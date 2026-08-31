@@ -1,3 +1,8 @@
+use crate::{FastPadError, Result};
+
+#[cfg(windows)]
+use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+
 const MILESTONE_COUNT: usize = 9;
 
 #[repr(u8)]
@@ -22,6 +27,35 @@ pub struct StartupMetrics {
 }
 
 impl StartupMetrics {
+    #[cfg(windows)]
+    pub fn begin() -> Result<Self> {
+        let mut frequency = 0_i64;
+        let mut start = 0_i64;
+        let frequency_ok = unsafe { QueryPerformanceFrequency(&mut frequency) };
+        if frequency_ok == 0 {
+            return Err(FastPadError::Win32(unsafe {
+                windows_sys::Win32::Foundation::GetLastError()
+            }));
+        }
+        let start_ok = unsafe { QueryPerformanceCounter(&mut start) };
+        if start_ok == 0 {
+            return Err(FastPadError::Win32(unsafe {
+                windows_sys::Win32::Foundation::GetLastError()
+            }));
+        }
+
+        let mut metrics = Self::with_frequency(frequency, start);
+        metrics.record(Milestone::ProcessStart, start);
+        Ok(metrics)
+    }
+
+    #[cfg(not(windows))]
+    pub fn begin() -> Result<Self> {
+        Err(FastPadError::Invariant(
+            "startup metrics are only available on Windows",
+        ))
+    }
+
     pub fn with_frequency(frequency: i64, start: i64) -> Self {
         Self {
             frequency,
@@ -35,6 +69,26 @@ impl StartupMetrics {
         if *slot == 0 {
             *slot = tick;
         }
+    }
+
+    #[cfg(windows)]
+    pub fn record_now(&mut self, milestone: Milestone) -> Result<()> {
+        let mut tick = 0_i64;
+        let ok = unsafe { QueryPerformanceCounter(&mut tick) };
+        if ok == 0 {
+            return Err(FastPadError::Win32(unsafe {
+                windows_sys::Win32::Foundation::GetLastError()
+            }));
+        }
+        self.record(milestone, tick);
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn record_now(&mut self, _milestone: Milestone) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "startup metrics are only available on Windows",
+        ))
     }
 
     pub fn micros(&self, milestone: Milestone) -> Option<u64> {

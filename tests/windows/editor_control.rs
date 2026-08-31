@@ -4,7 +4,7 @@ mod support;
 #[cfg(windows)]
 use fastpad::editor::Editor;
 #[cfg(windows)]
-use support::WindowHarness;
+use support::win32::WindowHarness;
 
 #[cfg(windows)]
 #[test]

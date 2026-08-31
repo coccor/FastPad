@@ -1,5 +1,7 @@
 #[cfg(windows)]
-mod win32;
+#[allow(dead_code)]
+pub mod process;
 
 #[cfg(windows)]
-pub use win32::WindowHarness;
+#[allow(dead_code)]
+pub mod win32;

@@ -1,22 +1,28 @@
 use fastpad::platform::{OwnedModule, wide_null};
 use std::error::Error;
+use std::mem::size_of;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleHandleW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
     LoadLibraryExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SW_HIDE, ShowWindow, TranslateMessage, UnregisterClassW, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumChildWindows,
+    GUITHREADINFO, GetClassNameW, GetGUIThreadInfo, GetWindowThreadProcessId, MSG, PM_REMOVE,
+    PeekMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SW_HIDE, SendMessageTimeoutW, ShowWindow,
+    TranslateMessage, UnregisterClassW, WM_CHAR, WM_GETTEXT, WM_GETTEXTLENGTH, WNDCLASSW,
     WS_OVERLAPPEDWINDOW,
 };
+use windows_sys::core::BOOL;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
 static WINDOW_CLASS_ID: AtomicUsize = AtomicUsize::new(1);
 
+#[allow(dead_code)]
 pub struct WindowHarness {
     hwnd: HWND,
     _scintilla: OwnedModule,
@@ -24,6 +30,7 @@ pub struct WindowHarness {
     instance: HMODULE,
 }
 
+#[allow(dead_code)]
 impl WindowHarness {
     pub fn new() -> TestResult<Self> {
         let scintilla = load_scintilla()?;
@@ -101,6 +108,7 @@ impl WindowHarness {
     }
 }
 
+#[allow(dead_code)]
 impl Drop for WindowHarness {
     fn drop(&mut self) {
         unsafe {
@@ -112,6 +120,139 @@ impl Drop for WindowHarness {
     }
 }
 
+pub fn find_child_by_class(parent: HWND, class_name: &str) -> TestResult<HWND> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let wanted = class_name.to_string();
+    loop {
+        let mut search = ChildSearch {
+            wanted: &wanted,
+            found: None,
+        };
+        unsafe {
+            EnumChildWindows(
+                parent,
+                Some(enum_child_by_class),
+                &mut search as *mut ChildSearch as isize,
+            );
+        }
+        if let Some(hwnd) = search.found {
+            return Ok(hwnd);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for child class {class_name}").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub fn focused_window(window: HWND) -> TestResult<HWND> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let thread_id = unsafe { GetWindowThreadProcessId(window, std::ptr::null_mut()) };
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let ok = unsafe { GetGUIThreadInfo(thread_id, &mut info) };
+        if ok != 0 && !info.hwndFocus.is_null() {
+            return Ok(info.hwndFocus);
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for focused window".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub fn send_text(hwnd: HWND, text: &str) -> TestResult<()> {
+    for unit in text.encode_utf16() {
+        let delivered = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                hwnd,
+                WM_CHAR,
+                unit as usize,
+                0,
+            )
+        };
+        if delivered == 0 {
+            return Err(Box::new(fastpad::platform::last_error()));
+        }
+    }
+    wait_for_text(hwnd, text)
+}
+
+pub fn scintilla_text(hwnd: HWND) -> TestResult<String> {
+    let mut length = 0;
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_GETTEXTLENGTH,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            2_000,
+            &mut length,
+        )
+    };
+    if ok == 0 {
+        return Err("timed out reading Scintilla text length".into());
+    }
+
+    let mut units = vec![0_u16; length + 1];
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_GETTEXT,
+            units.len(),
+            units.as_mut_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            2_000,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err("timed out reading Scintilla text".into());
+    }
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
+    Ok(String::from_utf16(&units[..end])?)
+}
+
+fn wait_for_text(hwnd: HWND, expected: &str) -> TestResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if scintilla_text(hwnd)? == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for Scintilla text {expected:?}").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct ChildSearch<'a> {
+    wanted: &'a str,
+    found: Option<HWND>,
+}
+
+unsafe extern "system" fn enum_child_by_class(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = unsafe { &mut *(lparam as *mut ChildSearch<'_>) };
+    let mut class_name = [0_u16; 128];
+    let length = unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+    if length > 0 {
+        let current = String::from_utf16_lossy(&class_name[..length as usize]);
+        if current == search.wanted {
+            search.found = Some(hwnd);
+            return 0;
+        }
+    }
+    1
+}
+
+#[allow(dead_code)]
 fn load_scintilla() -> TestResult<OwnedModule> {
     let path = native_scintilla_path();
     let text = path
@@ -128,6 +269,7 @@ fn load_scintilla() -> TestResult<OwnedModule> {
     Ok(unsafe { OwnedModule::from_raw_owned(module) }?)
 }
 
+#[allow(dead_code)]
 fn native_scintilla_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("native")
@@ -136,6 +278,7 @@ fn native_scintilla_path() -> PathBuf {
         .join("Scintilla.dll")
 }
 
+#[allow(dead_code)]
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
