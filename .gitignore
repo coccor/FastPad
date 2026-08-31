@@ -1,4 +1,5 @@
 /.superpowers/
+/.worktrees/
 /target/
 /dist/
 /native/build/
