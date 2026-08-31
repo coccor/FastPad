@@ -1,6 +1,8 @@
 pub mod error;
 pub mod file;
 pub mod launch;
+pub mod perf;
+pub mod platform;
 
 pub use error::FastPadError;
 pub use launch::{LaunchOptions, LaunchRequest};
