@@ -53,13 +53,13 @@ pub fn encode(text: &str, encoding: Encoding) -> Vec<u8> {
 }
 
 fn decode_utf16(bytes: &[u8], read: fn([u8; 2]) -> u16) -> Result<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(FastPadError::UnsupportedEncoding);
     }
 
-    let units = bytes
-        .chunks_exact(2)
-        .map(|chunk| read([chunk[0], chunk[1]]));
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    let units = chunks.iter().map(|chunk| read(*chunk));
     char::decode_utf16(units)
         .collect::<core::result::Result<String, _>>()
         .map_err(|_| FastPadError::UnsupportedEncoding)
