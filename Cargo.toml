@@ -24,3 +24,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[[test]]
+name = "editor_control"
+path = "tests/windows/editor_control.rs"
