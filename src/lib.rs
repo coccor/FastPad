@@ -1,4 +1,5 @@
 pub mod error;
+pub mod file;
 pub mod launch;
 
 pub use error::FastPadError;
