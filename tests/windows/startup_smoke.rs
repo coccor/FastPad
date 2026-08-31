@@ -5,7 +5,7 @@ mod support;
 use std::time::Duration;
 
 #[cfg(windows)]
-use support::process::FastPadProcess;
+use support::process::{FastPadProcess, wait_for_process_exit};
 #[cfg(windows)]
 use support::win32::{find_child_by_class, focused_window, scintilla_text, send_text};
 
@@ -14,7 +14,7 @@ use support::win32::{find_child_by_class, focused_window, scintilla_text, send_t
 fn launch_creates_a_focused_editable_scintilla() {
     // Break caught: bootstrap returns without creating a main window, so startup never exposes
     // a focused Scintilla editor that can accept real input.
-    let process = FastPadProcess::spawn(["--diagnostic"]).unwrap();
+    let mut process = FastPadProcess::spawn(["--diagnostic"]).unwrap();
     let hwnd = process
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();
@@ -23,4 +23,20 @@ fn launch_creates_a_focused_editable_scintilla() {
     send_text(editor, "x").unwrap();
     assert_eq!(scintilla_text(editor).unwrap(), "x");
     process.close().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn dropping_fastpad_process_reaps_the_running_child() {
+    // Break caught: a failed smoke assertion can orphan the spawned GUI process unless Drop
+    // performs bounded cleanup.
+    let process_id = {
+        let mut process = FastPadProcess::spawn(["--diagnostic"]).unwrap();
+        process
+            .wait_for_main_window(Duration::from_secs(2))
+            .unwrap();
+        process.id()
+    };
+
+    wait_for_process_exit(process_id, Duration::from_secs(2)).unwrap();
 }

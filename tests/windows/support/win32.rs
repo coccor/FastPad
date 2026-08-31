@@ -22,6 +22,44 @@ type TestResult<T> = Result<T, Box<dyn Error>>;
 
 static WINDOW_CLASS_ID: AtomicUsize = AtomicUsize::new(1);
 
+#[derive(Clone, Debug)]
+pub struct Deadline {
+    end: Instant,
+}
+
+impl Deadline {
+    pub fn after(timeout: Duration) -> Self {
+        Self {
+            end: Instant::now() + timeout,
+        }
+    }
+
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.end
+    }
+
+    pub fn remaining_millis(&self) -> u32 {
+        if self.expired() {
+            0
+        } else {
+            self.end
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .clamp(1, u128::from(u32::MAX)) as u32
+        }
+    }
+
+    pub fn sleep_step(&self) {
+        if self.expired() {
+            return;
+        }
+
+        std::thread::sleep(
+            Duration::from_millis(10).min(self.end.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
 #[allow(dead_code)]
 pub struct WindowHarness {
     hwnd: HWND,
@@ -121,7 +159,7 @@ impl Drop for WindowHarness {
 }
 
 pub fn find_child_by_class(parent: HWND, class_name: &str) -> TestResult<HWND> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Deadline::after(Duration::from_secs(2));
     let wanted = class_name.to_string();
     loop {
         let mut search = ChildSearch {
@@ -138,15 +176,15 @@ pub fn find_child_by_class(parent: HWND, class_name: &str) -> TestResult<HWND> {
         if let Some(hwnd) = search.found {
             return Ok(hwnd);
         }
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             return Err(format!("timed out waiting for child class {class_name}").into());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        deadline.sleep_step();
     }
 }
 
 pub fn focused_window(window: HWND) -> TestResult<HWND> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Deadline::after(Duration::from_secs(2));
     loop {
         let thread_id = unsafe { GetWindowThreadProcessId(window, std::ptr::null_mut()) };
         let mut info = GUITHREADINFO {
@@ -157,14 +195,15 @@ pub fn focused_window(window: HWND) -> TestResult<HWND> {
         if ok != 0 && !info.hwndFocus.is_null() {
             return Ok(info.hwndFocus);
         }
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             return Err("timed out waiting for focused window".into());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        deadline.sleep_step();
     }
 }
 
 pub fn send_text(hwnd: HWND, text: &str) -> TestResult<()> {
+    let deadline = Deadline::after(Duration::from_secs(2));
     for unit in text.encode_utf16() {
         let delivered = unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -178,10 +217,14 @@ pub fn send_text(hwnd: HWND, text: &str) -> TestResult<()> {
             return Err(Box::new(fastpad::platform::last_error()));
         }
     }
-    wait_for_text(hwnd, text)
+    wait_for_text(hwnd, text, &deadline)
 }
 
 pub fn scintilla_text(hwnd: HWND) -> TestResult<String> {
+    scintilla_text_with_deadline(hwnd, &Deadline::after(Duration::from_secs(2)))
+}
+
+fn scintilla_text_with_deadline(hwnd: HWND, deadline: &Deadline) -> TestResult<String> {
     let mut length = 0;
     let ok = unsafe {
         SendMessageTimeoutW(
@@ -190,7 +233,7 @@ pub fn scintilla_text(hwnd: HWND) -> TestResult<String> {
             0,
             0,
             SMTO_ABORTIFHUNG,
-            2_000,
+            deadline.remaining_millis(),
             &mut length,
         )
     };
@@ -206,7 +249,7 @@ pub fn scintilla_text(hwnd: HWND) -> TestResult<String> {
             units.len(),
             units.as_mut_ptr() as isize,
             SMTO_ABORTIFHUNG,
-            2_000,
+            deadline.remaining_millis(),
             std::ptr::null_mut(),
         )
     };
@@ -220,16 +263,15 @@ pub fn scintilla_text(hwnd: HWND) -> TestResult<String> {
     Ok(String::from_utf16(&units[..end])?)
 }
 
-fn wait_for_text(hwnd: HWND, expected: &str) -> TestResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+fn wait_for_text(hwnd: HWND, expected: &str, deadline: &Deadline) -> TestResult<()> {
     loop {
-        if scintilla_text(hwnd)? == expected {
+        if scintilla_text_with_deadline(hwnd, deadline)? == expected {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             return Err(format!("timed out waiting for Scintilla text {expected:?}").into());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        deadline.sleep_step();
     }
 }
 
@@ -286,4 +328,33 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Deadline;
+    use std::time::Duration;
+
+    #[test]
+    fn deadline_remaining_time_never_exceeds_the_original_budget() {
+        // Break caught: nested helper calls that reset their timeout can exceed the documented
+        // two-second public budget instead of sharing one deadline.
+        let deadline = Deadline::after(Duration::from_millis(50));
+        let first = deadline.remaining_millis();
+        std::thread::sleep(Duration::from_millis(10));
+        let second = deadline.remaining_millis();
+
+        assert!(first <= 50);
+        assert!(second <= first);
+    }
+
+    #[test]
+    fn deadline_expires_to_zero_remaining_time() {
+        // Break caught: nested SendMessageTimeout calls can keep granting fresh timeout windows
+        // after the public helper budget is already exhausted.
+        let deadline = Deadline::after(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(deadline.remaining_millis(), 0);
+    }
 }
