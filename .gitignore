@@ -3,3 +3,6 @@
 /target/
 /dist/
 /native/build/
+/native/cache/
+/native/src/
+/native/out/
