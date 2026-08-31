@@ -7,7 +7,7 @@ use crate::editor::scintilla_constants::{
 use crate::{FastPadError, Result};
 use std::ffi::CString;
 use std::ops::Range;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::HWND;
 
@@ -33,13 +33,13 @@ const EDITOR_ENDPOINT_SUBCLASS_ID: usize = 0x4650_4544;
 
 #[derive(Debug)]
 pub struct Editor {
-    endpoint: Arc<EditorEndpoint>,
+    endpoint: Rc<EditorEndpoint>,
 }
 
 #[derive(Debug)]
 pub struct EditorDocument {
     raw: isize,
-    endpoint: Arc<EditorEndpoint>,
+    endpoint: Rc<EditorEndpoint>,
 }
 
 #[derive(Debug)]
@@ -54,30 +54,7 @@ struct EditorEndpoint {
 impl Editor {
     #[cfg(windows)]
     pub fn create(parent: HWND) -> Result<Self> {
-        let hwnd = unsafe {
-            let mut rect = RECT::default();
-            if GetClientRect(parent, &mut rect) == 0 {
-                return Err(last_error());
-            }
-
-            let class_name = wide_null("Scintilla");
-            let width = (rect.right - rect.left).max(1);
-            let height = (rect.bottom - rect.top).max(1);
-            CreateWindowExW(
-                0,
-                class_name.as_ptr(),
-                std::ptr::null(),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                0,
-                0,
-                width,
-                height,
-                parent,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
+        let hwnd = create_scintilla_child(parent)?;
         require_hwnd(hwnd)?;
 
         let direct_fn_raw = unsafe { SendMessageW(hwnd, SCI_GETDIRECTFUNCTION, 0, 0) };
@@ -94,7 +71,7 @@ impl Editor {
             ));
         }
 
-        let endpoint = Arc::new(EditorEndpoint::new(
+        let endpoint = Rc::new(EditorEndpoint::new(
             hwnd,
             unsafe { transmute::<isize, SciFnDirect>(direct_fn_raw) },
             direct_ptr,
@@ -172,7 +149,7 @@ impl Editor {
         }
         Ok(EditorDocument {
             raw,
-            endpoint: Arc::clone(&self.endpoint),
+            endpoint: Rc::clone(&self.endpoint),
         })
     }
 
@@ -194,7 +171,7 @@ impl Editor {
         self.endpoint.retain_document(raw);
         Ok(EditorDocument {
             raw,
-            endpoint: Arc::clone(&self.endpoint),
+            endpoint: Rc::clone(&self.endpoint),
         })
     }
 
@@ -207,7 +184,7 @@ impl Editor {
 
     #[cfg(windows)]
     pub fn use_document(&self, document: &EditorDocument) -> Result<()> {
-        if !Arc::ptr_eq(&self.endpoint, &document.endpoint) {
+        if !Rc::ptr_eq(&self.endpoint, &document.endpoint) {
             return Err(FastPadError::Invariant(
                 "Scintilla document belongs to a different editor",
             ));
@@ -280,7 +257,7 @@ impl Editor {
     #[cfg(test)]
     fn test_fixture(direct_fn: SciFnDirect, direct_ptr: isize) -> Self {
         Self {
-            endpoint: Arc::new(EditorEndpoint::new(
+            endpoint: Rc::new(EditorEndpoint::new(
                 std::ptr::null_mut(),
                 direct_fn,
                 direct_ptr,
@@ -295,7 +272,7 @@ impl Clone for EditorDocument {
         self.endpoint.retain_document(self.raw);
         Self {
             raw: self.raw,
-            endpoint: Arc::clone(&self.endpoint),
+            endpoint: Rc::clone(&self.endpoint),
         }
     }
 }
@@ -311,7 +288,7 @@ impl EditorDocument {
     pub fn test_fixture() -> Self {
         Self {
             raw: 0,
-            endpoint: Arc::new(EditorEndpoint::new(
+            endpoint: Rc::new(EditorEndpoint::new(
                 std::ptr::null_mut(),
                 inert_direct_call,
                 0,
@@ -324,7 +301,7 @@ impl EditorDocument {
     fn test_fixture_with_raw(raw: isize, editor: &Editor) -> Self {
         Self {
             raw,
-            endpoint: Arc::clone(&editor.endpoint),
+            endpoint: Rc::clone(&editor.endpoint),
         }
     }
 
@@ -351,13 +328,13 @@ impl EditorEndpoint {
     }
 
     #[cfg(windows)]
-    fn install_lifecycle_guard(self: &Arc<Self>) -> Result<()> {
+    fn install_lifecycle_guard(self: &Rc<Self>) -> Result<()> {
         let installed = unsafe {
             SetWindowSubclass(
                 self.hwnd,
                 Some(editor_endpoint_subclass_proc),
                 EDITOR_ENDPOINT_SUBCLASS_ID,
-                Arc::as_ptr(self) as usize,
+                Rc::as_ptr(self) as usize,
             )
         };
         if installed == 0 {
@@ -367,7 +344,7 @@ impl EditorEndpoint {
     }
 
     #[cfg(not(windows))]
-    fn install_lifecycle_guard(self: &Arc<Self>) -> Result<()> {
+    fn install_lifecycle_guard(self: &Rc<Self>) -> Result<()> {
         let _ = self;
         Ok(())
     }
@@ -424,6 +401,45 @@ fn require_hwnd(raw: HWND) -> Result<HWND> {
     } else {
         Ok(raw)
     }
+}
+
+#[cfg(windows)]
+fn create_scintilla_child(parent: HWND) -> Result<HWND> {
+    let rect = parent_client_rect(parent)?;
+    let class_name = wide_null("Scintilla");
+    let width = (rect.right - rect.left).max(1);
+    let height = (rect.bottom - rect.top).max(1);
+    let hwnd = unsafe {
+        // SAFETY: `parent` is treated as an opaque host HWND supplied by the caller. This helper
+        // contains the only raw-HWND FFI for `Editor::create`, constraining the unchecked Win32
+        // boundary to one private function.
+        CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            std::ptr::null(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            0,
+            0,
+            width,
+            height,
+            parent,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    Ok(hwnd)
+}
+
+#[cfg(windows)]
+fn parent_client_rect(parent: HWND) -> Result<RECT> {
+    let mut rect = RECT::default();
+    let ok = unsafe {
+        // SAFETY: `parent` is forwarded unchanged to Win32 so the FFI dereference stays inside
+        // this private boundary instead of the public `Editor::create` API.
+        GetClientRect(parent, &mut rect)
+    };
+    if ok == 0 { Err(last_error()) } else { Ok(rect) }
 }
 
 #[cfg(windows)]
