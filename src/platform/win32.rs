@@ -1,5 +1,5 @@
 use crate::{FastPadError, Result};
-use windows_sys::Win32::Foundation::{HANDLE, HMODULE};
+use windows_sys::Win32::Foundation::{HANDLE, HMODULE, INVALID_HANDLE_VALUE};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, FreeLibrary, GetLastError};
@@ -38,7 +38,7 @@ pub(crate) fn module_is_valid(raw: HMODULE) -> bool {
 }
 
 pub(crate) fn handle_is_valid(raw: HANDLE) -> bool {
-    !raw.is_null()
+    !raw.is_null() && raw != INVALID_HANDLE_VALUE
 }
 
 #[cfg(windows)]
