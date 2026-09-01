@@ -1,7 +1,21 @@
 use crate::editor::Editor;
 use crate::launch::LaunchOptions;
 use crate::perf::{Milestone, StartupMetrics};
+use std::cell::Cell;
+use std::rc::Rc;
 use windows_sys::Win32::Foundation::HWND;
+
+#[derive(Clone, Debug)]
+pub(crate) struct WindowIdentity {
+    state: Rc<Cell<WindowIdentityState>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowIdentityState {
+    Unbound,
+    Live(HWND),
+    Invalidated,
+}
 
 #[derive(Debug)]
 pub struct App {
@@ -9,6 +23,7 @@ pub struct App {
     pub editor: Option<Editor>,
     pub launch: LaunchOptions,
     pub startup: StartupMetrics,
+    identity: WindowIdentity,
     first_paint_completed: bool,
     deferred_start_pending: bool,
     prioritize_input: bool,
@@ -21,6 +36,9 @@ impl App {
             editor: None,
             launch,
             startup,
+            identity: WindowIdentity {
+                state: Rc::new(Cell::new(WindowIdentityState::Unbound)),
+            },
             first_paint_completed: false,
             deferred_start_pending: false,
             prioritize_input: false,
@@ -51,6 +69,36 @@ impl App {
 
     pub fn prioritizes_input(&self) -> bool {
         self.prioritize_input
+    }
+
+    pub(crate) fn window_identity(&self) -> WindowIdentity {
+        self.identity.clone()
+    }
+
+    pub(crate) fn bind_window(&mut self, hwnd: HWND) -> bool {
+        if self.identity.state.get() != WindowIdentityState::Unbound {
+            return false;
+        }
+        self.hwnd = hwnd;
+        self.identity.state.set(WindowIdentityState::Live(hwnd));
+        true
+    }
+
+    pub(crate) fn invalidate_window(&self, hwnd: HWND) {
+        if self.identity.state.get() == WindowIdentityState::Live(hwnd) {
+            self.identity.state.set(WindowIdentityState::Invalidated);
+        }
+    }
+}
+
+impl WindowIdentity {
+    pub(crate) fn is_live_for(&self, hwnd: HWND) -> bool {
+        self.state.get() == WindowIdentityState::Live(hwnd)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_invalidated(&self) -> bool {
+        self.state.get() == WindowIdentityState::Invalidated
     }
 }
 

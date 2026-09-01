@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::app::App;
+use crate::app::{App, WindowIdentity};
 use crate::editor::Editor;
 use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
@@ -12,9 +12,9 @@ use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetWindowLongPtrW, IsWindow, MoveWindow, PostMessageW, PostQuitMessage, QS_INPUT,
-    RegisterClassW, SetWindowLongPtrW, UnregisterClassW, WM_CLOSE, WM_DESTROY, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    GetWindowLongPtrW, MoveWindow, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW,
+    SetWindowLongPtrW, UnregisterClassW, WM_CLOSE, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -95,9 +95,12 @@ impl Drop for MainWindowClass {
     }
 }
 
-pub(crate) unsafe fn maybe_post_deferred_start(hwnd: HWND) {
+pub(crate) unsafe fn maybe_post_deferred_start(hwnd: HWND, identity: &WindowIdentity) {
     // SAFETY: The caller guarantees `hwnd` is the live FastPad main window. The raw App pointer is
     // used only for the immediate pending-flag transition before posting the deferred message.
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
     let should_post = unsafe { take_deferred_start_pending(hwnd) };
     if should_post {
         unsafe {
@@ -159,10 +162,12 @@ unsafe extern "system" fn main_window_proc(
             result
         }
         WM_NCDESTROY => {
-            let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
-            unsafe {
-                drop(take_app(hwnd));
+            let app = unsafe { take_app(hwnd) };
+            if let Some(app) = app.as_ref() {
+                app.invalidate_window(hwnd);
             }
+            let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            drop(app);
             result
         }
         _ => {
@@ -178,7 +183,9 @@ unsafe fn on_nc_create(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let Some(mut app) = (unsafe { take_create_context_app(lparam) }) else {
         return 0;
     };
-    app.hwnd = hwnd;
+    if !app.bind_window(hwnd) {
+        return 0;
+    }
     store_app(hwnd, app);
     1
 }
@@ -272,19 +279,28 @@ unsafe fn take_app(hwnd: HWND) -> Option<Box<App>> {
     (!raw.is_null()).then(|| unsafe { Box::from_raw(raw) })
 }
 
-pub(crate) unsafe fn initialize_editor_with<F>(hwnd: HWND, create_editor: F) -> Result<HWND>
+pub(crate) unsafe fn initialize_editor_with<F>(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    create_editor: F,
+) -> Result<HWND>
 where
     F: FnOnce(HWND) -> Result<Editor>,
 {
     // SAFETY: The caller guarantees `hwnd` is the live FastPad main window whose `GWLP_USERDATA`
     // owns an App. No App reference is held across the reentrant editor creation callback.
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window identity was not live during editor initialization",
+        ));
+    }
     unsafe {
         record_milestone(hwnd, Milestone::WindowCreated)?;
     }
 
     let editor = create_editor(hwnd)?;
     let editor_hwnd = editor.hwnd();
-    if unsafe { IsWindow(hwnd) } == 0 {
+    if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
             "main window was destroyed during editor initialization",
         ));
@@ -297,21 +313,23 @@ where
     Ok(editor_hwnd)
 }
 
-pub(crate) fn window_alive(hwnd: HWND) -> bool {
-    unsafe { IsWindow(hwnd) != 0 }
-}
-
-pub(crate) unsafe fn input_priority_requested(hwnd: HWND) -> bool {
+pub(crate) unsafe fn input_priority_requested(hwnd: HWND, identity: &WindowIdentity) -> bool {
     // SAFETY: This helper reads a raw App pointer stored in `GWLP_USERDATA` and copies a boolean
     // flag without returning references across the FFI boundary.
+    if !identity.is_live_for(hwnd) {
+        return false;
+    }
     unsafe { app_ptr(hwnd) }
         .map(|app| unsafe { app.as_ref() }.prioritizes_input())
         .unwrap_or(false)
 }
 
-pub(crate) unsafe fn clear_input_priority(hwnd: HWND) {
+pub(crate) unsafe fn clear_input_priority(hwnd: HWND, identity: &WindowIdentity) {
     // SAFETY: This helper mutates a boolean flag through the window-owned App pointer and does not
     // retain any reference across reentrant Win32 calls.
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
         unsafe { app.as_mut() }.clear_input_priority();
     }
@@ -428,6 +446,29 @@ mod tests {
             DestroyWindow(window.hwnd);
         }
         assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+    }
+
+    #[test]
+    fn original_window_identity_stays_invalid_after_replacement_creation() {
+        // Break caught: an IsWindow-only liveness check can accept a recycled HWND and read the
+        // replacement window's GWLP_USERDATA as the original App.
+        let original_app = make_app();
+        let original_identity = original_app.window_identity();
+        let original = ProductionWindow::new(original_app);
+        assert!(original_identity.is_live_for(original.hwnd));
+
+        unsafe {
+            DestroyWindow(original.hwnd);
+        }
+        assert!(original_identity.is_invalidated());
+        drop(original);
+
+        let replacement_app = make_app();
+        let replacement_identity = replacement_app.window_identity();
+        let replacement = ProductionWindow::new(replacement_app);
+        assert!(replacement_identity.is_live_for(replacement.hwnd));
+        assert!(original_identity.is_invalidated());
+        assert!(!original_identity.is_live_for(replacement.hwnd));
     }
 
     fn make_app() -> Box<App> {
