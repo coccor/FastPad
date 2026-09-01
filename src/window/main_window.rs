@@ -155,11 +155,22 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_PAINT => {
-            let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
-            unsafe {
+            let default_window_proc = |hwnd, message, wparam, lparam| unsafe {
+                DefWindowProcW(hwnd, message, wparam, lparam)
+            };
+            let complete_first_paint = |hwnd| unsafe {
                 mark_first_paint_complete(hwnd);
+            };
+            unsafe {
+                handle_paint_with(
+                    hwnd,
+                    message,
+                    wparam,
+                    lparam,
+                    default_window_proc,
+                    complete_first_paint,
+                )
             }
-            result
         }
         WM_NCDESTROY => {
             let app = unsafe { take_app(hwnd) };
@@ -177,6 +188,29 @@ unsafe extern "system" fn main_window_proc(
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
     }
+}
+
+unsafe fn handle_paint_with<D, C>(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    default_window_proc: D,
+    complete_first_paint: C,
+) -> LRESULT
+where
+    D: FnOnce(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    C: FnOnce(HWND),
+{
+    let identity = unsafe { window_identity(hwnd) };
+    let result = default_window_proc(hwnd, message, wparam, lparam);
+    if identity
+        .as_ref()
+        .is_some_and(|identity| identity.is_live_for(hwnd))
+    {
+        complete_first_paint(hwnd);
+    }
+    result
 }
 
 unsafe fn on_nc_create(hwnd: HWND, lparam: LPARAM) -> LRESULT {
@@ -393,6 +427,13 @@ unsafe fn app_ptr(hwnd: HWND) -> Option<NonNull<App>> {
     NonNull::new(unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App })
 }
 
+unsafe fn window_identity(hwnd: HWND) -> Option<WindowIdentity> {
+    // SAFETY: Clone only the App's stable identity token. The temporary App reference ends before
+    // callers cross any reentrant Win32 boundary.
+    let app = unsafe { app_ptr(hwnd) }?;
+    Some(unsafe { app.as_ref() }.window_identity())
+}
+
 unsafe fn take_create_context_app(lparam: LPARAM) -> Option<Box<App>> {
     let create = unsafe { &mut *(lparam as *mut CREATESTRUCTW) };
     let context = create.lpCreateParams as *mut WindowCreateContext<App>;
@@ -410,18 +451,22 @@ fn store_app(hwnd: HWND, value: Box<App>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MainWindowClass, WindowCreateContext};
+    use super::{
+        MainWindowClass, WindowCreateContext, handle_paint_with, mark_first_paint_complete,
+        take_deferred_start_pending,
+    };
     use crate::app::App;
     use crate::launch::LaunchOptions;
     use crate::perf::StartupMetrics;
+    use std::cell::RefCell;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Foundation::{HWND, LRESULT};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, IsWindow,
+        DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, IsWindow, WM_PAINT,
     };
 
     #[test]
@@ -469,6 +514,45 @@ mod tests {
         assert!(replacement_identity.is_live_for(replacement.hwnd));
         assert!(original_identity.is_invalidated());
         assert!(!original_identity.is_live_for(replacement.hwnd));
+    }
+
+    #[test]
+    fn reentrant_paint_completion_does_not_mutate_replacement_app() {
+        // Break caught: removing the post-DefWindowProc identity gate lets an old WM_PAINT
+        // completion mutate the App found in a recycled HWND's replacement GWLP_USERDATA slot.
+        const PAINT_RESULT: LRESULT = 73;
+        let mut original = Some(ProductionWindow::new(make_app()));
+        let original_hwnd = original.as_ref().unwrap().hwnd;
+        let replacement = RefCell::new(None::<ProductionWindow>);
+
+        let default_window_proc = |hwnd, _, _, _| {
+            assert_ne!(unsafe { DestroyWindow(hwnd) }, 0);
+            drop(original.take());
+            replacement.replace(Some(ProductionWindow::new(make_app())));
+            PAINT_RESULT
+        };
+        let complete_first_paint = |_| {
+            let replacement = replacement.borrow();
+            let replacement = replacement.as_ref().unwrap();
+            unsafe {
+                mark_first_paint_complete(replacement.hwnd);
+            }
+        };
+        let result = unsafe {
+            handle_paint_with(
+                original_hwnd,
+                WM_PAINT,
+                0,
+                0,
+                default_window_proc,
+                complete_first_paint,
+            )
+        };
+
+        assert_eq!(result, PAINT_RESULT);
+        let replacement = replacement.borrow();
+        let replacement = replacement.as_ref().unwrap();
+        assert!(!unsafe { take_deferred_start_pending(replacement.hwnd) });
     }
 
     fn make_app() -> Box<App> {
