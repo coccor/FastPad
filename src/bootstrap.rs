@@ -2,13 +2,16 @@ use crate::app::App;
 use crate::editor::Editor;
 use crate::error::StartupStage;
 use crate::launch::LaunchOptions;
-use crate::perf::{Milestone, StartupMetrics};
+use crate::perf::StartupMetrics;
 use crate::platform::{OwnedModule, last_error, wide_null};
 use crate::window::{
-    MainWindowClass, WindowCreateContext, app_mut, clear_input_priority, input_priority_requested,
-    maybe_post_deferred_start,
+    INPUT_MESSAGE_FIRST, INPUT_MESSAGE_LAST, MainWindowClass, WindowCreateContext,
+    clear_input_priority, initialize_editor_with, input_priority_requested,
+    input_queue_status_mask, maybe_post_deferred_start, window_alive,
 };
 use crate::{FastPadError, Result};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{HMODULE, HWND};
 use windows_sys::Win32::System::LibraryLoader::{
@@ -19,9 +22,11 @@ use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+#[cfg(test)]
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_QUIT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, IsWindow, MSG, PM_REMOVE, PeekMessageW, SW_SHOW, ShowWindow,
-    TranslateMessage, WM_KEYFIRST, WM_KEYLAST, WM_MOUSEFIRST, WM_MOUSELAST, WM_PAINT,
+    TranslateMessage, WM_PAINT,
 };
 
 pub fn run(options: LaunchOptions) -> Result<i32> {
@@ -34,26 +39,34 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
         .map_err(|error| FastPadError::startup(StartupStage::WindowClassRegistration, error))?;
 
     let mut create_context = WindowCreateContext::new(Box::new(App::new(options, startup)));
-    let hwnd = window_class.create(create_context.lp_param())?;
-    let mut teardown = ParentWindowGuard::new(hwnd);
+    let hwnd = window_class.create(&mut create_context)?;
+    let teardown = ParentWindowGuard::new(hwnd);
 
-    let editor_hwnd = app_mut(hwnd, |app| {
-        let _ = app.startup.record_now(Milestone::WindowCreated);
-        let editor = Editor::create(hwnd)
-            .map_err(|error| FastPadError::startup(StartupStage::EditorCreate, error))?;
-        let _ = app.startup.record_now(Milestone::EditorCreated);
-        let editor_hwnd = editor.hwnd();
-        app.editor = Some(editor);
-        Ok(editor_hwnd)
-    })?;
+    let editor_hwnd = unsafe {
+        initialize_editor_with(hwnd, |parent| {
+            Editor::create(parent)
+                .map_err(|error| FastPadError::startup(StartupStage::EditorCreate, error))
+        })?
+    };
 
     unsafe {
         ShowWindow(hwnd, SW_SHOW);
+    }
+    if !window_alive(hwnd) {
+        return Err(FastPadError::Invariant(
+            "main window was destroyed before entering the message loop",
+        ));
+    }
+    unsafe {
         SetFocus(editor_hwnd);
     }
+    if !window_alive(hwnd) {
+        return Err(FastPadError::Invariant(
+            "main window was destroyed before entering the message loop",
+        ));
+    }
 
-    teardown.disarm();
-    message_loop(hwnd)
+    finish_message_loop(hwnd, teardown, message_loop)
 }
 
 fn configure_dpi() {
@@ -107,60 +120,91 @@ fn message_loop(hwnd: HWND) -> Result<i32> {
             return Ok(message.wParam as i32);
         }
 
-        unsafe {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-
-        if message.hwnd == hwnd && message.message == WM_PAINT {
-            maybe_post_deferred_start(hwnd);
-        }
+        dispatch_message(hwnd, &message);
     }
 }
 
+fn finish_message_loop<F>(hwnd: HWND, mut teardown: ParentWindowGuard, run_loop: F) -> Result<i32>
+where
+    F: FnOnce(HWND) -> Result<i32>,
+{
+    let result = run_loop(hwnd);
+    if !window_alive(hwnd) {
+        teardown.disarm();
+    }
+    drop(teardown);
+    result
+}
+
 fn drain_prioritized_input(hwnd: HWND) -> Result<()> {
-    if !input_priority_requested(hwnd)? {
+    if !window_alive(hwnd) || !unsafe { input_priority_requested(hwnd) } {
         return Ok(());
     }
 
-    while dispatch_next_input_message()? {}
-    clear_input_priority(hwnd)?;
+    while window_alive(hwnd) && dispatch_next_input_message()? {}
+    if window_alive(hwnd) {
+        unsafe {
+            clear_input_priority(hwnd);
+        }
+    }
     Ok(())
 }
 
 fn dispatch_next_input_message() -> Result<bool> {
     let mut message = MSG::default();
-    let found_keyboard = unsafe {
+    let queue_status = input_queue_status_mask();
+    if unsafe {
         PeekMessageW(
             &mut message,
             std::ptr::null_mut(),
-            WM_KEYFIRST,
-            WM_KEYLAST,
-            PM_REMOVE,
+            INPUT_MESSAGE_FIRST,
+            INPUT_MESSAGE_LAST,
+            PM_REMOVE | (queue_status << 16),
         )
-    };
-    let found = if found_keyboard != 0 {
-        true
-    } else {
-        unsafe {
-            PeekMessageW(
-                &mut message,
-                std::ptr::null_mut(),
-                WM_MOUSEFIRST,
-                WM_MOUSELAST,
-                PM_REMOVE,
-            ) != 0
-        }
-    };
-    if !found {
+    } == 0
+    {
         return Ok(false);
     }
 
-    unsafe {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-    }
+    dispatch_message(std::ptr::null_mut(), &message);
     Ok(true)
+}
+
+fn dispatch_message(hwnd: HWND, message: &MSG) {
+    #[cfg(test)]
+    TEST_DISPATCHED_MESSAGES.with(|messages| messages.borrow_mut().push(message.message));
+
+    unsafe {
+        TranslateMessage(message);
+        DispatchMessageW(message);
+    }
+
+    if message.hwnd == hwnd && message.message == WM_PAINT && window_alive(hwnd) {
+        unsafe {
+            maybe_post_deferred_start(hwnd);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DISPATCHED_MESSAGES: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn pump_next_available_message(hwnd: HWND) -> Result<Option<u32>> {
+    drain_prioritized_input(hwnd)?;
+
+    let mut message = MSG::default();
+    if unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } == 0 {
+        return Ok(None);
+    }
+    if message.message == WM_QUIT {
+        return Ok(Some(WM_QUIT));
+    }
+
+    dispatch_message(hwnd, &message);
+    Ok(Some(message.message))
 }
 
 struct ParentWindowGuard {
@@ -194,14 +238,23 @@ impl Drop for ParentWindowGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartupStage, dispatch_next_input_message};
-    use crate::platform::wide_null;
-    use std::sync::{Arc, Mutex};
-    use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+    use super::{
+        ParentWindowGuard, StartupStage, finish_message_loop, load_scintilla_module,
+        pump_next_available_message,
+    };
+    use crate::app::App;
+    use crate::editor::Editor;
+    use crate::error::FastPadError;
+    use crate::launch::LaunchOptions;
+    use crate::perf::StartupMetrics;
+    use crate::window::{
+        MainWindowClass, WindowCreateContext, initialize_editor_with, with_test_input_queue_status,
+    };
+    use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-        RegisterClassW, UnregisterClassW, WM_KEYDOWN, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+        DestroyWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW, PostMessageW, QS_POSTMESSAGE,
+        WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN,
     };
 
     #[test]
@@ -214,22 +267,27 @@ mod tests {
     }
 
     #[test]
-    fn prioritized_input_dispatches_keyboard_before_reposted_deferred_work() {
-        // Break caught: a reposted deferred startup message can livelock ahead of pending input
-        // unless the message loop explicitly drains QS_INPUT before reading the queue again.
-        let state = Arc::new(Mutex::new(Vec::new()));
-        let window = TestWindow::new(Arc::clone(&state));
+    fn prioritized_input_drains_mixed_input_in_queue_order_before_reposted_work() {
+        // Break caught: splitting keyboard and mouse drains can reorder queued input and let a
+        // reposted deferred startup unit continue before the oldest pending input is dispatched.
+        let main = ProductionWindow::new(make_app());
         pump_thread_messages();
-        state.lock().unwrap().clear();
+        super::TEST_DISPATCHED_MESSAGES.with(|messages| messages.borrow_mut().clear());
 
-        unsafe {
-            PostMessageW(window.hwnd, crate::window::WM_FASTPAD_LOAD_SETTINGS, 0, 0);
-            PostMessageW(window.hwnd, WM_KEYDOWN, usize::from(b'X'), 0);
-        }
+        with_test_input_queue_status(QS_POSTMESSAGE, || {
+            unsafe {
+                PostMessageW(main.hwnd, crate::window::WM_FASTPAD_LOAD_SETTINGS, 0, 0);
+                assert_ne!(PostMessageW(main.hwnd, WM_INPUT, 0, 0), 0);
+                assert_ne!(PostMessageW(main.hwnd, WM_LBUTTONDOWN, 0, 0), 0);
+                assert_ne!(PostMessageW(main.hwnd, WM_KEYDOWN, usize::from(b'X'), 0), 0);
+            }
 
-        assert!(dispatch_next_input_message().unwrap());
+            pump_until_message(main.hwnd, crate::window::WM_FASTPAD_LOAD_SETTINGS);
+            assert!(unsafe { crate::window::input_priority_requested(main.hwnd) });
+            pump_until_message(main.hwnd, crate::window::WM_FASTPAD_LOAD_SETTINGS);
+        });
         let mut queued = MSG::default();
-        let status = unsafe {
+        let load_settings_status = unsafe {
             PeekMessageW(
                 &mut queued,
                 std::ptr::null_mut(),
@@ -238,17 +296,69 @@ mod tests {
                 PM_REMOVE,
             )
         };
-        assert_ne!(status, 0);
-        assert_eq!(queued.message, crate::window::WM_FASTPAD_LOAD_SETTINGS);
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::TranslateMessage(&queued);
-            windows_sys::Win32::UI::WindowsAndMessaging::DispatchMessageW(&queued);
-        }
+        assert_eq!(load_settings_status, 0);
+        let open_request_status = unsafe {
+            PeekMessageW(
+                &mut queued,
+                std::ptr::null_mut(),
+                crate::window::WM_FASTPAD_OPEN_REQUEST,
+                crate::window::WM_FASTPAD_OPEN_REQUEST,
+                PM_REMOVE,
+            )
+        };
+        assert_ne!(open_request_status, 0);
+        assert_eq!(queued.message, crate::window::WM_FASTPAD_OPEN_REQUEST);
 
-        assert_eq!(
-            *state.lock().unwrap(),
-            vec![WM_KEYDOWN, crate::window::WM_FASTPAD_LOAD_SETTINGS]
-        );
+        let input_messages = super::TEST_DISPATCHED_MESSAGES
+            .with(|messages| messages.borrow().clone())
+            .iter()
+            .copied()
+            .filter(|message| matches!(message, &WM_INPUT | &WM_LBUTTONDOWN | &WM_KEYDOWN))
+            .collect::<Vec<_>>();
+        assert_eq!(input_messages, vec![WM_INPUT, WM_LBUTTONDOWN, WM_KEYDOWN]);
+        assert!(!unsafe { crate::window::input_priority_requested(main.hwnd) });
+    }
+
+    #[test]
+    fn message_loop_failure_destroys_parent_before_return() {
+        // Break caught: disarming the parent teardown guard before entering the fallible message
+        // loop can leak a live HWND and unload Scintilla without running WM_NCDESTROY cleanup.
+        let window = ProductionWindow::new(make_app());
+        let teardown = ParentWindowGuard::new(window.hwnd);
+
+        let error = finish_message_loop(window.hwnd, teardown, |_hwnd| {
+            Err(FastPadError::Invariant("expected message loop failure"))
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FastPadError::Invariant("expected message loop failure")
+        ));
+        assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+    }
+
+    #[test]
+    fn editor_initialization_rechecks_window_after_reentrant_creation() {
+        // Break caught: retaining or reusing App state across reentrant Editor::create can install
+        // an editor into window state that WM_NCDESTROY has already dropped.
+        let _scintilla = load_scintilla_module().unwrap();
+        let window = ProductionWindow::new(make_app());
+
+        let error = unsafe {
+            initialize_editor_with(window.hwnd, |parent| {
+                let editor = Editor::create(parent)?;
+                DestroyWindow(parent);
+                Ok(editor)
+            })
+        }
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FastPadError::Invariant("main window was destroyed during editor initialization")
+        ));
+        assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
     }
 
     fn pump_thread_messages() {
@@ -261,110 +371,46 @@ mod tests {
         }
     }
 
-    struct TestWindow {
-        hwnd: HWND,
-        class_name: Vec<u16>,
-        instance: HMODULE,
-        _state: Arc<Mutex<Vec<u32>>>,
+    fn pump_until_message(hwnd: HWND, expected: u32) {
+        for _ in 0..32 {
+            match pump_next_available_message(hwnd).unwrap() {
+                Some(message) if message == expected => return,
+                Some(_) => {}
+                None => panic!("message queue emptied before expected message {expected}"),
+            }
+        }
+        panic!("expected message {expected} was not dispatched within 32 queue steps");
     }
 
-    impl TestWindow {
-        fn new(state: Arc<Mutex<Vec<u32>>>) -> Self {
+    fn make_app() -> Box<App> {
+        Box::new(App::new(
+            LaunchOptions::default(),
+            StartupMetrics::with_frequency(1, 0),
+        ))
+    }
+
+    struct ProductionWindow {
+        hwnd: HWND,
+        _class: MainWindowClass,
+    }
+
+    impl ProductionWindow {
+        fn new(app: Box<App>) -> Self {
             let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
-            let class_name = wide_null("FastPadBootstrapQueueTest");
-            let window_class = WNDCLASSW {
-                lpfnWndProc: Some(test_window_proc),
-                hInstance: instance,
-                lpszClassName: class_name.as_ptr(),
-                ..Default::default()
-            };
-            let atom = unsafe { RegisterClassW(&window_class) };
-            assert_ne!(atom, 0);
-
-            let hwnd = unsafe {
-                CreateWindowExW(
-                    0,
-                    class_name.as_ptr(),
-                    class_name.as_ptr(),
-                    WS_OVERLAPPEDWINDOW,
-                    0,
-                    0,
-                    100,
-                    100,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    instance,
-                    Arc::into_raw(Arc::clone(&state)) as *const _,
-                )
-            };
-            assert!(!hwnd.is_null());
-
+            let class = MainWindowClass::register(instance).unwrap();
+            let mut context = WindowCreateContext::new(app);
+            let hwnd = class.create(&mut context).unwrap();
             Self {
                 hwnd,
-                class_name,
-                instance,
-                _state: state,
+                _class: class,
             }
         }
     }
 
-    impl Drop for TestWindow {
+    impl Drop for ProductionWindow {
         fn drop(&mut self) {
             unsafe {
                 let _ = DestroyWindow(self.hwnd);
-                UnregisterClassW(self.class_name.as_ptr(), self.instance);
-            }
-        }
-    }
-
-    unsafe extern "system" fn test_window_proc(
-        hwnd: HWND,
-        message: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        match message {
-            windows_sys::Win32::UI::WindowsAndMessaging::WM_NCCREATE => {
-                let create = unsafe {
-                    &*(lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CREATESTRUCTW)
-                };
-                unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                        hwnd,
-                        windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
-                        create.lpCreateParams as isize,
-                    );
-                }
-                1
-            }
-            windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY => {
-                let raw = unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                        hwnd,
-                        windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
-                        0,
-                    ) as *const Mutex<Vec<u32>>
-                };
-                if !raw.is_null() {
-                    unsafe {
-                        drop(Arc::from_raw(raw));
-                    }
-                }
-                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-            }
-            _ => {
-                let raw = unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                        hwnd,
-                        windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
-                    ) as *const Mutex<Vec<u32>>
-                };
-                if !raw.is_null() {
-                    unsafe {
-                        (*raw).lock().unwrap().push(message);
-                    }
-                }
-                0
             }
         }
     }
