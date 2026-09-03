@@ -194,3 +194,186 @@ Remaining concerns:
 - Raw RED stdout from the prior agent was not archived; only the test-first source and expected RED
   failure contract were available for audit.
 - GUI windows may briefly flash during live benchmarking by design.
+
+## Fix round 1 — independent review
+
+Review base: `5173e30e0dc3514f0267488b0db60bcc5b61721d`.
+
+Status: `DONE_WITH_CONCERNS` — all seven Important findings were validated and fixed. The report-only
+minor is also addressed below. The remaining concerns are measured performance, not harness
+correctness.
+
+### Findings and resolutions
+
+1. **Private-memory semantics — validated.** `PROCESS_MEMORY_COUNTERS_EX::PrivateUsage` is private
+   commit charge, not resident private working set. The harness now prefers
+   `PROCESS_MEMORY_COUNTERS_EX2::PrivateWorkingSetSize`. Because EX2 requires a fully updated Windows
+   10 22H2/Windows 11 22H2 or newer system, older supported Windows 10 builds fall back to
+   enumerating committed regions with `VirtualQueryEx`, querying page residency/sharing with
+   `QueryWorkingSetEx`, and counting only valid pages whose Shared bit is clear.
+2. **Shared-frame coherence and premature signaling — validated.** The mapped transport now uses an
+   aligned generation plus atomic header/record fields. The single writer marks an odd generation,
+   updates all fields, then publishes an even generation with sequentially consistent operations;
+   readers accept only identical, nonzero even generations around their atomic snapshot. Rendered
+   input signals the event only when QPC capture, record-once insertion, and coherent publication
+   all succeed.
+3. **Console cleanup handle race/lifecycle gap — validated; suggested mechanism refined.** The old
+   control handler and borrowed global process handle were removed. Each run creates a job with
+   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Rather than create suspended, then assign (which still has a
+   post-create/pre-assignment gap), Windows 10's `PROC_THREAD_ATTRIBUTE_JOB_LIST` assigns the child
+   atomically during `CreateProcessW`. `IsProcessInJob` verifies the association. Closing the job is
+   the primary error/termination cleanup, with bounded wait and direct termination only as a final
+   same-thread fallback.
+4. **Unchecked `WM_NOTIFY` payload size — validated.** The parent subclass now reads only `NMHDR`,
+   validates `hwndFrom` and `SCN_MODIFIED`, and only then lazily casts to the larger Scintilla
+   notification prefix to read `modification_type`.
+5. **Broad inherited-handle set — validated.** Process creation now uses `STARTUPINFOEXW` and
+   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` containing exactly the mapping and event. The child requires
+   `HANDLE_FLAG_INHERIT` on both adopted handles and clears the bit before using them.
+6. **Unbounded scalar Scintilla reads — validated.** `SCI_GETLENGTH` and every `SCI_GETCHARAT` now use
+   `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT` and a five-second bound. Timeout
+   or target-exit errors propagate through benchmark-character verification.
+7. **Incomplete validation and integer narrowing — validated.** Records require a nonzero PID;
+   child records separately match the launched PID; persisted records no longer perform a
+   tautological PID comparison. Ordering requires process -> window -> editor, editor before paint
+   and accepted input, accepted before rendered input, and paint -> settings -> file -> ready.
+   Comparison output and bootstrap deltas use `i128`, preserving the complete JSON `u64` range.
+
+### Focused RED/GREEN evidence
+
+Memory semantics:
+
+```text
+cargo test --bin fastpad-bench private_working_set_uses_resident_private_pages_not_commit_charge
+RED: unresolved private-working-set selection/page-accounting helpers
+GREEN: 1 passed; 0 failed
+```
+
+Shared publication and successful-write signaling:
+
+```text
+cargo test perf::protocol::tests --lib
+RED: SharedBenchmarkFrame absent; set_milestone returned () rather than write success
+GREEN: 8 passed at that cycle; 0 failed
+```
+
+Safe notification discrimination:
+
+```text
+cargo test perf::protocol::tests::unrelated_notification_does_not_read_scintilla_only_payload --lib
+RED: lazy Scintilla notification discriminator absent
+GREEN: 1 passed; 0 failed
+```
+
+Bounded scalar verification:
+
+```text
+cargo test --bin fastpad-bench benchmark_character_verification
+RED: verifier closure could not return/propagate timeout errors
+GREEN: 2 passed; 0 failed
+```
+
+Record validation and full-range deltas:
+
+```text
+cargo test --bin fastpad-bench comparison_delta_preserves_the_full_u64_timing_range
+RED: expected (i128, i128), implementation returned (i64, i64)
+GREEN: 1 passed; 0 failed
+
+# Mutation check: temporarily removed the new PID/order guards
+cargo test --bin fastpad-bench record_validation_rejects_missing_or_misordered_milestones
+RED: assertion failed because the impossible frame was accepted
+# Restored guards
+GREEN: 1 passed; 0 failed
+```
+
+Inherited handle validation and allowlisting:
+
+```text
+cargo test perf::protocol::tests::diagnostic_handles_must_arrive_with_inheritance_enabled --lib
+RED: inherited-handle flag validator absent
+GREEN: 1 passed; 0 failed
+
+cargo test --bin fastpad-bench diagnostic_handle_allowlist_contains_only_mapping_and_event
+RED: diagnostic handle allowlist absent
+GREEN: 1 passed; 0 failed
+```
+
+Kill-on-close job:
+
+```text
+cargo test --bin fastpad-bench cleanup_job_is_configured_to_kill_children_when_harness_closes
+RED: JobObjects feature and cleanup-job constructor absent
+GREEN: 1 passed; 0 failed
+```
+
+An abrupt-lifecycle integration check launched the release harness, observed FastPad child PID
+7276, force-terminated the harness, and confirmed `abrupt_cleanup_reaped_child=true` and
+`fastpad_processes_after_abrupt_test=0`.
+
+### Fix-round verification
+
+Focused aggregate suites:
+
+```text
+cargo test --bin fastpad-bench
+13 passed; 0 failed
+
+cargo test perf::protocol::tests --lib
+10 passed; 0 failed
+```
+
+Serialized full suite:
+
+```text
+cargo test --lib -- --test-threads=1
+39 passed; 0 failed
+
+cargo test --bin fastpad-bench -- --test-threads=1
+13 passed; 0 failed
+
+cargo test --test editor_control -- --test-threads=1
+5 passed; 0 failed
+
+cargo test --test startup_smoke -- --test-threads=1
+6 passed; 0 failed
+```
+
+Fresh live release distribution:
+
+```text
+cargo build --release --bin fastpad
+cargo run --release --bin fastpad-bench -- --runs 20 --warmup 5 --output %TEMP%\fastpad-task7-fix-round1.jsonl
+20 measured records; 20 valid JSONL lines; 0 malformed lines; exit 0
+
+process_start: p50=9525us p95=10683us
+window_created: p50=14369us p95=15999us
+editor_created: p50=23552us p95=27479us
+first_paint: p50=33092us p95=36652us
+first_input_accepted: p50=32764us p95=36067us
+first_input_rendered: p50=34014us p95=38672us
+settings_loaded: p50=33119us p95=36832us
+file_loaded: p50=33126us p95=36966us
+fully_ready: p50=33154us p95=36996us
+idle_private_working_set_bytes: p50=1675264 p95=1720320
+valid_records=20
+fastpad_processes_after_benchmark=0
+```
+
+Quality gates were rerun after implementation:
+
+```text
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo check --all-targets --target x86_64-pc-windows-msvc
+cargo build --release --bins --target x86_64-pc-windows-msvc
+```
+
+### Updated performance concern
+
+The corrected fresh run's rendered-input TTI p95 (`38,672` microseconds) was below the 40 ms limit,
+but p50 (`34,014` microseconds) still exceeded the 25 ms limit. First paint p50 was `33,092`
+microseconds, also above the design's 20 ms goal; the original run's first-paint p50 (`34,291`
+microseconds) missed it as well. These are explicit performance concerns for reference-machine
+investigation, not correctness failures in the distribution harness. Correct resident-private
+memory was 1.68 MB p50 / 1.72 MB p95, comfortably below the 20 MB budget.

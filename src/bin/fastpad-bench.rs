@@ -1,34 +1,9 @@
 use fastpad::perf::protocol::BenchmarkRecord;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, Ordering};
 
 const BOOTSTRAP_RESAMPLES: usize = 10_000;
 const BOOTSTRAP_SEED: u64 = 0xFA57_0A0D;
-static ACTIVE_CHILD: AtomicIsize = AtomicIsize::new(0);
-
-struct ActiveChildRegistration(isize);
-
-impl ActiveChildRegistration {
-    fn new(handle: isize) -> Self {
-        ACTIVE_CHILD.store(handle, Ordering::Release);
-        Self(handle)
-    }
-
-    fn clear(&self) {
-        let _ = ACTIVE_CHILD.compare_exchange(self.0, 0, Ordering::AcqRel, Ordering::Acquire);
-    }
-}
-
-impl Drop for ActiveChildRegistration {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-fn active_child_handle() -> isize {
-    ACTIVE_CHILD.load(Ordering::Acquire)
-}
 
 #[derive(Debug, Eq, PartialEq)]
 enum Action {
@@ -127,17 +102,25 @@ fn record_to_json_line(record: &BenchmarkRecord) -> String {
 }
 
 fn validate_record(record: &BenchmarkRecord, expected_pid: u32) -> Result<(), String> {
+    validate_record_fields(record)?;
+    if record.pid != expected_pid {
+        return Err(format!(
+            "diagnostic PID {} did not match child PID {expected_pid}",
+            record.pid
+        ));
+    }
+    Ok(())
+}
+
+fn validate_record_fields(record: &BenchmarkRecord) -> Result<(), String> {
     if record.version != fastpad::perf::protocol::BENCHMARK_VERSION {
         return Err(format!(
             "unsupported benchmark record version {}",
             record.version
         ));
     }
-    if record.pid != expected_pid {
-        return Err(format!(
-            "diagnostic PID {} did not match child PID {expected_pid}",
-            record.pid
-        ));
+    if record.pid == 0 {
+        return Err("diagnostic record has a zero PID".to_owned());
     }
     let milestones = [
         record.process_start_us,
@@ -156,7 +139,9 @@ fn validate_record(record: &BenchmarkRecord, expected_pid: u32) -> Result<(), St
     if !(record.process_start_us <= record.window_created_us
         && record.window_created_us <= record.editor_created_us
         && record.editor_created_us <= record.first_paint_us
+        && record.editor_created_us <= record.first_input_accepted_us
         && record.first_input_accepted_us <= record.first_input_rendered_us
+        && record.first_paint_us <= record.settings_loaded_us
         && record.settings_loaded_us <= record.file_loaded_us
         && record.file_loaded_us <= record.fully_ready_us)
     {
@@ -190,59 +175,12 @@ fn run_main() -> Result<i32, String> {
             warmup,
             output,
             enforce_reference,
-        } => {
-            install_console_cleanup()?;
-            run_distribution(runs, warmup, &output, enforce_reference)
-        }
+        } => run_distribution(runs, warmup, &output, enforce_reference),
         Action::Compare {
             baseline,
             candidate,
         } => compare_distributions(&baseline, &candidate),
     }
-}
-
-#[cfg(not(windows))]
-fn install_console_cleanup() -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(windows)]
-fn install_console_cleanup() -> Result<(), String> {
-    if unsafe {
-        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(console_control_handler), 1)
-    } == 0
-    {
-        Err(fastpad::platform::last_error().to_string())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn console_control_handler(control: u32) -> windows_sys::core::BOOL {
-    use windows_sys::Win32::System::Console::{
-        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
-    };
-    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-    if !matches!(
-        control,
-        CTRL_C_EVENT
-            | CTRL_BREAK_EVENT
-            | CTRL_CLOSE_EVENT
-            | CTRL_LOGOFF_EVENT
-            | CTRL_SHUTDOWN_EVENT
-    ) {
-        return 0;
-    }
-    let raw = active_child_handle();
-    if raw != 0 {
-        let handle = raw as windows_sys::Win32::Foundation::HANDLE;
-        unsafe {
-            TerminateProcess(handle, 1);
-            WaitForSingleObject(handle, 5_000);
-        }
-    }
-    1
 }
 
 fn run_distribution(
@@ -357,7 +295,7 @@ fn compare_distributions(
         candidate_sorted.sort_unstable();
         let baseline_p95 = percentile(&baseline_sorted, 0.95);
         let candidate_p95 = percentile(&candidate_sorted, 0.95);
-        let delta = candidate_p95 as i64 - baseline_p95 as i64;
+        let delta = candidate_p95 as i128 - baseline_p95 as i128;
         let (lower, upper) = bootstrap_p95_delta_ci(&baseline_values, &candidate_values);
         let regressed = is_regression(&baseline_values, &candidate_values);
         println!(
@@ -388,7 +326,7 @@ fn read_records(path: &std::path::Path) -> Result<Vec<BenchmarkRecord>, String> 
         })?;
         let record = record_from_json(&value)
             .map_err(|error| format!("{} line {}: {error}", path.display(), index + 1))?;
-        validate_record(&record, record.pid)?;
+        validate_record_fields(&record)?;
         records.push(record);
     }
     if records.is_empty() {
@@ -429,10 +367,131 @@ fn run_once() -> Result<BenchmarkRecord, String> {
     Err("the startup benchmark requires Windows".to_owned())
 }
 
+fn diagnostic_handle_allowlist(
+    mapping: windows_sys::Win32::Foundation::HANDLE,
+    event: windows_sys::Win32::Foundation::HANDLE,
+) -> [windows_sys::Win32::Foundation::HANDLE; 2] {
+    [mapping, event]
+}
+
+#[cfg(windows)]
+struct ProcThreadAttributeList {
+    _storage: Vec<usize>,
+    pointer: windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+#[cfg(windows)]
+impl ProcThreadAttributeList {
+    fn with_diagnostic_resources(
+        handles: &[windows_sys::Win32::Foundation::HANDLE],
+        jobs: &[windows_sys::Win32::Foundation::HANDLE],
+    ) -> Result<Self, String> {
+        use windows_sys::Win32::System::Threading::{
+            InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST, UpdateProcThreadAttribute,
+        };
+
+        let handle_bytes = handles
+            .len()
+            .checked_mul(std::mem::size_of::<windows_sys::Win32::Foundation::HANDLE>())
+            .ok_or_else(|| "diagnostic handle-list size overflowed".to_owned())?;
+        let job_bytes = jobs
+            .len()
+            .checked_mul(std::mem::size_of::<windows_sys::Win32::Foundation::HANDLE>())
+            .ok_or_else(|| "cleanup job-list size overflowed".to_owned())?;
+        let mut byte_len = 0_usize;
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut byte_len);
+        }
+        if byte_len == 0 {
+            return Err("could not size process attribute list".to_owned());
+        }
+        let word_len = byte_len.div_ceil(std::mem::size_of::<usize>());
+        let mut storage = vec![0_usize; word_len];
+        let pointer = storage.as_mut_ptr().cast();
+        if unsafe { InitializeProcThreadAttributeList(pointer, 2, 0, &mut byte_len) } == 0 {
+            return Err(fastpad::platform::last_error().to_string());
+        }
+        if unsafe {
+            UpdateProcThreadAttribute(
+                pointer,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                handle_bytes,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            unsafe {
+                windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList(pointer);
+            }
+            return Err(fastpad::platform::last_error().to_string());
+        }
+        if unsafe {
+            UpdateProcThreadAttribute(
+                pointer,
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                jobs.as_ptr().cast(),
+                job_bytes,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            unsafe {
+                windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList(pointer);
+            }
+            return Err(fastpad::platform::last_error().to_string());
+        }
+        Ok(Self {
+            _storage: storage,
+            pointer,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn create_cleanup_job() -> Result<fastpad::platform::OwnedHandle, String> {
+    use fastpad::platform::OwnedHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    let job = unsafe { OwnedHandle::from_raw_owned(raw) }.map_err(|error| error.to_string())?;
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw(),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == 0
+    {
+        return Err(fastpad::platform::last_error().to_string());
+    }
+    Ok(job)
+}
+
+#[cfg(windows)]
+impl Drop for ProcThreadAttributeList {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList(self.pointer);
+        }
+    }
+}
+
 #[cfg(windows)]
 fn run_once() -> Result<BenchmarkRecord, String> {
     use fastpad::perf::protocol::{
-        BENCHMARK_FRAME_LEN, BENCHMARK_INPUT_CHAR, EVENT_HANDLE_ENV, MAPPING_HANDLE_ENV,
+        BENCHMARK_INPUT_CHAR, BENCHMARK_SHARED_FRAME_LEN, EVENT_HANDLE_ENV, MAPPING_HANDLE_ENV,
         QPC_ORIGIN_ENV,
     };
     use fastpad::platform::{OwnedHandle, last_error, wide_null};
@@ -445,7 +504,8 @@ fn run_once() -> Result<BenchmarkRecord, String> {
     };
     use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
     use windows_sys::Win32::System::Threading::{
-        CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+        CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
+        PROCESS_INFORMATION, STARTUPINFOEXW,
     };
 
     let executable = std::env::current_exe()
@@ -476,7 +536,7 @@ fn run_once() -> Result<BenchmarkRecord, String> {
             &security,
             PAGE_READWRITE,
             0,
-            BENCHMARK_FRAME_LEN as u32,
+            BENCHMARK_SHARED_FRAME_LEN as u32,
             mapping_name.as_ptr(),
         )
     };
@@ -491,7 +551,7 @@ fn run_once() -> Result<BenchmarkRecord, String> {
             FILE_MAP_READ | FILE_MAP_WRITE,
             0,
             0,
-            BENCHMARK_FRAME_LEN,
+            BENCHMARK_SHARED_FRAME_LEN,
         )
     };
     if view.Value.is_null() {
@@ -536,9 +596,17 @@ fn run_once() -> Result<BenchmarkRecord, String> {
         .encode_utf16()
         .chain([0])
         .collect::<Vec<_>>();
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
+    let cleanup_job = create_cleanup_job()?;
+    let inherited_handles = diagnostic_handle_allowlist(mapping.as_raw(), event.as_raw());
+    let cleanup_jobs = [cleanup_job.as_raw()];
+    let attributes =
+        ProcThreadAttributeList::with_diagnostic_resources(&inherited_handles, &cleanup_jobs)?;
+    let startup = STARTUPINFOEXW {
+        StartupInfo: windows_sys::Win32::System::Threading::STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+            ..Default::default()
+        },
+        lpAttributeList: attributes.pointer,
     };
     let mut process_info = PROCESS_INFORMATION::default();
     let mut origin = 0_i64;
@@ -556,10 +624,10 @@ fn run_once() -> Result<BenchmarkRecord, String> {
             std::ptr::null(),
             std::ptr::null(),
             1,
-            CREATE_UNICODE_ENVIRONMENT,
+            CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             environment.as_ptr().cast(),
             std::ptr::null(),
-            &startup,
+            (&startup as *const STARTUPINFOEXW).cast(),
             &mut process_info,
         )
     };
@@ -571,7 +639,19 @@ fn run_once() -> Result<BenchmarkRecord, String> {
     drop(thread);
     let process = unsafe { OwnedHandle::from_raw_owned(process_info.hProcess) }
         .map_err(|error| error.to_string())?;
-    let child = ChildGuard::new(process, process_info.dwProcessId);
+    let mut assigned_to_cleanup_job = 0;
+    if unsafe {
+        windows_sys::Win32::System::JobObjects::IsProcessInJob(
+            process.as_raw(),
+            cleanup_job.as_raw(),
+            &mut assigned_to_cleanup_job,
+        )
+    } == 0
+        || assigned_to_cleanup_job == 0
+    {
+        return Err("FastPad was not atomically assigned to its cleanup job".to_owned());
+    }
+    let mut child = ChildGuard::new(cleanup_job, process, process_info.dwProcessId);
 
     let main_hwnd = wait_for_main_window(&child)?;
     let scintilla = wait_for_scintilla(main_hwnd, &child)?;
@@ -639,7 +719,7 @@ fn write_fixed_decimal(target: &mut [u16], value: i64) -> Result<(), String> {
 
 #[cfg(windows)]
 struct ChildGuard {
-    active: ActiveChildRegistration,
+    job: Option<fastpad::platform::OwnedHandle>,
     process: fastpad::platform::OwnedHandle,
     pid: u32,
     closed: std::cell::Cell<bool>,
@@ -647,17 +727,20 @@ struct ChildGuard {
 
 #[cfg(windows)]
 impl ChildGuard {
-    fn new(process: fastpad::platform::OwnedHandle, pid: u32) -> Self {
-        let active = ActiveChildRegistration::new(process.as_raw() as isize);
+    fn new(
+        job: fastpad::platform::OwnedHandle,
+        process: fastpad::platform::OwnedHandle,
+        pid: u32,
+    ) -> Self {
         Self {
-            active,
+            job: Some(job),
             process,
             pid,
             closed: std::cell::Cell::new(false),
         }
     }
 
-    fn close(&self, hwnd: windows_sys::Win32::Foundation::HWND) -> Result<(), String> {
+    fn close(&mut self, hwnd: windows_sys::Win32::Foundation::HWND) -> Result<(), String> {
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -673,7 +756,7 @@ impl ChildGuard {
         if unsafe { WaitForSingleObject(self.process.as_raw(), 5_000) } != WAIT_OBJECT_0 {
             return Err("FastPad did not exit after WM_CLOSE".to_owned());
         }
-        self.active.clear();
+        self.job.take();
         self.closed.set(true);
         Ok(())
     }
@@ -687,12 +770,15 @@ impl Drop for ChildGuard {
         if !self.closed.get()
             && unsafe { WaitForSingleObject(self.process.as_raw(), 0) } != WAIT_OBJECT_0
         {
+            self.job.take();
+            if unsafe { WaitForSingleObject(self.process.as_raw(), 5_000) } == WAIT_OBJECT_0 {
+                return;
+            }
             unsafe {
                 TerminateProcess(self.process.as_raw(), 1);
                 WaitForSingleObject(self.process.as_raw(), 5_000);
             }
         }
-        self.active.clear();
     }
 }
 
@@ -815,7 +901,7 @@ fn send_benchmark_char(
 
 fn verify_benchmark_utf8(
     length: usize,
-    mut get_byte: impl FnMut(usize) -> u8,
+    mut get_byte: impl FnMut(usize) -> Result<u8, String>,
 ) -> Result<(), String> {
     let expected = "\u{E000}".as_bytes();
     if length != expected.len() {
@@ -825,7 +911,7 @@ fn verify_benchmark_utf8(
         ));
     }
     for (index, expected_byte) in expected.iter().copied().enumerate() {
-        let actual = get_byte(index);
+        let actual = get_byte(index)?;
         if actual != expected_byte {
             return Err(format!(
                 "Scintilla benchmark byte {index} was {actual:#04x}, expected {expected_byte:#04x}"
@@ -861,29 +947,52 @@ fn wait_for_event(
 #[cfg(windows)]
 fn verify_benchmark_char(editor: windows_sys::Win32::Foundation::HWND) -> Result<(), String> {
     use fastpad::editor::scintilla_constants::SCI_GETLENGTH;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
     const SCI_GETCHARAT: u32 = 2007;
-    let length = unsafe { SendMessageW(editor, SCI_GETLENGTH, 0, 0) };
+    let length = send_scintilla_scalar(editor, SCI_GETLENGTH, 0)? as isize;
     if length < 0 {
         return Err("Scintilla did not retain the benchmark character".to_owned());
     }
-    verify_benchmark_utf8(length as usize, |index| unsafe {
-        SendMessageW(editor, SCI_GETCHARAT, index, 0) as u8
+    verify_benchmark_utf8(length as usize, |index| {
+        send_scintilla_scalar(editor, SCI_GETCHARAT, index).map(|value| value as u8)
     })
 }
 
 #[cfg(windows)]
+fn send_scintilla_scalar(
+    editor: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    wparam: usize,
+) -> Result<usize, String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SendMessageTimeoutW,
+    };
+    let mut result = 0_usize;
+    if unsafe {
+        SendMessageTimeoutW(
+            editor,
+            message,
+            wparam,
+            0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            5_000,
+            &mut result,
+        )
+    } == 0
+    {
+        Err(fastpad::platform::last_error().to_string())
+    } else {
+        Ok(result)
+    }
+}
+
+#[cfg(windows)]
 fn wait_for_fully_ready(view: *const u8, guard: &ChildGuard) -> Result<BenchmarkRecord, String> {
-    use fastpad::perf::protocol::BENCHMARK_FRAME_LEN;
+    use fastpad::perf::protocol::read_shared_record;
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let mut bytes = [0_u8; BENCHMARK_FRAME_LEN];
-        unsafe {
-            std::ptr::copy_nonoverlapping(view, bytes.as_mut_ptr(), bytes.len());
-        }
-        if let Ok(record) = BenchmarkRecord::decode(&bytes)
+        if let Some(record) = unsafe { read_shared_record(view) }.map_err(str::to_owned)?
             && record.fully_ready_us != 0
         {
             return Ok(record);
@@ -901,20 +1010,135 @@ fn wait_for_fully_ready(view: *const u8, guard: &ChildGuard) -> Result<Benchmark
 #[cfg(windows)]
 fn private_working_set(process: windows_sys::Win32::Foundation::HANDLE) -> Result<u64, String> {
     use windows_sys::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
     };
-    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
-    if unsafe {
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32,
+        ..Default::default()
+    };
+    let ex2_value = (unsafe {
         GetProcessMemoryInfo(
             process,
-            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX2).cast::<PROCESS_MEMORY_COUNTERS>(),
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32,
         )
-    } == 0
-    {
-        return Err(fastpad::platform::last_error().to_string());
+    } != 0
+        && counters.PrivateWorkingSetSize != 0)
+        .then_some(counters.PrivateWorkingSetSize as u64);
+    select_private_working_set(ex2_value, || private_working_set_via_page_query(process))
+}
+
+fn select_private_working_set(
+    ex2_value: Option<u64>,
+    fallback: impl FnOnce() -> Result<u64, String>,
+) -> Result<u64, String> {
+    ex2_value.map_or_else(fallback, Ok)
+}
+
+fn private_bytes_from_working_set_flags(flags: &[usize], page_size: u64) -> u64 {
+    const VALID: usize = 1;
+    const SHARED: usize = 1 << 15;
+    flags
+        .iter()
+        .filter(|flags| **flags & VALID != 0 && **flags & SHARED == 0)
+        .count() as u64
+        * page_size
+}
+
+#[cfg(windows)]
+fn private_working_set_via_page_query(
+    process: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<u64, String> {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQueryEx,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    const QUERY_BATCH_PAGES: usize = 4096;
+    let mut system_info = SYSTEM_INFO::default();
+    unsafe { GetSystemInfo(&mut system_info) };
+    let page_size = u64::from(system_info.dwPageSize);
+    if page_size == 0 {
+        return Err("GetSystemInfo returned a zero page size".to_owned());
     }
-    Ok(counters.PrivateUsage as u64)
+
+    let maximum_address = system_info.lpMaximumApplicationAddress as usize;
+    let mut address = 0_usize;
+    let mut private_bytes = 0_u64;
+    let mut pages = Vec::with_capacity(QUERY_BATCH_PAGES);
+
+    let query_pages = |pages: &mut Vec<PSAPI_WORKING_SET_EX_INFORMATION>,
+                       private_bytes: &mut u64|
+     -> Result<(), String> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let byte_len = pages
+            .len()
+            .checked_mul(std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "working-set query batch exceeded DWORD size".to_owned())?;
+        if unsafe { K32QueryWorkingSetEx(process, pages.as_mut_ptr().cast(), byte_len) } == 0 {
+            return Err(fastpad::platform::last_error().to_string());
+        }
+        let flags = pages
+            .iter()
+            .map(|page| unsafe { page.VirtualAttributes.Flags })
+            .collect::<Vec<_>>();
+        *private_bytes = private_bytes
+            .checked_add(private_bytes_from_working_set_flags(&flags, page_size))
+            .ok_or_else(|| "private working-set byte count overflowed".to_owned())?;
+        pages.clear();
+        Ok(())
+    };
+
+    while address < maximum_address {
+        let mut information = MEMORY_BASIC_INFORMATION::default();
+        let queried = unsafe {
+            VirtualQueryEx(
+                process,
+                address as *const core::ffi::c_void,
+                &mut information,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
+                break;
+            }
+            return Err(fastpad::platform::last_error().to_string());
+        }
+
+        let base = information.BaseAddress as usize;
+        let next = base
+            .checked_add(information.RegionSize)
+            .ok_or_else(|| "virtual-memory region address overflowed".to_owned())?;
+        if information.State == MEM_COMMIT {
+            let mut page = base;
+            while page < next {
+                pages.push(PSAPI_WORKING_SET_EX_INFORMATION {
+                    VirtualAddress: page as *mut core::ffi::c_void,
+                    ..Default::default()
+                });
+                if pages.len() == QUERY_BATCH_PAGES {
+                    query_pages(&mut pages, &mut private_bytes)?;
+                }
+                page = page
+                    .checked_add(page_size as usize)
+                    .ok_or_else(|| "virtual page address overflowed".to_owned())?;
+            }
+        }
+        if next <= address {
+            return Err("VirtualQueryEx did not advance the address".to_owned());
+        }
+        address = next;
+    }
+    query_pages(&mut pages, &mut private_bytes)?;
+    Ok(private_bytes)
 }
 
 fn percentile(sorted: &[u64], percentile: f64) -> u64 {
@@ -942,7 +1166,7 @@ fn is_regression(baseline: &[u64], candidate: &[u64]) -> bool {
     delta >= material_delta && lower > 0
 }
 
-fn bootstrap_p95_delta_ci(baseline: &[u64], candidate: &[u64]) -> (i64, i64) {
+fn bootstrap_p95_delta_ci(baseline: &[u64], candidate: &[u64]) -> (i128, i128) {
     assert!(!baseline.is_empty());
     assert!(!candidate.is_empty());
     let mut rng = DeterministicRng::new(BOOTSTRAP_SEED);
@@ -960,7 +1184,8 @@ fn bootstrap_p95_delta_ci(baseline: &[u64], candidate: &[u64]) -> (i64, i64) {
         baseline_sample.sort_unstable();
         candidate_sample.sort_unstable();
         deltas.push(
-            percentile(&candidate_sample, 0.95) as i64 - percentile(&baseline_sample, 0.95) as i64,
+            percentile(&candidate_sample, 0.95) as i128
+                - percentile(&baseline_sample, 0.95) as i128,
         );
     }
 
@@ -971,7 +1196,7 @@ fn bootstrap_p95_delta_ci(baseline: &[u64], candidate: &[u64]) -> (i64, i64) {
     )
 }
 
-fn signed_percentile(sorted: &[i64], percentile: f64) -> i64 {
+fn signed_percentile(sorted: &[i128], percentile: f64) -> i128 {
     let index = ((sorted.len() - 1) as f64 * percentile).ceil() as usize;
     sorted[index]
 }
@@ -994,9 +1219,10 @@ impl DeterministicRng {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, ActiveChildRegistration, active_child_handle, bootstrap_p95_delta_ci,
-        is_fastpad_main_window_class, is_regression, parse_args, percentile, record_to_json_line,
-        reference_thresholds_pass, validate_record, verify_benchmark_utf8,
+        Action, bootstrap_p95_delta_ci, diagnostic_handle_allowlist, is_fastpad_main_window_class,
+        is_regression, parse_args, percentile, private_bytes_from_working_set_flags,
+        record_to_json_line, reference_thresholds_pass, select_private_working_set,
+        validate_record, verify_benchmark_utf8,
     };
     use fastpad::perf::protocol::BenchmarkRecord;
     use std::path::PathBuf;
@@ -1120,6 +1346,27 @@ mod tests {
         record.pid = 42;
         record.version = 2;
         assert!(validate_record(&record, 42).is_err());
+
+        record.version = 1;
+        record.editor_created_us = 6;
+        assert!(validate_record(&record, 42).is_err());
+        record.editor_created_us = 3;
+        record.first_paint_us = 8;
+        assert!(validate_record(&record, 42).is_err());
+        record.first_paint_us = 4;
+        record.pid = 0;
+        assert!(validate_record(&record, 0).is_err());
+    }
+
+    #[test]
+    fn comparison_delta_preserves_the_full_u64_timing_range() {
+        // Break caught: narrowing arbitrary JSON u64 timings to i64 wraps large candidate values
+        // and can hide a real positive regression.
+        let expected = u64::MAX as i128 - 1;
+        assert_eq!(
+            bootstrap_p95_delta_ci(&[1], &[u64::MAX]),
+            (expected, expected)
+        );
     }
 
     #[test]
@@ -1135,17 +1382,83 @@ mod tests {
         // Break caught: passing a harness-process buffer pointer to child-process SCI_GETTEXT
         // cannot retrieve the inserted UTF-8 bytes across the process boundary.
         let expected = "\u{E000}".as_bytes();
-        assert!(verify_benchmark_utf8(expected.len(), |index| expected[index]).is_ok());
-        assert!(verify_benchmark_utf8(expected.len(), |_| 0).is_err());
+        assert!(verify_benchmark_utf8(expected.len(), |index| Ok(expected[index])).is_ok());
+        assert!(verify_benchmark_utf8(expected.len(), |_| Ok(0)).is_err());
     }
 
     #[test]
-    fn active_child_registration_clears_the_console_interrupt_target() {
-        // Break caught: relying only on ChildGuard::drop lets Ctrl+C terminate the harness before
-        // Rust destructors run, leaving the currently benchmarked FastPad process orphaned.
-        let registration = ActiveChildRegistration::new(123);
-        assert_eq!(active_child_handle(), 123);
-        drop(registration);
-        assert_eq!(active_child_handle(), 0);
+    fn benchmark_character_verification_propagates_scalar_read_timeout() {
+        // Break caught: an unbounded or failed cross-process scalar read must not leave the
+        // harness blocked forever after the rendered-input event was signaled.
+        let error = verify_benchmark_utf8("\u{E000}".len(), |_| {
+            Err("Scintilla scalar read timed out".to_owned())
+        })
+        .unwrap_err();
+        assert_eq!(error, "Scintilla scalar read timed out");
+    }
+
+    #[test]
+    fn private_working_set_uses_resident_private_pages_not_commit_charge() {
+        // Break caught: persisting PROCESS_MEMORY_COUNTERS_EX::PrivateUsage reports private commit
+        // charge rather than the resident private working set required by the benchmark contract.
+        assert_eq!(
+            select_private_working_set(Some(1_048_576), || -> Result<u64, String> {
+                panic!("fallback must not run when EX2 supplied a resident value")
+            })
+            .unwrap(),
+            1_048_576
+        );
+        assert_eq!(
+            select_private_working_set(None, || Ok(524_288)).unwrap(),
+            524_288
+        );
+
+        const VALID: usize = 1;
+        const SHARED: usize = 1 << 15;
+        assert_eq!(
+            private_bytes_from_working_set_flags(&[VALID, VALID | SHARED, 0], 4096),
+            4096
+        );
+    }
+
+    #[test]
+    fn diagnostic_handle_allowlist_contains_only_mapping_and_event() {
+        // Break caught: CreateProcessW with broad inheritance leaks unrelated inheritable harness
+        // handles into FastPad instead of limiting inheritance to its two transport handles.
+        let mapping = 11_isize as windows_sys::Win32::Foundation::HANDLE;
+        let event = 12_isize as windows_sys::Win32::Foundation::HANDLE;
+        assert_eq!(
+            diagnostic_handle_allowlist(mapping, event),
+            [mapping, event]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_job_is_configured_to_kill_children_when_harness_closes() {
+        // Break caught: cleanup that depends on a Rust Drop or a borrowed process handle can leave
+        // FastPad alive when the harness is terminated before normal teardown.
+        use windows_sys::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        };
+        let job = super::create_cleanup_job().unwrap();
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        assert_ne!(
+            unsafe {
+                QueryInformationJobObject(
+                    job.as_raw(),
+                    JobObjectExtendedLimitInformation,
+                    (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_ne!(
+            limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            0
+        );
     }
 }

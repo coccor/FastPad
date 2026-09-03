@@ -93,6 +93,17 @@ pub fn validate_diagnostic_config(
     Ok(config)
 }
 
+fn validate_inherited_handle_flags(
+    mapping_flags: u32,
+    event_flags: u32,
+) -> Result<(), &'static str> {
+    let inherit = windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+    if mapping_flags & inherit == 0 || event_flags & inherit == 0 {
+        return Err("diagnostic handles were not inherited from the harness");
+    }
+    Ok(())
+}
+
 fn parse_usize(value: Option<String>, missing: &'static str) -> Result<usize, &'static str> {
     value
         .ok_or(missing)?
@@ -121,6 +132,126 @@ pub struct BenchmarkRecord {
     pub file_loaded_us: u64,
     pub fully_ready_us: u64,
     pub idle_private_working_set_bytes: u64,
+}
+
+#[repr(C, align(8))]
+struct SharedBenchmarkFrame {
+    magic: std::sync::atomic::AtomicU32,
+    sequence: std::sync::atomic::AtomicU32,
+    version: std::sync::atomic::AtomicU32,
+    pid: std::sync::atomic::AtomicU32,
+    values: [std::sync::atomic::AtomicU64; 10],
+}
+
+pub const BENCHMARK_SHARED_FRAME_LEN: usize = size_of::<SharedBenchmarkFrame>();
+
+impl Default for SharedBenchmarkFrame {
+    fn default() -> Self {
+        Self {
+            magic: std::sync::atomic::AtomicU32::new(0),
+            sequence: std::sync::atomic::AtomicU32::new(0),
+            version: std::sync::atomic::AtomicU32::new(0),
+            pid: std::sync::atomic::AtomicU32::new(0),
+            values: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+}
+
+impl SharedBenchmarkFrame {
+    fn publish(&self, record: BenchmarkRecord) -> bool {
+        use std::sync::atomic::Ordering;
+
+        let sequence = self.sequence.load(Ordering::SeqCst);
+        if sequence & 1 != 0
+            || self
+                .sequence
+                .compare_exchange(
+                    sequence,
+                    sequence.wrapping_add(1),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_err()
+        {
+            return false;
+        }
+
+        self.magic
+            .store(u32::from_le_bytes(*BENCHMARK_MAGIC), Ordering::SeqCst);
+        self.version.store(record.version, Ordering::SeqCst);
+        self.pid.store(record.pid, Ordering::SeqCst);
+        for (slot, value) in self.values.iter().zip([
+            record.process_start_us,
+            record.window_created_us,
+            record.editor_created_us,
+            record.first_paint_us,
+            record.first_input_accepted_us,
+            record.first_input_rendered_us,
+            record.settings_loaded_us,
+            record.file_loaded_us,
+            record.fully_ready_us,
+            record.idle_private_working_set_bytes,
+        ]) {
+            slot.store(value, Ordering::SeqCst);
+        }
+        self.sequence
+            .store(sequence.wrapping_add(2), Ordering::SeqCst);
+        true
+    }
+
+    fn read(&self) -> Option<BenchmarkRecord> {
+        use std::sync::atomic::Ordering;
+
+        let sequence = self.sequence.load(Ordering::SeqCst);
+        if sequence == 0 || sequence & 1 != 0 {
+            return None;
+        }
+        let magic = self.magic.load(Ordering::SeqCst);
+        let version = self.version.load(Ordering::SeqCst);
+        let pid = self.pid.load(Ordering::SeqCst);
+        let values: [u64; 10] =
+            std::array::from_fn(|index| self.values[index].load(Ordering::SeqCst));
+        if self.sequence.load(Ordering::SeqCst) != sequence
+            || magic != u32::from_le_bytes(*BENCHMARK_MAGIC)
+            || version != BENCHMARK_VERSION
+        {
+            return None;
+        }
+        Some(BenchmarkRecord {
+            version,
+            pid,
+            process_start_us: values[0],
+            window_created_us: values[1],
+            editor_created_us: values[2],
+            first_paint_us: values[3],
+            first_input_accepted_us: values[4],
+            first_input_rendered_us: values[5],
+            settings_loaded_us: values[6],
+            file_loaded_us: values[7],
+            fully_ready_us: values[8],
+            idle_private_working_set_bytes: values[9],
+        })
+    }
+
+    #[cfg(test)]
+    fn begin_write_for_test(&self) {
+        use std::sync::atomic::Ordering;
+        let previous = self.sequence.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(previous & 1, 0);
+    }
+}
+
+/// Reads one coherent record snapshot from an aligned mapped diagnostic frame.
+///
+/// # Safety
+///
+/// `view` must point to a readable mapping of at least `BENCHMARK_SHARED_FRAME_LEN` bytes whose
+/// base address is aligned for `SharedBenchmarkFrame`.
+pub unsafe fn read_shared_record(view: *const u8) -> Result<Option<BenchmarkRecord>, &'static str> {
+    if view.is_null() || !(view as usize).is_multiple_of(align_of::<SharedBenchmarkFrame>()) {
+        return Err("benchmark shared frame is null or misaligned");
+    }
+    Ok(unsafe { &*view.cast::<SharedBenchmarkFrame>() }.read())
 }
 
 #[cfg(windows)]
@@ -152,7 +283,9 @@ impl std::fmt::Debug for DiagnosticSession {
 impl DiagnosticSession {
     pub fn attach(diagnostic: bool) -> crate::Result<Option<std::rc::Rc<Self>>> {
         use crate::{FastPadError, platform::OwnedHandle};
-        use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE};
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        };
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         use windows_sys::Win32::System::Performance::{
             QueryPerformanceCounter, QueryPerformanceFrequency,
@@ -173,17 +306,31 @@ impl DiagnosticSession {
             validate_diagnostic_config(config, current_qpc).map_err(FastPadError::Invariant)?;
         let mapping_raw = config.mapping_handle as HANDLE;
         let event_raw = config.event_handle as HANDLE;
-        let mut flags = 0_u32;
-        if unsafe { GetHandleInformation(mapping_raw, &mut flags) } == 0
-            || unsafe { GetHandleInformation(event_raw, &mut flags) } == 0
+        let mapping = unsafe { OwnedHandle::from_raw_owned(mapping_raw)? };
+        let event = unsafe { OwnedHandle::from_raw_owned(event_raw)? };
+        let mut mapping_flags = 0_u32;
+        let mut event_flags = 0_u32;
+        if unsafe { GetHandleInformation(mapping.as_raw(), &mut mapping_flags) } == 0
+            || unsafe { GetHandleInformation(event.as_raw(), &mut event_flags) } == 0
         {
             return Err(crate::platform::last_error());
         }
-
-        let mapping = unsafe { OwnedHandle::from_raw_owned(mapping_raw)? };
-        let event = unsafe { OwnedHandle::from_raw_owned(event_raw)? };
-        let view =
-            unsafe { MapViewOfFile(mapping.as_raw(), FILE_MAP_WRITE, 0, 0, BENCHMARK_FRAME_LEN) };
+        validate_inherited_handle_flags(mapping_flags, event_flags)
+            .map_err(FastPadError::Invariant)?;
+        if unsafe { SetHandleInformation(mapping.as_raw(), HANDLE_FLAG_INHERIT, 0) } == 0
+            || unsafe { SetHandleInformation(event.as_raw(), HANDLE_FLAG_INHERIT, 0) } == 0
+        {
+            return Err(crate::platform::last_error());
+        }
+        let view = unsafe {
+            MapViewOfFile(
+                mapping.as_raw(),
+                FILE_MAP_WRITE,
+                0,
+                0,
+                BENCHMARK_SHARED_FRAME_LEN,
+            )
+        };
         if view.Value.is_null() {
             return Err(crate::platform::last_error());
         }
@@ -218,13 +365,15 @@ impl DiagnosticSession {
         Ok(Some(session))
     }
 
-    pub fn record_milestone(&self, milestone: crate::perf::Milestone, tick: i64) {
+    pub fn record_milestone(&self, milestone: crate::perf::Milestone, tick: i64) -> bool {
         if tick < self.qpc_origin {
-            return;
+            return false;
         }
         let micros = ((tick - self.qpc_origin) as i128 * 1_000_000 / self.frequency as i128) as u64;
-        self.record.borrow_mut().set_milestone(milestone, micros);
-        self.publish();
+        if !self.record.borrow_mut().set_milestone(milestone, micros) {
+            return false;
+        }
+        self.publish()
     }
 
     pub(crate) fn install_input_hooks(
@@ -275,24 +424,19 @@ impl DiagnosticSession {
         Ok(())
     }
 
-    fn record_now(&self, milestone: crate::perf::Milestone) {
+    fn record_now(&self, milestone: crate::perf::Milestone) -> bool {
         let mut tick = 0_i64;
         if unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut tick) }
             != 0
         {
-            self.record_milestone(milestone, tick);
+            return self.record_milestone(milestone, tick);
         }
+        false
     }
 
-    fn publish(&self) {
-        let bytes = self.record.borrow().encode();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.view.Value.cast::<u8>(),
-                BENCHMARK_FRAME_LEN,
-            );
-        }
+    fn publish(&self) -> bool {
+        let pointer = self.view.Value.cast::<SharedBenchmarkFrame>();
+        !pointer.is_null() && unsafe { &*pointer }.publish(*self.record.borrow())
     }
 }
 
@@ -353,19 +497,34 @@ unsafe extern "system" fn diagnostic_editor_subclass_proc(
     }
 
     if message == WM_CHAR && session.input.borrow_mut().accept_char(wparam) {
-        session.record_now(Milestone::FirstInputAccepted);
+        let _ = session.record_now(Milestone::FirstInputAccepted);
     }
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     if message == WM_PAINT
         && !session.editor_destroyed.get()
         && session.input.borrow_mut().finish_paint()
+        && session.record_now(Milestone::FirstInputRendered)
     {
-        session.record_now(Milestone::FirstInputRendered);
         unsafe {
             SetEvent(session.event.as_raw());
         }
     }
     result
+}
+
+fn is_scintilla_text_change(
+    source: windows_sys::Win32::Foundation::HWND,
+    expected_source: windows_sys::Win32::Foundation::HWND,
+    code: u32,
+    modification_type: impl FnOnce() -> i32,
+) -> bool {
+    if source != expected_source || code != crate::editor::scintilla_constants::SCN_MODIFIED {
+        return false;
+    }
+    modification_type()
+        & (crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
+            | crate::editor::scintilla_constants::SC_MOD_DELETETEXT) as i32
+        != 0
 }
 
 #[cfg(windows)]
@@ -394,15 +553,13 @@ unsafe extern "system" fn diagnostic_parent_subclass_proc(
             Rc::decrement_strong_count(raw);
         }
     } else if message == WM_NOTIFY && lparam != 0 {
-        let notification = unsafe { &*(lparam as *const ScintillaNotificationPrefix) };
-        let text_change = notification.modification_type
-            & (crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
-                | crate::editor::scintilla_constants::SC_MOD_DELETETEXT) as i32
-            != 0;
-        if notification.header.hwndFrom == session.editor_hwnd.get()
-            && notification.header.code == crate::editor::scintilla_constants::SCN_MODIFIED
-            && text_change
-        {
+        let header = unsafe { &*(lparam as *const windows_sys::Win32::UI::Controls::NMHDR) };
+        if is_scintilla_text_change(
+            header.hwndFrom,
+            session.editor_hwnd.get(),
+            header.code,
+            || unsafe { (*(lparam as *const ScintillaNotificationPrefix)).modification_type },
+        ) {
             session.input.borrow_mut().note_text_modified();
         }
     }
@@ -427,7 +584,7 @@ impl BenchmarkRecord {
         }
     }
 
-    pub fn set_milestone(&mut self, milestone: crate::perf::Milestone, micros: u64) {
+    pub fn set_milestone(&mut self, milestone: crate::perf::Milestone, micros: u64) -> bool {
         let slot = match milestone {
             crate::perf::Milestone::ProcessStart => &mut self.process_start_us,
             crate::perf::Milestone::WindowCreated => &mut self.window_created_us,
@@ -441,6 +598,9 @@ impl BenchmarkRecord {
         };
         if *slot == 0 {
             *slot = micros;
+            true
+        } else {
+            false
         }
     }
 
@@ -548,7 +708,8 @@ fn read_u64(bytes: &[u8], offset: &mut usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCHMARK_INPUT_CHAR, BenchmarkInputState, BenchmarkRecord, read_diagnostic_config,
+        BENCHMARK_INPUT_CHAR, BenchmarkInputState, BenchmarkRecord, SharedBenchmarkFrame,
+        is_scintilla_text_change, read_diagnostic_config, validate_inherited_handle_flags,
     };
     use std::cell::Cell;
 
@@ -632,5 +793,52 @@ mod tests {
         assert!(state.finish_paint());
         assert!(!state.accept_char(BENCHMARK_INPUT_CHAR));
         assert!(!state.finish_paint());
+    }
+
+    #[test]
+    fn shared_frame_reader_never_accepts_a_write_in_progress() {
+        // Break caught: copying the mapped record while its writer is updating fields can accept a
+        // torn combination of old and new milestone values.
+        let frame = SharedBenchmarkFrame::default();
+        let record = BenchmarkRecord::sample();
+        frame.publish(record);
+        assert_eq!(frame.read(), Some(record));
+
+        frame.begin_write_for_test();
+        assert_eq!(frame.read(), None);
+    }
+
+    #[test]
+    fn milestone_publish_reports_whether_a_timestamp_was_written() {
+        // Break caught: signaling the rendered-input event after QPC/recording failed lets the
+        // harness proceed even though no rendered timestamp was published.
+        let mut record = BenchmarkRecord::empty(42);
+        assert!(record.set_milestone(crate::perf::Milestone::FirstInputRendered, 100));
+        assert!(!record.set_milestone(crate::perf::Milestone::FirstInputRendered, 200));
+        assert_eq!(record.first_input_rendered_us, 100);
+    }
+
+    #[test]
+    fn unrelated_notification_does_not_read_scintilla_only_payload() {
+        // Break caught: casting every WM_NOTIFY payload to SCNotification before checking its
+        // NMHDR source/code reads beyond shorter notifications from other controls.
+        let expected_source = 0x1000_usize as windows_sys::Win32::Foundation::HWND;
+        let unrelated_source = 0x2000_usize as windows_sys::Win32::Foundation::HWND;
+        assert!(!is_scintilla_text_change(
+            unrelated_source,
+            expected_source,
+            crate::editor::scintilla_constants::SCN_MODIFIED,
+            || panic!("unrelated NMHDR must not read Scintilla fields"),
+        ));
+    }
+
+    #[test]
+    fn diagnostic_handles_must_arrive_with_inheritance_enabled() {
+        // Break caught: accepting valid but non-inherited handle values does not prove they came
+        // from the harness allowlist and leaves their inheritance bit enabled for descendants.
+        let inherit = windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+        assert!(validate_inherited_handle_flags(inherit, inherit).is_ok());
+        assert!(validate_inherited_handle_flags(0, inherit).is_err());
+        assert!(validate_inherited_handle_flags(inherit, 0).is_err());
     }
 }
