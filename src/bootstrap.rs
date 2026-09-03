@@ -2,7 +2,7 @@ use crate::app::{App, WindowIdentity};
 use crate::editor::Editor;
 use crate::error::StartupStage;
 use crate::launch::LaunchOptions;
-use crate::perf::StartupMetrics;
+use crate::perf::{StartupMetrics, protocol::DiagnosticSession};
 use crate::platform::{OwnedModule, last_error, wide_null};
 use crate::window::{
     INPUT_MESSAGE_FIRST, INPUT_MESSAGE_LAST, MainWindowClass, WindowCreateContext,
@@ -30,7 +30,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 pub fn run(options: LaunchOptions) -> Result<i32> {
-    let startup = StartupMetrics::begin()?;
+    let mut startup = StartupMetrics::begin()?;
+    let diagnostic = DiagnosticSession::attach(options.diagnostic)?;
+    if let Some(diagnostic) = &diagnostic {
+        startup.enable_diagnostic(std::rc::Rc::clone(diagnostic));
+    }
     configure_dpi();
     let _scintilla = load_scintilla_module()
         .map_err(|error| FastPadError::startup(StartupStage::ScintillaLoad, error))?;
@@ -55,6 +59,20 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
                 .map_err(|error| FastPadError::startup(StartupStage::EditorCreate, error))
         })?
     };
+
+    if let Some(diagnostic) = &diagnostic {
+        if !identity.is_live_for(hwnd) {
+            return Err(FastPadError::Invariant(
+                "main window was destroyed before diagnostic hook installation",
+            ));
+        }
+        diagnostic.install_input_hooks(hwnd, editor_hwnd)?;
+        if !identity.is_live_for(hwnd) {
+            return Err(FastPadError::Invariant(
+                "main window was destroyed during diagnostic hook installation",
+            ));
+        }
+    }
 
     unsafe {
         ShowWindow(hwnd, SW_SHOW);

@@ -3,7 +3,9 @@ use crate::app::{App, WindowIdentity};
 use crate::editor::Editor;
 use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
-use crate::window::messages::{DeferredAction, classify_deferred_message, deferred_start_message};
+use crate::window::messages::{
+    DeferredAction, classify_deferred_message, completed_milestone, deferred_start_message,
+};
 #[cfg(test)]
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -225,6 +227,11 @@ unsafe fn on_nc_create(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 }
 
 fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
+    if let Some(milestone) = completed_milestone(action) {
+        unsafe {
+            let _ = record_milestone(hwnd, milestone);
+        }
+    }
     match action {
         DeferredAction::RepostSelf(message) => {
             unsafe {
@@ -239,12 +246,7 @@ fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
             PostMessageW(hwnd, message, 0, 0);
             0
         },
-        DeferredAction::RecordFullyReady => {
-            unsafe {
-                let _ = record_milestone(hwnd, Milestone::FullyReady);
-            }
-            0
-        }
+        DeferredAction::RecordFullyReady => 0,
     }
 }
 

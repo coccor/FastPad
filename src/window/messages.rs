@@ -1,5 +1,7 @@
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 
+use crate::perf::Milestone;
+
 pub const WM_FASTPAD_LOAD_SETTINGS: u32 = WM_APP + 1;
 pub const WM_FASTPAD_OPEN_REQUEST: u32 = WM_APP + 2;
 pub const WM_FASTPAD_APPLY_LANGUAGE: u32 = WM_APP + 3;
@@ -37,6 +39,15 @@ pub fn classify_deferred_message(message: u32, input_pending: bool) -> Option<De
     Some(action)
 }
 
+pub(crate) fn completed_milestone(action: DeferredAction) -> Option<Milestone> {
+    match action {
+        DeferredAction::PostNext(WM_FASTPAD_OPEN_REQUEST) => Some(Milestone::SettingsLoaded),
+        DeferredAction::PostNext(WM_FASTPAD_APPLY_LANGUAGE) => Some(Milestone::FileLoaded),
+        DeferredAction::RecordFullyReady => Some(Milestone::FullyReady),
+        _ => None,
+    }
+}
+
 fn next_action(message: u32, next: u32, input_pending: bool) -> DeferredAction {
     if input_pending {
         DeferredAction::RepostSelf(message)
@@ -50,8 +61,9 @@ mod tests {
     use super::{
         DeferredAction, WM_FASTPAD_APPLY_LANGUAGE, WM_FASTPAD_BUILD_CHROME,
         WM_FASTPAD_LOAD_SETTINGS, WM_FASTPAD_OPEN_REQUEST, WM_FASTPAD_RECOVERY,
-        WM_FASTPAD_START_IPC, classify_deferred_message,
+        WM_FASTPAD_START_IPC, classify_deferred_message, completed_milestone,
     };
+    use crate::perf::Milestone;
 
     #[test]
     fn deferred_messages_follow_the_required_startup_order() {
@@ -94,6 +106,24 @@ mod tests {
         assert_eq!(
             classify_deferred_message(WM_FASTPAD_BUILD_CHROME, true),
             Some(DeferredAction::RepostSelf(WM_FASTPAD_BUILD_CHROME))
+        );
+    }
+
+    #[test]
+    fn deferred_transitions_report_settings_and_file_completion() {
+        // Break caught: leaving placeholder settings/file units unrecorded produces zero fields in
+        // otherwise valid benchmark frames.
+        assert_eq!(
+            completed_milestone(DeferredAction::PostNext(WM_FASTPAD_OPEN_REQUEST)),
+            Some(Milestone::SettingsLoaded)
+        );
+        assert_eq!(
+            completed_milestone(DeferredAction::PostNext(WM_FASTPAD_APPLY_LANGUAGE)),
+            Some(Milestone::FileLoaded)
+        );
+        assert_eq!(
+            completed_milestone(DeferredAction::RecordFullyReady),
+            Some(Milestone::FullyReady)
         );
     }
 }

@@ -1,6 +1,11 @@
 use crate::{FastPadError, Result};
 
 #[cfg(windows)]
+use super::protocol::DiagnosticSession;
+#[cfg(windows)]
+use std::rc::Rc;
+
+#[cfg(windows)]
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 const MILESTONE_COUNT: usize = 9;
@@ -19,12 +24,22 @@ pub enum Milestone {
     FullyReady,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct StartupMetrics {
     frequency: i64,
     start: i64,
     ticks: [i64; MILESTONE_COUNT],
+    #[cfg(windows)]
+    diagnostic: Option<Rc<DiagnosticSession>>,
 }
+
+impl PartialEq for StartupMetrics {
+    fn eq(&self, other: &Self) -> bool {
+        self.frequency == other.frequency && self.start == other.start && self.ticks == other.ticks
+    }
+}
+
+impl Eq for StartupMetrics {}
 
 impl StartupMetrics {
     #[cfg(windows)]
@@ -61,6 +76,8 @@ impl StartupMetrics {
             frequency,
             start,
             ticks: [0; MILESTONE_COUNT],
+            #[cfg(windows)]
+            diagnostic: None,
         }
     }
 
@@ -68,7 +85,24 @@ impl StartupMetrics {
         let slot = &mut self.ticks[milestone as usize];
         if *slot == 0 {
             *slot = tick;
+            #[cfg(windows)]
+            if let Some(diagnostic) = &self.diagnostic {
+                diagnostic.record_milestone(milestone, tick);
+            }
         }
+    }
+
+    #[cfg(windows)]
+    pub fn enable_diagnostic(&mut self, diagnostic: Rc<DiagnosticSession>) {
+        if let Some(tick) = self.tick(Milestone::ProcessStart) {
+            diagnostic.record_milestone(Milestone::ProcessStart, tick);
+        }
+        self.diagnostic = Some(diagnostic);
+    }
+
+    fn tick(&self, milestone: Milestone) -> Option<i64> {
+        let tick = self.ticks[milestone as usize];
+        (tick != 0).then_some(tick)
     }
 
     #[cfg(windows)]
@@ -92,8 +126,8 @@ impl StartupMetrics {
     }
 
     pub fn micros(&self, milestone: Milestone) -> Option<u64> {
-        let tick = self.ticks[milestone as usize];
-        (tick != 0).then(|| ((tick - self.start) * 1_000_000 / self.frequency) as u64)
+        self.tick(milestone)
+            .map(|tick| ((tick - self.start) * 1_000_000 / self.frequency) as u64)
     }
 }
 
@@ -108,5 +142,17 @@ mod tests {
         metrics.record(Milestone::WindowCreated, 143);
         metrics.record(Milestone::WindowCreated, 999);
         assert_eq!(metrics.micros(Milestone::WindowCreated), Some(4_300));
+    }
+
+    #[test]
+    fn startup_metrics_preserves_its_equality_contract() {
+        // Break caught: adding diagnostic transport state must not remove the existing Eq API or
+        // make otherwise identical timestamp sets compare differently.
+        fn assert_eq_type<T: Eq>() {}
+        assert_eq_type::<StartupMetrics>();
+        assert_eq!(
+            StartupMetrics::with_frequency(10, 20),
+            StartupMetrics::with_frequency(10, 20)
+        );
     }
 }
