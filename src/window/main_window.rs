@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::app::{App, WindowIdentity};
-use crate::editor::Editor;
 use crate::document::{CloseDecision, Document, DocumentId, RecoveryId};
+use crate::editor::Editor;
 use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
 use crate::window::accessibility;
@@ -17,19 +17,19 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::UI::Controls::NMHDR;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
 };
-use windows_sys::Win32::UI::Controls::NMHDR;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetWindowLongPtrW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT,
-    IDCANCEL, IDNO, IDYES, MB_ICONWARNING, MB_YESNOCANCEL, MessageBoxW, RegisterClassW, SC_KEYMENU,
+    GetWindowLongPtrW, IDCANCEL, IDNO, IDYES, MB_ICONWARNING, MB_YESNOCANCEL, MessageBoxW,
+    MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_KEYMENU,
     SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, UnregisterClassW, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_EXITMENULOOP,
-    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NOTIFY,
+    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -441,11 +441,7 @@ where
         ));
     }
 
-    let document = Document::untitled(
-        DocumentId(1),
-        RecoveryId(1),
-        editor.current_document()?,
-    );
+    let document = Document::untitled(DocumentId(1), RecoveryId(1), editor.current_document()?);
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
             "main window was destroyed while adopting the initial document",
@@ -530,10 +526,7 @@ fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize) {
     unsafe { app_ptr(hwnd) }
         .map(|app| {
             let app = unsafe { app.as_ref() };
-            (
-                app.tabs.titles().collect(),
-                app.tabs.active_index(),
-            )
+            (app.tabs.titles().collect(), app.tabs.active_index())
         })
         .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0))
 }
@@ -563,9 +556,10 @@ fn create_new_document(hwnd: HWND) -> Result<()> {
             ));
         };
         let app = unsafe { app.as_mut() };
-        let editor = app.editor.clone().ok_or(crate::FastPadError::Invariant(
-            "editor was not initialized",
-        ))?;
+        let editor = app
+            .editor
+            .clone()
+            .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
         let (id, recovery_id) = app.allocate_document_identity();
         (editor, id, recovery_id)
     };
@@ -582,10 +576,11 @@ fn create_new_document(hwnd: HWND) -> Result<()> {
             "main window app state was not available",
         ));
     };
-    unsafe { app.as_mut() }
-        .tabs
+    let app = unsafe { app.as_mut() };
+    app.tabs
         .push(document)
         .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))?;
+    app.accessibility.invalidate_tabs();
     invalidate_title_strip(hwnd);
     Ok(())
 }
@@ -612,14 +607,16 @@ fn close_active_document(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    let snapshot = unsafe { app_ptr(hwnd) }.map(|app| {
+    let snapshot = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
-        (
-            app.tabs.active().dirty,
-            app.tabs.active().title(),
-            app.tabs.len(),
-            app.editor.clone(),
-        )
+        (!app.tabs.is_empty()).then(|| {
+            (
+                app.tabs.active().dirty,
+                app.tabs.active().title(),
+                app.tabs.len(),
+                app.editor.clone(),
+            )
+        })
     });
     let Some((dirty, title, len, Some(editor))) = snapshot else {
         return;
@@ -654,8 +651,11 @@ fn close_active_document(hwnd: HWND) {
         let app = unsafe { app.as_mut() };
         let closed = app
             .tabs
-            .close_active(decision, || replacement.expect("last tab needs replacement"))
+            .close_active(decision, || {
+                replacement.expect("last tab needs replacement")
+            })
             .ok()?;
+        app.accessibility.invalidate_tabs();
         Some((closed, app.tabs.active_handle().clone()))
     });
     let Some((closed, active)) = switched else {
@@ -730,7 +730,14 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         _ => return,
     };
     let changed = unsafe { app_ptr(hwnd) }
-        .map(|mut app| unsafe { app.as_mut() }.tabs.set_active_dirty(dirty))
+        .map(|mut app| {
+            let app = unsafe { app.as_mut() };
+            let changed = app.tabs.set_active_dirty(dirty);
+            if changed {
+                app.accessibility.invalidate_tabs();
+            }
+            changed
+        })
         .unwrap_or(false);
     if changed {
         invalidate_title_strip(hwnd);
@@ -829,6 +836,7 @@ unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Resu
     };
     let app = unsafe { app.as_mut() };
     app.tabs = Tabs::with_document(document);
+    app.accessibility.invalidate_tabs();
     app.editor = Some(editor);
     Ok(())
 }

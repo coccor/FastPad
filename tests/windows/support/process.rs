@@ -75,6 +75,13 @@ impl FastPadProcess {
     }
 
     pub fn close(mut self) -> TestResult<()> {
+        if let Some(status) = self.process.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!("fastpad exited with nonzero exit code {:?}", status.code()).into())
+            };
+        }
         if let Some(hwnd) = find_main_window(self.process.id())? {
             unsafe {
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);

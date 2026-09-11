@@ -147,7 +147,24 @@ mod tests {
 
         assert_eq!(closed.id, DocumentId(2));
         assert_eq!(tabs.active().id, DocumentId(3));
-        assert_eq!(tabs.ids().collect::<Vec<_>>(), [DocumentId(1), DocumentId(3)]);
+        assert_eq!(
+            tabs.ids().collect::<Vec<_>>(),
+            [DocumentId(1), DocumentId(3)]
+        );
+    }
+
+    #[test]
+    fn confirmed_save_allows_a_dirty_document_to_close() {
+        // Break caught: the tab model can ignore a caller's successful save decision and leave
+        // the already-saved document open.
+        let mut tabs = Tabs::from_documents([dirty_document(1), document(2)]);
+
+        let closed = tabs
+            .close_active(CloseDecision::Save, || document(3))
+            .unwrap();
+
+        assert_eq!(closed.id, DocumentId(1));
+        assert_eq!(tabs.active().id, DocumentId(2));
     }
 
     #[test]
@@ -159,8 +176,8 @@ mod tests {
 
         assert!(tabs.set_active_dirty(true));
         assert!(!tabs.set_active_dirty(true));
-        assert_eq!(tabs.document(DocumentId(1)).unwrap().dirty, false);
-        assert_eq!(tabs.document(DocumentId(2)).unwrap().dirty, true);
+        assert!(!tabs.document(DocumentId(1)).unwrap().dirty);
+        assert!(tabs.document(DocumentId(2)).unwrap().dirty);
         assert!(tabs.set_active_dirty(false));
     }
 
@@ -198,7 +215,10 @@ mod tests {
         // Break caught: title-strip and accessibility snapshots cannot show which document has
         // left its save point.
         let tabs = Tabs::from_documents([document(1), dirty_document(2)]);
-        assert_eq!(tabs.titles().collect::<Vec<_>>(), ["Untitled", "Untitled *"]);
+        assert_eq!(
+            tabs.titles().collect::<Vec<_>>(),
+            ["Untitled", "Untitled *"]
+        );
     }
 
     #[test]
@@ -206,9 +226,8 @@ mod tests {
         // Break caught: keeping a second mutable handle beside document metadata leaks a native
         // Scintilla document reference when the tab is closed.
         let releases = Arc::new(AtomicUsize::new(0));
-        let handle = crate::editor::EditorDocument::test_fixture_with_release_counter(
-            Arc::clone(&releases),
-        );
+        let handle =
+            crate::editor::EditorDocument::test_fixture_with_release_counter(Arc::clone(&releases));
         let first = Document::untitled(DocumentId(1), super::RecoveryId(1), handle);
         let mut tabs = Tabs::from_documents([first, document(2)]);
 
@@ -218,5 +237,28 @@ mod tests {
         assert_eq!(releases.load(Ordering::SeqCst), 0);
         drop(closed);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn shutdown_clear_releases_every_owned_document_reference() {
+        // Break caught: dropping the editor HWND before Tabs drains its native document owners
+        // makes SCI_RELEASEDOCUMENT target an invalid endpoint during shutdown.
+        let releases = Arc::new(AtomicUsize::new(0));
+        let first = Document::untitled(
+            DocumentId(1),
+            super::RecoveryId(1),
+            crate::editor::EditorDocument::test_fixture_with_release_counter(Arc::clone(&releases)),
+        );
+        let second = Document::untitled(
+            DocumentId(2),
+            super::RecoveryId(2),
+            crate::editor::EditorDocument::test_fixture_with_release_counter(Arc::clone(&releases)),
+        );
+        let mut tabs = Tabs::from_documents([first, second]);
+
+        tabs.clear_for_shutdown();
+
+        assert_eq!(releases.load(Ordering::SeqCst), 2);
+        assert_eq!(tabs.len(), 0);
     }
 }

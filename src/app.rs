@@ -1,5 +1,5 @@
-use crate::editor::Editor;
 use crate::document::{DocumentId, RecoveryId};
+use crate::editor::Editor;
 use crate::launch::LaunchOptions;
 use crate::perf::{Milestone, StartupMetrics};
 use crate::window::accessibility::AccessibilityState;

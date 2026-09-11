@@ -77,6 +77,7 @@ impl Tabs {
         self.documents.iter().find(|document| document.id == id)
     }
 
+    #[cfg(test)]
     pub fn ids(&self) -> impl Iterator<Item = DocumentId> + '_ {
         self.documents.iter().map(|document| document.id)
     }

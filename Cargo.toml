@@ -43,3 +43,7 @@ path = "tests/windows/startup_smoke.rs"
 [[test]]
 name = "titlebar"
 path = "tests/windows/titlebar.rs"
+
+[[test]]
+name = "tabs"
+path = "tests/windows/tabs.rs"

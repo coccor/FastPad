@@ -82,6 +82,14 @@ impl AccessibilityState {
         provider.as_ptr().cast()
     }
 
+    pub(crate) fn invalidate_tabs(&mut self) {
+        if let Some(provider) = self.provider.take() {
+            unsafe {
+                accessible_release(provider.as_ptr().cast());
+            }
+        }
+    }
+
     #[cfg(test)]
     fn ensure_for_test(&mut self) {
         let _ = self.ensure(
@@ -571,8 +579,11 @@ unsafe extern "system" fn accessible_select(
         return E_INVALIDARG;
     }
     if !item.hwnd.is_null() {
+        let center = native_layout(item).tab(index).center();
+        let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
         unsafe {
             InvalidateRect(item.hwnd, std::ptr::null(), 0);
+            PostMessageW(item.hwnd, WM_LBUTTONUP, 0, packed);
         }
     }
     S_OK

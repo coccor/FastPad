@@ -5,9 +5,13 @@ mod support;
 use std::time::Duration;
 
 #[cfg(windows)]
+use fastpad::editor::scintilla_constants::SCI_SETSAVEPOINT;
+#[cfg(windows)]
 use support::process::{FastPadProcess, wait_for_process_exit};
 #[cfg(windows)]
 use support::win32::{find_child_by_class, focused_window, scintilla_text, send_text};
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
 
 #[cfg(windows)]
 #[test]
@@ -22,6 +26,7 @@ fn launch_creates_a_focused_editable_scintilla() {
     assert_eq!(focused_window(hwnd).unwrap(), editor);
     send_text(editor, "x").unwrap();
     assert_eq!(scintilla_text(editor).unwrap(), "x");
+    unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
     process.close().unwrap();
 }
 
