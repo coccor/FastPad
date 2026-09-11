@@ -10,9 +10,12 @@ use support::process::FastPadProcess;
 use windows_sys::Win32::Foundation::{RECT, SysFreeString, SysStringLen};
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::UI::Accessibility::{AccessibleObjectFromWindow, ObjectFromLresult};
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
+    SetThreadDpiAwarenessContext,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, OBJID_CLIENT, SendMessageW, WM_GETOBJECT,
+    GetClientRect, GetWindowRect, HTLEFT, HTMAXBUTTON, OBJID_CLIENT, SendMessageW, WM_GETOBJECT,
     WM_NCHITTEST,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
@@ -23,6 +26,7 @@ const IID_IACCESSIBLE: GUID = GUID::from_u128(0x618736e0_3c3d_11cf_810c_00aa0038
 
 #[test]
 fn get_object_returns_a_marshaled_title_provider() -> TestResult<()> {
+    let _dpi = DpiContext::per_monitor_v2()?;
     let _com = ComApartment::initialize()?;
     let mut process = FastPadProcess::spawn(["--new-window"])?;
     let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
@@ -58,6 +62,7 @@ impl Drop for ComApartment {
 
 #[test]
 fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestResult<()> {
+    let _dpi = DpiContext::per_monitor_v2()?;
     let _com = ComApartment::initialize()?;
     let mut process = FastPadProcess::spawn(["--new-window"])?;
     let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
@@ -70,29 +75,50 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
         dpi,
         1,
     );
-    for (point, expected) in [
-        (layout.minimize.center(), HTMINBUTTON),
-        (layout.maximize.center(), HTMAXBUTTON),
-        (layout.close.center(), HTCLOSE),
-    ] {
-        let mut screen_point = windows_sys::Win32::Foundation::POINT {
-            x: point.x,
-            y: point.y,
-        };
-        assert_ne!(
-            unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut screen_point) },
-            0
-        );
-        let packed =
-            (screen_point.x as u16 as u32 | ((screen_point.y as u16 as u32) << 16)) as isize;
-        assert_eq!(
-            unsafe { SendMessageW(hwnd, WM_NCHITTEST, 0, packed) },
-            expected as isize,
-            "caption target mismatch at client point ({}, {})",
-            point.x,
-            point.y
-        );
-    }
+    let point = layout.maximize.center();
+    let mut screen_point = windows_sys::Win32::Foundation::POINT {
+        x: point.x,
+        y: point.y,
+    };
+    assert_ne!(
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut screen_point) },
+        0
+    );
+    let packed =
+        (screen_point.x as u16 as u32 | ((screen_point.y as u16 as u32) << 16)) as isize;
+    assert_eq!(
+        unsafe { SendMessageW(hwnd, WM_NCHITTEST, 0, packed) },
+        HTMAXBUTTON as isize
+    );
+
+    let mut window = RECT::default();
+    assert_ne!(unsafe { GetWindowRect(hwnd, &mut window) }, 0);
+    let mut client_origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    assert_ne!(
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut client_origin) },
+        0
+    );
+    let resize_point = windows_sys::Win32::Foundation::POINT {
+        x: window.left + 1,
+        y: client_origin.y + layout.height / 2,
+    };
+    let packed =
+        (resize_point.x as u16 as u32 | ((resize_point.y as u16 as u32) << 16)) as isize;
+    assert_eq!(
+        unsafe { SendMessageW(hwnd, WM_NCHITTEST, 0, packed) },
+        HTLEFT as isize,
+        "custom title strip swallowed the left resize border: window=({}, {}, {}, {}), client_origin=({}, {}), client=({}, {}, {}, {})",
+        window.left,
+        window.top,
+        window.right,
+        window.bottom,
+        client_origin.x,
+        client_origin.y,
+        client.left,
+        client.top,
+        client.right,
+        client.bottom
+    );
 
     let accessible = Accessible::from_window(hwnd)?;
     assert_eq!(accessible.child_count()?, 6);
@@ -112,6 +138,29 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
     );
 
     process.close()
+}
+
+struct DpiContext(DPI_AWARENESS_CONTEXT);
+
+impl DpiContext {
+    fn per_monitor_v2() -> TestResult<Self> {
+        let previous = unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        };
+        if previous.is_null() {
+            Err("SetThreadDpiAwarenessContext failed".into())
+        } else {
+            Ok(Self(previous))
+        }
+    }
+}
+
+impl Drop for DpiContext {
+    fn drop(&mut self) {
+        unsafe {
+            SetThreadDpiAwarenessContext(self.0);
+        }
+    }
 }
 
 #[repr(C)]

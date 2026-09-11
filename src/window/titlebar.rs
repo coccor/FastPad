@@ -313,7 +313,11 @@ pub(crate) unsafe fn nonclient_hit_test(
         ScreenToClient(hwnd, &mut point);
     }
     let layout = layout_for_window(hwnd, tab_count);
-    if point.y < 0 || point.y >= layout.height {
+    if point.x < 0
+        || point.x >= layout.close.right
+        || point.y < 0
+        || point.y >= layout.height
+    {
         return unsafe {
             DefWindowProcW(
                 hwnd,
@@ -341,11 +345,22 @@ pub(crate) unsafe fn reclaim_caption(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if wparam == 0 {
-        return 0;
+    if lparam == 0 {
+        return unsafe {
+            DefWindowProcW(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_NCCALCSIZE,
+                wparam,
+                lparam,
+            )
+        };
     }
-    let params = unsafe { &mut *(lparam as *mut NCCALCSIZE_PARAMS) };
-    let proposed_top = params.rgrc[0].top;
+    let client = if wparam == 0 {
+        unsafe { &mut *(lparam as *mut RECT) }
+    } else {
+        unsafe { &mut (*(lparam as *mut NCCALCSIZE_PARAMS)).rgrc[0] }
+    };
+    let proposed_top = client.top;
     unsafe {
         DefWindowProcW(
             hwnd,
@@ -364,7 +379,7 @@ pub(crate) unsafe fn reclaim_caption(
             dpi,
         )
     };
-    params.rgrc[0].top = proposed_top + border.max(1);
+    client.top = proposed_top + border.max(1);
     0
 }
 
