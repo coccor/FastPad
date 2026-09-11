@@ -312,8 +312,10 @@ activation, and non-attachment of the transient menu for Alt+Space.
 
 ### Commits, performance, and remaining limitations
 
-- Review-fix implementation commit: recorded by hash in the follow-up report metadata after the
-  code/report commit (a commit cannot contain its own hash).
+- Review-fix implementation commit: `1ed04bc2f3c51dcc64a4097f7b9c1a560c936a41`
+  (`fix: harden title shell accessibility and menu keys`).
+- Follow-up report metadata commit: reported in the handoff because a commit cannot contain its
+  own hash.
 - The prior 100-run performance result was not repeated because the review explicitly excluded
   unrelated performance work. The missing baseline still prevents a regression comparison, and
   the previously recorded rendered-input p50 remains above the 25 ms reference target while p95
