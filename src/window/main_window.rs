@@ -15,7 +15,9 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_F10, VK_MENU};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, SetFocus, VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
     GetWindowLongPtrW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT,
@@ -23,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_EXITMENULOOP,
     WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE,
     WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
-    WM_SYSKEYDOWN, WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -219,19 +221,9 @@ unsafe extern "system" fn main_window_proc(
             }
             0
         }
-        WM_SYSKEYDOWN if wparam == VK_MENU as usize => {
+        WM_SYSCOMMAND if transient_menu_syscommand(wparam, lparam) => {
             show_menu_mode(hwnd);
-            unsafe {
-                PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0);
-            }
-            0
-        }
-        WM_KEYDOWN if wparam == VK_F10 as usize => {
-            show_menu_mode(hwnd);
-            unsafe {
-                PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0);
-            }
-            0
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_EXITMENULOOP => {
             menus::detach_menu(hwnd);
@@ -555,6 +547,11 @@ pub(crate) unsafe fn translate_accelerator(
     if !identity.is_live_for(hwnd) {
         return false;
     }
+    if menu_activation_message(hwnd, message)
+        && unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0) } != 0
+    {
+        return true;
+    }
     let accelerator = unsafe { app_ptr(hwnd) }.and_then(|app| {
         unsafe { app.as_ref() }
             .accelerators
@@ -562,6 +559,41 @@ pub(crate) unsafe fn translate_accelerator(
             .map(|table| table.raw())
     });
     accelerator.is_some_and(|accelerator| menus::translate_accelerator(accelerator, hwnd, message))
+}
+
+fn menu_activation_message(
+    hwnd: HWND,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    let no_control_or_shift = unsafe { GetKeyState(VK_CONTROL as i32) } >= 0
+        && unsafe { GetKeyState(VK_SHIFT as i32) } >= 0;
+    let f10 = matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+        && message.wParam == VK_F10 as usize
+        && no_control_or_shift
+        && unsafe { GetKeyState(VK_MENU as i32) } >= 0;
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        return f10;
+    };
+    let app = unsafe { app.as_mut() };
+    if f10 {
+        app.set_menu_alt_pending(false);
+        return true;
+    }
+    if message.message == WM_SYSKEYDOWN && message.wParam == VK_MENU as usize {
+        app.set_menu_alt_pending(no_control_or_shift);
+        return false;
+    }
+    if message.message == WM_SYSKEYUP && message.wParam == VK_MENU as usize {
+        return app.take_menu_alt_pending();
+    }
+    if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        app.set_menu_alt_pending(false);
+    }
+    false
+}
+
+fn transient_menu_syscommand(wparam: WPARAM, lparam: LPARAM) -> bool {
+    wparam & 0xfff0 == SC_KEYMENU as usize && lparam == 0
 }
 
 unsafe fn install_editor(hwnd: HWND, editor: Editor) -> Result<()> {

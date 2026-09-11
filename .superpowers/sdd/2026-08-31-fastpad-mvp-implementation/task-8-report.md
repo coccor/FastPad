@@ -191,3 +191,142 @@ exit code: 1
 - Kept accessibility allocation lazy and isolated its COM ABI/refcount implementation.
 - Remaining concerns are limited to the missing performance baseline, the absolute TTI p50 miss,
   and the manual GUI/accessibility matrix that cannot be honestly completed in this environment.
+
+## Independent-review fix round 1 (2026-09-11)
+
+### Findings, reproduction, and root causes
+
+1. **VARIANT ABI overwrite (Critical).** `VariantData` used `[u64; 2]` as an alignment member,
+   making `RawVariant` 24 bytes (8-byte header plus a 16-byte union) instead of the Win32
+   `VARIANT` ABI's 16 bytes. The native test duplicated the same oversized declaration, so it
+   masked the production overwrite. A focused size assertion first failed with `left: 24,
+   right: 16` under:
+
+   ```text
+   cargo test window::accessibility::tests::raw_variant_matches_the_win32_variant_abi --lib -- --exact
+   0 passed; 1 failed
+   ```
+
+2. **Focused-editor menu routing (Critical).** F10/Alt handling lived in the root WndProc even
+   though Scintilla owns focus, so those key messages never reached it. The initial focused
+   native reproduction posted F10 to the real Scintilla HWND and timed out waiting for the
+   five-item transient menu:
+
+   ```text
+   cargo test --test titlebar f10_from_the_focused_editor_activates_the_transient_menu -- --exact --nocapture --test-threads=1
+   transient menu attached=true was not observed
+   0 passed; 1 failed
+   ```
+
+   A first keydown-level Alt route exposed a second regression: it attached FastPad's transient
+   menu before an Alt+Space chord could reach the native system menu. The added preservation
+   test failed red under:
+
+   ```text
+   cargo test --test titlebar alt_space_does_not_attach_the_transient_menu -- --exact --nocapture --test-threads=1
+   assertion failed: GetMenu(hwnd).is_null()
+   0 passed; 1 failed
+   ```
+
+3. **Advertised accessibility behavior without state/actions (Important).** `get_accFocus`
+   fabricated child 1 while the editor owns focus; every tab reported selected;
+   `get_accSelection` was fixed at child 1; `accSelect` accepted every positive ID without a
+   change; tab default action said `Select` but did nothing; and Overflow posted command ID 0.
+   Focused tests reproduced the three principal semantic failures:
+
+   ```text
+   cargo test window::accessibility::tests --lib -- --test-threads=1
+   focus_is_not_fabricated_when_the_editor_owns_focus: S_OK instead of S_FALSE
+   selection_is_bounded_to_tabs_and_updates_the_selected_state: child 1 instead of child 2
+   tabs_expose_close_as_their_default_action: "Select" instead of "Close"
+   3 passed; 3 failed
+   ```
+
+### Fix design and scope ruling
+
+- The production and native-test `VARIANT` payload union now has one 8-byte alignment member,
+  yielding a 16-byte, 8-byte-aligned structure. All VARIANT output paths assign a complete
+  `RawVariant::empty()` or `RawVariant::integer()` value, including reserved fields.
+- Menu-key recognition moved into the top-level message-pump accelerator route, so messages
+  targeted at focused Scintilla are observed. F10 activates immediately. Standalone Alt is
+  tracked from keydown to keyup; another key cancels it, preserving Alt+Space and other native
+  chords. Only `SC_KEYMENU` with a zero lParam attaches the transient menu, leaving character
+  and system-menu requests to `DefWindowProcW`.
+- The accessibility provider now owns a bounded atomic selected-tab index initialized from
+  `Tabs::active_index`. Exactly one tab reports `STATE_SYSTEM_SELECTED`; `get_accSelection`
+  reflects it; and `accSelect` accepts only `SELFLAG_TAKESELECTION` for an in-range tab child.
+  Root IDs, button IDs, out-of-range IDs, and unsupported/mixed flags return `E_INVALIDARG`.
+  Because focus remains in Scintilla and the title strip has no child HWNDs, `get_accFocus`
+  truthfully returns an empty VARIANT with `S_FALSE`.
+- Narrow Task 8 ruling for selectable/closable tabs: selection is the MSAA `accSelect` action;
+  the tab's default action is `Close`, routed through the existing shared `CloseTab` command.
+  That command intentionally remains a focus-preserving no-op until the later file/tab lifecycle
+  task, as required by the Task 8 brief. No tab creation/removal lifecycle was added.
+- Overflow's default action now posts the existing title-strip Overflow click at its calculated
+  center, reusing the production popup path instead of emitting invalid `WM_COMMAND(0)`.
+  New/CloseTab use shared `CommandId` values and caption buttons use standard system commands.
+- Related simple-child entry points now reject invalid child IDs consistently, and navigation
+  rejects invalid starts/directions rather than treating malformed input as an edge.
+
+### Green verification
+
+Focused tests after the fixes:
+
+```text
+cargo test window::accessibility::tests --lib -- --test-threads=1
+7 passed; 0 failed
+
+cargo test --test titlebar alt_space_does_not_attach_the_transient_menu -- --exact --nocapture --test-threads=1
+1 passed; 0 failed
+
+cargo test --test titlebar alt_and_f10_from_the_focused_editor_activate_the_transient_menu -- --exact --nocapture --test-threads=1
+1 passed; 0 failed
+```
+
+Exact Task 8 verification and broader regression checks:
+
+```text
+cargo test window::titlebar::tests --lib -- --test-threads=1
+3 passed; 0 failed
+
+cargo test --test titlebar -- --test-threads=1
+9 passed; 0 failed
+
+cargo test --all-targets --all-features -- --test-threads=1
+52 lib + 13 benchmark-harness + 5 editor-control + 6 startup-smoke + 9 titlebar passed;
+0 failed
+
+cargo clippy --all-targets --all-features -- -D warnings
+exit 0
+
+cargo fmt --all -- --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+The native suite now checks the 16-byte test-side ABI, marshaled selected state, truthful empty
+focus, current selection, Close default action, bounded selection, focused-editor Alt/F10 menu
+activation, and non-attachment of the transient menu for Alt+Space.
+
+### Commits, performance, and remaining limitations
+
+- Review-fix implementation commit: recorded by hash in the follow-up report metadata after the
+  code/report commit (a commit cannot contain its own hash).
+- The prior 100-run performance result was not repeated because the review explicitly excluded
+  unrelated performance work. The missing baseline still prevents a regression comparison, and
+  the previously recorded rendered-input p50 remains above the 25 ms reference target while p95
+  remains below the 40 ms absolute ceiling.
+- The manual DPI/high-contrast/Narrator/snap/drag matrix remains unperformed. Native automation
+  is real process/API coverage, but it is not claimed as hands-on visual or assistive-technology
+  observation.
+
+### Fix-round self-review
+
+- Re-read the three findings against the final diff and verified each reported false behavior has
+  a focused regression assertion.
+- Preserved lazy provider creation, COM ownership/reference counting, Task 6/7 HWND identity and
+  reentrancy guards, and the no-child-HWND title-strip architecture.
+- Kept changes within Task 8: no performance tuning, Mica, animation, image decoding, or later
+  document/tab lifecycle was introduced.

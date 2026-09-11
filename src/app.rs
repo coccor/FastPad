@@ -36,6 +36,7 @@ pub struct App {
     first_paint_completed: bool,
     deferred_start_pending: bool,
     prioritize_input: bool,
+    menu_alt_pending: bool,
 }
 
 impl App {
@@ -55,6 +56,7 @@ impl App {
             first_paint_completed: false,
             deferred_start_pending: false,
             prioritize_input: false,
+            menu_alt_pending: false,
         }
     }
 
@@ -84,6 +86,14 @@ impl App {
         self.prioritize_input
     }
 
+    pub(crate) fn set_menu_alt_pending(&mut self, pending: bool) {
+        self.menu_alt_pending = pending;
+    }
+
+    pub(crate) fn take_menu_alt_pending(&mut self) -> bool {
+        std::mem::take(&mut self.menu_alt_pending)
+    }
+
     pub fn execute(&mut self, command: CommandId) {
         if command == CommandId::Exit && !self.hwnd.is_null() {
             unsafe {
@@ -99,7 +109,8 @@ impl App {
 
     pub(crate) fn ensure_accessibility(&mut self) -> *mut c_void {
         let titles = self.tabs.titles().collect::<Vec<_>>();
-        self.accessibility.ensure(self.hwnd, &titles)
+        self.accessibility
+            .ensure(self.hwnd, &titles, self.tabs.active_index())
     }
 
     pub(crate) fn window_identity(&self) -> WindowIdentity {

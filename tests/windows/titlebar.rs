@@ -2,28 +2,33 @@
 
 mod support;
 
+use fastpad::platform::wide_null;
 use fastpad::window::commands::CommandId;
 use fastpad::window::titlebar::{Size, TitleBarLayout};
 use std::error::Error;
 use std::ffi::c_void;
 use std::time::Duration;
 use support::process::FastPadProcess;
-use windows_sys::Win32::Foundation::{RECT, SysFreeString, SysStringLen};
+use windows_sys::Win32::Foundation::{
+    E_INVALIDARG, RECT, S_FALSE, S_OK, SysFreeString, SysStringLen,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::UI::Accessibility::{
     AccessibleObjectFromWindow, ObjectFromLresult, ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST,
-    ROLE_SYSTEM_PUSHBUTTON,
+    ROLE_SYSTEM_PUSHBUTTON, SELFLAG_TAKESELECTION,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
     SetThreadDpiAwarenessContext,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F10, VK_MENU, VK_SPACE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowRect, HTLEFT, HTMAXBUTTON, MINMAXINFO, OBJID_CLIENT, SendMessageW,
-    WM_COMMAND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_NCHITTEST,
+    FindWindowExW, GetClientRect, GetMenu, GetMenuItemCount, GetWindowRect, HTLEFT, HTMAXBUTTON,
+    MINMAXINFO, OBJID_CLIENT, PostMessageW, STATE_SYSTEM_SELECTED, SendMessageW, WM_CANCELMODE,
+    WM_COMMAND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_NCHITTEST, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -59,6 +64,91 @@ fn wm_command_exit_routes_through_app_execute() -> TestResult<()> {
     support::process::wait_for_process_exit(process_id, Duration::from_secs(2))?;
     drop(process);
     Ok(())
+}
+
+#[test]
+fn alt_and_f10_from_the_focused_editor_activate_the_transient_menu() -> TestResult<()> {
+    let _dpi = DpiContext::per_monitor_v2()?;
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+    let scintilla = wide_null("Scintilla");
+    let editor = unsafe {
+        FindWindowExW(
+            hwnd,
+            std::ptr::null_mut(),
+            scintilla.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+    assert!(!editor.is_null());
+
+    for key in [VK_F10, VK_MENU] {
+        assert_ne!(
+            unsafe { PostMessageW(editor, WM_SYSKEYDOWN, key as usize, 0) },
+            0
+        );
+        if key == VK_MENU {
+            assert_ne!(
+                unsafe { PostMessageW(editor, WM_SYSKEYUP, key as usize, 0) },
+                0
+            );
+        }
+        let menu = wait_for_menu(hwnd, true, Duration::from_secs(1))?;
+        assert_eq!(unsafe { GetMenuItemCount(menu) }, 5);
+
+        assert_ne!(unsafe { PostMessageW(hwnd, WM_CANCELMODE, 0, 0) }, 0);
+        wait_for_menu(hwnd, false, Duration::from_secs(1))?;
+    }
+    process.close()
+}
+
+#[test]
+fn alt_space_does_not_attach_the_transient_menu() -> TestResult<()> {
+    let _dpi = DpiContext::per_monitor_v2()?;
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+    let scintilla = wide_null("Scintilla");
+    let editor = unsafe {
+        FindWindowExW(
+            hwnd,
+            std::ptr::null_mut(),
+            scintilla.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+    assert!(!editor.is_null());
+
+    assert_ne!(
+        unsafe { PostMessageW(editor, WM_SYSKEYDOWN, VK_MENU as usize, 0) },
+        0
+    );
+    assert_ne!(
+        unsafe { PostMessageW(editor, WM_SYSKEYDOWN, VK_SPACE as usize, 0) },
+        0
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(unsafe { GetMenu(hwnd) }.is_null());
+
+    assert_ne!(unsafe { PostMessageW(hwnd, WM_CANCELMODE, 0, 0) }, 0);
+    process.close()
+}
+
+fn wait_for_menu(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    attached: bool,
+    timeout: Duration,
+) -> TestResult<windows_sys::Win32::UI::WindowsAndMessaging::HMENU> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let menu = unsafe { GetMenu(hwnd) };
+        if !menu.is_null() == attached {
+            return Ok(menu);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("transient menu attached={attached} was not observed").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct ComApartment;
@@ -170,6 +260,7 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
     );
 
     let accessible = Accessible::from_window(hwnd)?;
+    assert_eq!(std::mem::size_of::<RawVariant>(), 16);
     assert_eq!(accessible.child_count()?, 6);
     assert_eq!(accessible.role(0)?, ROLE_SYSTEM_PAGETABLIST as i32);
     assert_eq!(accessible.role(1)?, ROLE_SYSTEM_PAGETAB as i32);
@@ -184,6 +275,15 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
         vec![
             "Untitled", "New tab", "Overflow", "Minimize", "Maximize", "Close"
         ]
+    );
+    assert_ne!(accessible.state(1)? as u32 & STATE_SYSTEM_SELECTED, 0);
+    assert_eq!(accessible.focus()?, None);
+    assert_eq!(accessible.selection()?, Some(1));
+    assert_eq!(accessible.default_action(1)?, "Close");
+    assert_eq!(accessible.select(SELFLAG_TAKESELECTION as i32, 1), S_OK);
+    assert_eq!(
+        accessible.select(SELFLAG_TAKESELECTION as i32, 2),
+        E_INVALIDARG
     );
 
     process.close()
@@ -227,12 +327,21 @@ struct AccessibleVtable {
     get_acc_value: usize,
     get_acc_description: usize,
     get_acc_role: unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
+    get_acc_state: unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
+    get_acc_help: usize,
+    get_acc_help_topic: usize,
+    get_acc_keyboard_shortcut: usize,
+    get_acc_focus: unsafe extern "system" fn(*mut c_void, *mut RawVariant) -> HRESULT,
+    get_acc_selection: unsafe extern "system" fn(*mut c_void, *mut RawVariant) -> HRESULT,
+    get_acc_default_action:
+        unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
+    acc_select: unsafe extern "system" fn(*mut c_void, i32, RawVariant) -> HRESULT,
 }
 
 #[repr(C)]
 union VariantData {
     l_val: i32,
-    _alignment: [u64; 2],
+    _alignment: u64,
 }
 
 #[repr(C)]
@@ -253,6 +362,14 @@ impl RawVariant {
 
     fn integer(&self) -> Option<i32> {
         (self.vt == 3).then_some(unsafe { self.data.l_val })
+    }
+
+    fn empty() -> Self {
+        Self {
+            vt: 0,
+            reserved: [0; 3],
+            data: VariantData { _alignment: 0 },
+        }
     }
 }
 
@@ -318,6 +435,54 @@ impl Accessible {
         value
             .integer()
             .ok_or_else(|| format!("get_accRole({child}) returned a non-integer").into())
+    }
+
+    fn state(&self, child: i32) -> TestResult<i32> {
+        let mut value = RawVariant::empty();
+        let result =
+            unsafe { (self.vtable().get_acc_state)(self.0, RawVariant::child(child), &mut value) };
+        if result < 0 {
+            return Err(format!("get_accState({child}) failed: {result:#x}").into());
+        }
+        value
+            .integer()
+            .ok_or_else(|| format!("get_accState({child}) returned a non-integer").into())
+    }
+
+    fn focus(&self) -> TestResult<Option<i32>> {
+        let mut value = RawVariant::child(99);
+        let result = unsafe { (self.vtable().get_acc_focus)(self.0, &mut value) };
+        if result != S_FALSE {
+            return Err(format!("get_accFocus returned {result:#x}, expected S_FALSE").into());
+        }
+        Ok(value.integer())
+    }
+
+    fn selection(&self) -> TestResult<Option<i32>> {
+        let mut value = RawVariant::empty();
+        let result = unsafe { (self.vtable().get_acc_selection)(self.0, &mut value) };
+        if result < 0 {
+            return Err(format!("get_accSelection failed: {result:#x}").into());
+        }
+        Ok(value.integer())
+    }
+
+    fn default_action(&self, child: i32) -> TestResult<String> {
+        let mut value: BSTR = std::ptr::null();
+        let result = unsafe {
+            (self.vtable().get_acc_default_action)(self.0, RawVariant::child(child), &mut value)
+        };
+        if result < 0 || value.is_null() {
+            return Err(format!("get_accDefaultAction({child}) failed: {result:#x}").into());
+        }
+        let length = unsafe { SysStringLen(value) } as usize;
+        let action = String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })?;
+        unsafe { SysFreeString(value) };
+        Ok(action)
+    }
+
+    fn select(&self, flags: i32, child: i32) -> HRESULT {
+        unsafe { (self.vtable().acc_select)(self.0, flags, RawVariant::child(child)) }
     }
 }
 
