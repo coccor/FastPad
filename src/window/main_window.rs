@@ -3,6 +3,9 @@ use crate::app::{App, WindowIdentity};
 use crate::editor::Editor;
 use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
+use crate::window::accessibility;
+use crate::window::commands::CommandId;
+use crate::window::menus::{self, MenuBar};
 use crate::window::messages::{
     DeferredAction, classify_deferred_message, completed_milestone, deferred_start_message,
 };
@@ -10,13 +13,18 @@ use crate::window::messages::{
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_F10, VK_MENU};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetWindowLongPtrW, MoveWindow, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW,
-    SetWindowLongPtrW, UnregisterClassW, WM_CLOSE, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    GetWindowLongPtrW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage,
+    QS_INPUT, RegisterClassW, SC_KEYMENU, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW,
+    SetWindowPos, UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_DPICHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONUP,
+    WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETTINGCHANGE,
+    WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_THEMECHANGED, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -122,14 +130,15 @@ unsafe extern "system" fn main_window_proc(
         WM_SIZE => {
             if let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) } {
                 let mut rect = Default::default();
+                let title_height = crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd)).height;
                 unsafe {
                     GetClientRect(hwnd, &mut rect);
                     MoveWindow(
                         editor_hwnd,
                         0,
-                        0,
+                        title_height,
                         rect.right - rect.left,
-                        rect.bottom - rect.top,
+                        (rect.bottom - rect.top - title_height).max(0),
                         1,
                     );
                 }
@@ -157,24 +166,105 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_PAINT => {
-            let default_window_proc = |hwnd, message, wparam, lparam| unsafe {
-                DefWindowProcW(hwnd, message, wparam, lparam)
-            };
-            let complete_first_paint = |hwnd| unsafe {
-                mark_first_paint_complete(hwnd);
-            };
+            let identity = unsafe { window_identity(hwnd) };
+            let (titles, active) = tab_snapshot(hwnd);
+            let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
+            unsafe { crate::window::titlebar::paint(hwnd, &title_refs, active) };
+            if identity
+                .as_ref()
+                .is_some_and(|identity| identity.is_live_for(hwnd))
+            {
+                unsafe { mark_first_paint_complete(hwnd) };
+            }
+            0
+        }
+        WM_NCHITTEST => unsafe {
+            crate::window::titlebar::nonclient_hit_test(hwnd, wparam, lparam, tab_count(hwnd))
+        },
+        WM_NCCALCSIZE => unsafe {
+            crate::window::titlebar::reclaim_caption(hwnd, wparam, lparam)
+        },
+        WM_GETMINMAXINFO => unsafe {
+            crate::window::titlebar::constrain_maximized_window(hwnd, lparam)
+        },
+        WM_LBUTTONUP => {
+            let point = crate::window::titlebar::Point::new(
+                (lparam as u32 & 0xffff) as u16 as i16 as i32,
+                ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+            );
+            let layout = crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd));
+            match layout.hit_test(point) {
+                crate::window::titlebar::HitTarget::Overflow => {
+                    if let Some(command) = menus::show_overflow(hwnd, point.x, layout.height) {
+                        execute_command(hwnd, command);
+                    }
+                }
+                crate::window::titlebar::HitTarget::NewTab => {
+                    execute_command(hwnd, CommandId::New)
+                }
+                crate::window::titlebar::HitTarget::CloseTab(_) => {
+                    execute_command(hwnd, CommandId::CloseTab)
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_COMMAND => {
+            if let Ok(command) = CommandId::try_from((wparam & 0xffff) as u16) {
+                execute_command(hwnd, command);
+            }
+            0
+        }
+        WM_SYSKEYDOWN if wparam == VK_MENU as usize => {
+            show_menu_mode(hwnd);
             unsafe {
-                handle_paint_with(
-                    hwnd,
-                    message,
-                    wparam,
-                    lparam,
-                    default_window_proc,
-                    complete_first_paint,
-                )
+                PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0);
+            }
+            0
+        }
+        WM_KEYDOWN if wparam == VK_F10 as usize => {
+            show_menu_mode(hwnd);
+            unsafe {
+                PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0);
+            }
+            0
+        }
+        WM_EXITMENULOOP => {
+            menus::detach_menu(hwnd);
+            0
+        }
+        WM_GETOBJECT if lparam as i32 == OBJID_CLIENT => {
+            let provider = ensure_accessibility(hwnd);
+            if provider.is_null() {
+                0
+            } else {
+                unsafe { accessibility::object_result(provider, wparam) }
             }
         }
+        WM_DPICHANGED => {
+            let suggested = unsafe { &*(lparam as *const RECT) };
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                InvalidateRect(hwnd, std::ptr::null(), 1);
+            }
+            0
+        }
+        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+            unsafe {
+                InvalidateRect(hwnd, std::ptr::null(), 1);
+            }
+            0
+        }
         WM_NCDESTROY => {
+            menus::detach_menu(hwnd);
             let app = unsafe { take_app(hwnd) };
             if let Some(app) = app.as_ref() {
                 app.invalidate_window(hwnd);
@@ -408,6 +498,62 @@ unsafe fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
     // any subsequent Win32 call.
     let app = unsafe { app_ptr(hwnd) }?;
     unsafe { app.as_ref() }.editor.as_ref().map(Editor::hwnd)
+}
+
+fn tab_count(hwnd: HWND) -> usize {
+    unsafe { app_ptr(hwnd) }
+        .map(|app| unsafe { app.as_ref() }.tabs.len())
+        .unwrap_or(1)
+}
+
+fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize) {
+    unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            let app = unsafe { app.as_ref() };
+            (
+                app.tabs.titles().map(str::to_owned).collect(),
+                app.tabs.active_index(),
+            )
+        })
+        .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0))
+}
+
+fn execute_command(hwnd: HWND, command: CommandId) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.execute(command);
+    }
+}
+
+fn ensure_accessibility(hwnd: HWND) -> *mut c_void {
+    unsafe { app_ptr(hwnd) }
+        .map(|mut app| unsafe { app.as_mut() }.ensure_accessibility())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+fn show_menu_mode(hwnd: HWND) {
+    let menu = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        if app.menu_bar.is_none() {
+            app.menu_bar = MenuBar::create().ok();
+        }
+        app.menu_bar.as_ref().map(MenuBar::raw)
+    });
+    if let Some(menu) = menu {
+        menus::attach_menu(hwnd, menu);
+    }
+}
+
+pub(crate) unsafe fn translate_accelerator(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> bool {
+    if !identity.is_live_for(hwnd) {
+        return false;
+    }
+    let accelerator = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.accelerators.as_ref().map(|table| table.raw()));
+    accelerator.is_some_and(|accelerator| menus::translate_accelerator(accelerator, hwnd, message))
 }
 
 unsafe fn install_editor(hwnd: HWND, editor: Editor) -> Result<()> {

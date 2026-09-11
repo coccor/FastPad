@@ -205,6 +205,9 @@ fn dispatch_message(hwnd: HWND, identity: &WindowIdentity, message: &MSG) {
     TEST_DISPATCHED_MESSAGES.with(|messages| messages.borrow_mut().push(message.message));
 
     unsafe {
+        if crate::window::translate_accelerator(hwnd, identity, message) {
+            return;
+        }
         TranslateMessage(message);
         DispatchMessageW(message);
     }

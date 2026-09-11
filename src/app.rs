@@ -1,7 +1,12 @@
 use crate::editor::Editor;
 use crate::launch::LaunchOptions;
 use crate::perf::{Milestone, StartupMetrics};
+use crate::window::accessibility::AccessibilityState;
+use crate::window::commands::CommandId;
+use crate::window::menus::{AcceleratorTable, MenuBar};
+use crate::window::tabs::Tabs;
 use std::cell::Cell;
+use std::ffi::c_void;
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::HWND;
 
@@ -23,6 +28,10 @@ pub struct App {
     pub editor: Option<Editor>,
     pub launch: LaunchOptions,
     pub startup: StartupMetrics,
+    pub(crate) tabs: Tabs,
+    pub(crate) accessibility: AccessibilityState,
+    pub(crate) accelerators: Option<AcceleratorTable>,
+    pub(crate) menu_bar: Option<MenuBar>,
     identity: WindowIdentity,
     first_paint_completed: bool,
     deferred_start_pending: bool,
@@ -36,6 +45,10 @@ impl App {
             editor: None,
             launch,
             startup,
+            tabs: Tabs::new(),
+            accessibility: AccessibilityState::default(),
+            accelerators: AcceleratorTable::create().ok(),
+            menu_bar: None,
             identity: WindowIdentity {
                 state: Rc::new(Cell::new(WindowIdentityState::Unbound)),
             },
@@ -69,6 +82,24 @@ impl App {
 
     pub fn prioritizes_input(&self) -> bool {
         self.prioritize_input
+    }
+
+    pub fn execute(&mut self, command: CommandId) {
+        if command == CommandId::Exit && !self.hwnd.is_null() {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    self.hwnd,
+                    windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn ensure_accessibility(&mut self) -> *mut c_void {
+        let titles = self.tabs.titles().collect::<Vec<_>>();
+        self.accessibility.ensure(self.hwnd, &titles)
     }
 
     pub(crate) fn window_identity(&self) -> WindowIdentity {
