@@ -332,3 +332,88 @@ activation, and non-attachment of the transient menu for Alt+Space.
   reentrancy guards, and the no-child-HWND title-strip architecture.
 - Kept changes within Task 8: no performance tuning, Mica, animation, image decoding, or later
   document/tab lifecycle was introduced.
+
+## Scoped re-review fix round 2 (2026-09-11)
+
+### Corrected ruling and ABI red/green evidence
+
+The controller rechecked `windows-sys 0.61.2` rather than relying on the round-1 review's
+hand-written 16-byte assumption. Its generated `Win32/System/Variant/mod.rs` includes the
+`VARIANT_0_0_0_0 { pvRecord, pRecInfo }` record arm. On this x64 target that makes `VARIANT`
+24 bytes with 8-byte alignment: an 8-byte header plus a 16-byte payload union.
+
+The focused regression first enabled the generated Variant/Ole bindings and compared the
+round-1 declaration directly with `windows_sys::Win32::System::Variant::VARIANT`:
+
+```text
+cargo test window::accessibility::tests::raw_variant_matches_the_win32_variant_abi --lib -- --exact --nocapture
+assertion failed: left: 16, right: 24
+0 passed; 1 failed
+```
+
+Production and the native client test now use the generated `VARIANT` itself; both duplicated
+manual representations were removed. Empty and `VT_I4` values start from the binding's fully
+zeroed default before the tag/value are written. Unit assertions inspect all reserved header
+fields and both halves of the 16-byte payload. The native client allocates a platform-sized
+generated `VARIANT`, poisons its reserved fields and second payload half before each result call,
+and verifies the provider overwrites the complete value. The focused green ABI/accessibility run
+passed 7/7 tests.
+
+### Application-owned selection and bounded actions
+
+The root cause of the remaining selection defect was a provider-private `AtomicUsize` copied
+from `Tabs::active_index` when MSAA was first requested. `accSelect` changed that copy, while the
+App/title paint snapshot continued reading the unchanged `Tabs` value.
+
+`Tabs` now owns a cloneable atomic `TabSelection` handle. The App passes that handle to the lazy
+provider, `accSelect` validates both the exact `SELFLAG_TAKESELECTION` flag and an in-range tab
+child, and successful selection updates the shared model. The existing title paint path reads
+`Tabs::active_index`, so it observes the same value; the provider also invalidates the window
+after a successful change. Focus and selection getters remain truthful and bounded.
+
+The tab-model regression test first failed because no shared selection API existed, then passed
+after the model was introduced. The provider regression now demonstrates that selecting child 2
+changes the shared model, moves `STATE_SYSTEM_SELECTED`, and rejects root, button,
+out-of-range, zero-flag, and mixed-flag selections.
+
+The native test additionally calls the tab's `Close` default action and verifies it is accepted,
+while root/out-of-range default actions return `E_INVALIDARG`. It verifies the FastPad window
+remains live after the action: `CloseTab` still routes through the shared command model to the
+Task-8-mandated focus-preserving no-op. No document/tab creation or close lifecycle was added.
+
+### Verification
+
+```text
+cargo test window::titlebar::tests --lib -- --test-threads=1
+3 passed; 0 failed
+
+cargo test --test titlebar -- --test-threads=1
+9 passed; 0 failed
+
+cargo test --all-targets --all-features -- --test-threads=1
+53 library + 13 benchmark-harness + 5 editor-control + 6 startup-smoke + 9 titlebar passed;
+0 failed
+
+cargo clippy --all-targets --all-features -- -D warnings
+exit 0
+
+cargo fmt --all -- --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+The first strict-Clippy run flagged the native test's integer-to-pointer poison sentinel. It was
+replaced with `std::ptr::dangling_mut`, after which strict Clippy passed. The complete test suite
+was rerun after that test-only correction.
+
+### Scope and retained limitations
+
+- The resolved focused-editor Alt/F10 route and Alt+Space preservation tests remain unchanged
+  and green.
+- The prior performance run/baseline limitation and manual DPI, high-contrast, Narrator, snap,
+  drag, and caption-interaction limitations were not revisited; this round was explicitly
+  limited to ABI and accessibility semantics.
+- No performance tuning, visual feature work, child HWNDs, or later-task document lifecycle was
+  introduced.

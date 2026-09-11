@@ -110,7 +110,7 @@ impl App {
     pub(crate) fn ensure_accessibility(&mut self) -> *mut c_void {
         let titles = self.tabs.titles().collect::<Vec<_>>();
         self.accessibility
-            .ensure(self.hwnd, &titles, self.tabs.active_index())
+            .ensure(self.hwnd, &titles, self.tabs.selection())
     }
 
     pub(crate) fn window_identity(&self) -> WindowIdentity {

@@ -16,6 +16,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{
     AccessibleObjectFromWindow, ObjectFromLresult, ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST,
     ROLE_SYSTEM_PUSHBUTTON, SELFLAG_TAKESELECTION,
@@ -27,8 +28,9 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F10, VK_MENU, VK_SPACE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, GetClientRect, GetMenu, GetMenuItemCount, GetWindowRect, HTLEFT, HTMAXBUTTON,
-    MINMAXINFO, OBJID_CLIENT, PostMessageW, STATE_SYSTEM_SELECTED, SendMessageW, WM_CANCELMODE,
-    WM_COMMAND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_NCHITTEST, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    IsWindow, MINMAXINFO, OBJID_CLIENT, PostMessageW, STATE_SYSTEM_SELECTED, SendMessageW,
+    WM_CANCELMODE, WM_COMMAND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_NCHITTEST, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -260,7 +262,7 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
     );
 
     let accessible = Accessible::from_window(hwnd)?;
-    assert_eq!(std::mem::size_of::<RawVariant>(), 16);
+    assert_eq!(std::mem::size_of::<VARIANT>(), 24);
     assert_eq!(accessible.child_count()?, 6);
     assert_eq!(accessible.role(0)?, ROLE_SYSTEM_PAGETABLIST as i32);
     assert_eq!(accessible.role(1)?, ROLE_SYSTEM_PAGETAB as i32);
@@ -284,6 +286,16 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
     assert_eq!(
         accessible.select(SELFLAG_TAKESELECTION as i32, 2),
         E_INVALIDARG
+    );
+    assert_eq!(accessible.do_default_action(1), S_OK);
+    assert_eq!(accessible.do_default_action(0), E_INVALIDARG);
+    assert_eq!(accessible.do_default_action(7), E_INVALIDARG);
+    assert_eq!(accessible.selection()?, Some(1));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_ne!(
+        unsafe { IsWindow(hwnd) },
+        0,
+        "CloseTab default action must remain the Task 8 command no-op"
     );
 
     process.close()
@@ -336,41 +348,58 @@ struct AccessibleVtable {
     get_acc_default_action:
         unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
     acc_select: unsafe extern "system" fn(*mut c_void, i32, RawVariant) -> HRESULT,
+    acc_location: usize,
+    acc_navigate: usize,
+    acc_hit_test: usize,
+    acc_do_default_action: unsafe extern "system" fn(*mut c_void, RawVariant) -> HRESULT,
 }
 
-#[repr(C)]
-union VariantData {
-    l_val: i32,
-    _alignment: u64,
+type RawVariant = VARIANT;
+
+trait VariantValue {
+    fn child(id: i32) -> Self;
+    fn integer(&self) -> Option<i32>;
+    fn poisoned() -> Self;
 }
 
-#[repr(C)]
-struct RawVariant {
-    vt: u16,
-    reserved: [u16; 3],
-    data: VariantData,
-}
-
-impl RawVariant {
+impl VariantValue for VARIANT {
     fn child(id: i32) -> Self {
-        Self {
-            vt: 3,
-            reserved: [0; 3],
-            data: VariantData { l_val: id },
-        }
+        let mut variant = Self::default();
+        variant.Anonymous.Anonymous.vt = VT_I4;
+        variant.Anonymous.Anonymous.Anonymous.lVal = id;
+        variant
     }
 
     fn integer(&self) -> Option<i32> {
-        (self.vt == 3).then_some(unsafe { self.data.l_val })
-    }
-
-    fn empty() -> Self {
-        Self {
-            vt: 0,
-            reserved: [0; 3],
-            data: VariantData { _alignment: 0 },
+        unsafe {
+            (self.Anonymous.Anonymous.vt == VT_I4)
+                .then_some(self.Anonymous.Anonymous.Anonymous.lVal)
         }
     }
+
+    fn poisoned() -> Self {
+        let mut variant = Self::default();
+        variant.Anonymous.Anonymous.wReserved1 = 0xa5a5;
+        variant.Anonymous.Anonymous.wReserved2 = 0xa5a5;
+        variant.Anonymous.Anonymous.wReserved3 = 0xa5a5;
+        variant.Anonymous.Anonymous.Anonymous.Anonymous =
+            windows_sys::Win32::System::Variant::VARIANT_0_0_0_0 {
+                pvRecord: std::ptr::dangling_mut::<c_void>(),
+                pRecInfo: std::ptr::dangling_mut::<c_void>(),
+            };
+        variant
+    }
+}
+
+fn ensure_full_variant_write(value: &VARIANT) -> TestResult<()> {
+    let fields = unsafe { value.Anonymous.Anonymous };
+    if fields.wReserved1 != 0 || fields.wReserved2 != 0 || fields.wReserved3 != 0 {
+        return Err("VARIANT writer did not clear the reserved header".into());
+    }
+    if !unsafe { fields.Anonymous.Anonymous.pRecInfo }.is_null() {
+        return Err("VARIANT writer did not clear the second half of its payload".into());
+    }
+    Ok(())
 }
 
 struct Accessible(*mut c_void);
@@ -426,44 +455,48 @@ impl Accessible {
     }
 
     fn role(&self, child: i32) -> TestResult<i32> {
-        let mut value = RawVariant::child(0);
+        let mut value = RawVariant::poisoned();
         let result =
             unsafe { (self.vtable().get_acc_role)(self.0, RawVariant::child(child), &mut value) };
         if result < 0 {
             return Err(format!("get_accRole({child}) failed: {result:#x}").into());
         }
+        ensure_full_variant_write(&value)?;
         value
             .integer()
             .ok_or_else(|| format!("get_accRole({child}) returned a non-integer").into())
     }
 
     fn state(&self, child: i32) -> TestResult<i32> {
-        let mut value = RawVariant::empty();
+        let mut value = RawVariant::poisoned();
         let result =
             unsafe { (self.vtable().get_acc_state)(self.0, RawVariant::child(child), &mut value) };
         if result < 0 {
             return Err(format!("get_accState({child}) failed: {result:#x}").into());
         }
+        ensure_full_variant_write(&value)?;
         value
             .integer()
             .ok_or_else(|| format!("get_accState({child}) returned a non-integer").into())
     }
 
     fn focus(&self) -> TestResult<Option<i32>> {
-        let mut value = RawVariant::child(99);
+        let mut value = RawVariant::poisoned();
         let result = unsafe { (self.vtable().get_acc_focus)(self.0, &mut value) };
         if result != S_FALSE {
             return Err(format!("get_accFocus returned {result:#x}, expected S_FALSE").into());
         }
+        ensure_full_variant_write(&value)?;
         Ok(value.integer())
     }
 
     fn selection(&self) -> TestResult<Option<i32>> {
-        let mut value = RawVariant::empty();
+        let mut value = RawVariant::poisoned();
         let result = unsafe { (self.vtable().get_acc_selection)(self.0, &mut value) };
         if result < 0 {
             return Err(format!("get_accSelection failed: {result:#x}").into());
         }
+        ensure_full_variant_write(&value)?;
         Ok(value.integer())
     }
 
@@ -483,6 +516,10 @@ impl Accessible {
 
     fn select(&self, flags: i32, child: i32) -> HRESULT {
         unsafe { (self.vtable().acc_select)(self.0, flags, RawVariant::child(child)) }
+    }
+
+    fn do_default_action(&self, child: i32) -> HRESULT {
+        unsafe { (self.vtable().acc_do_default_action)(self.0, RawVariant::child(child)) }
     }
 }
 

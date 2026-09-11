@@ -1,13 +1,15 @@
 use crate::window::commands::CommandId;
+use crate::window::tabs::TabSelection;
 use crate::window::titlebar::{Point, Size, TitleBarLayout};
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use windows_sys::Win32::Foundation::{
     DISP_E_MEMBERNOTFOUND, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HWND, LRESULT, S_FALSE, S_OK,
     SysAllocStringLen, WPARAM,
 };
-use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
+use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{
     LresultFromObject, NAVDIR_FIRSTCHILD, NAVDIR_LASTCHILD, NAVDIR_NEXT, NAVDIR_PREVIOUS,
     ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST, ROLE_SYSTEM_PUSHBUTTON, SELFLAG_TAKESELECTION,
@@ -22,8 +24,6 @@ use windows_sys::core::{BSTR, GUID, HRESULT};
 const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
 const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
 const IID_IACCESSIBLE: GUID = GUID::from_u128(0x618736e0_3c3d_11cf_810c_00aa00389b71);
-const VT_EMPTY: u16 = 0;
-const VT_I4: u16 = 3;
 const STATE_SYSTEM_FOCUSABLE: u32 = 0x0010_0000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,16 +67,15 @@ impl AccessibilityState {
         &mut self,
         hwnd: HWND,
         tab_titles: &[&str],
-        active_tab: usize,
+        selection: TabSelection,
     ) -> *mut c_void {
         let provider = *self.provider.get_or_insert_with(|| {
-            let active_tab = active_tab.min(tab_titles.len().saturating_sub(1));
             let provider = Box::new(AccessibleProvider {
                 vtable: &ACCESSIBLE_VTABLE,
                 references: AtomicU32::new(1),
                 hwnd,
                 children: accessible_children(tab_titles),
-                active_tab: AtomicUsize::new(active_tab),
+                selection,
             });
             NonNull::new(Box::into_raw(provider)).expect("Box never creates a null pointer")
         });
@@ -85,7 +84,11 @@ impl AccessibilityState {
 
     #[cfg(test)]
     fn ensure_for_test(&mut self) {
-        let _ = self.ensure(std::ptr::null_mut(), &["Untitled"], 0);
+        let _ = self.ensure(
+            std::ptr::null_mut(),
+            &["Untitled"],
+            crate::window::tabs::Tabs::new().selection(),
+        );
     }
 
     #[cfg(test)]
@@ -114,7 +117,7 @@ struct AccessibleProvider {
     references: AtomicU32,
     hwnd: HWND,
     children: Vec<AccessibleChild>,
-    active_tab: AtomicUsize,
+    selection: TabSelection,
 }
 
 #[repr(C)]
@@ -178,39 +181,31 @@ struct AccessibleVtable {
     put_acc_value: unsafe extern "system" fn(*mut c_void, RawVariant, BSTR) -> HRESULT,
 }
 
-#[repr(C)]
-union VariantData {
-    l_val: i32,
-    pointer: *mut c_void,
-    alignment: u64,
+type RawVariant = VARIANT;
+
+trait VariantValue {
+    fn empty() -> Self;
+    fn integer(value: i32) -> Self;
+    fn child_id(&self) -> Option<i32>;
 }
 
-#[repr(C)]
-struct RawVariant {
-    vt: u16,
-    reserved: [u16; 3],
-    data: VariantData,
-}
-
-impl RawVariant {
+impl VariantValue for VARIANT {
     fn empty() -> Self {
-        Self {
-            vt: VT_EMPTY,
-            reserved: [0; 3],
-            data: VariantData { alignment: 0 },
-        }
+        Self::default()
     }
 
     fn integer(value: i32) -> Self {
-        Self {
-            vt: VT_I4,
-            reserved: [0; 3],
-            data: VariantData { l_val: value },
-        }
+        let mut variant = Self::default();
+        variant.Anonymous.Anonymous.vt = VT_I4;
+        variant.Anonymous.Anonymous.Anonymous.lVal = value;
+        variant
     }
 
     fn child_id(&self) -> Option<i32> {
-        (self.vt == VT_I4).then_some(unsafe { self.data.l_val })
+        unsafe {
+            (self.Anonymous.Anonymous.vt == VT_I4)
+                .then_some(self.Anonymous.Anonymous.Anonymous.lVal)
+        }
     }
 }
 
@@ -465,12 +460,11 @@ unsafe extern "system" fn accessible_get_state(
     } else {
         match unsafe { accessible_child(provider(this), &child) } {
             Some((index, AccessibleChild::Tab(_))) => {
-                let selected =
-                    if index == unsafe { provider(this) }.active_tab.load(Ordering::Acquire) {
-                        STATE_SYSTEM_SELECTED
-                    } else {
-                        0
-                    };
+                let selected = if index == unsafe { provider(this) }.selection.active_index() {
+                    STATE_SYSTEM_SELECTED
+                } else {
+                    0
+                };
                 STATE_SYSTEM_SELECTABLE | STATE_SYSTEM_FOCUSABLE | selected
             }
             Some((_, AccessibleChild::Button(_))) => STATE_SYSTEM_FOCUSABLE,
@@ -542,7 +536,7 @@ unsafe extern "system" fn accessible_get_selection(
         unsafe { *output = RawVariant::empty() };
         S_FALSE
     } else {
-        let active = item.active_tab.load(Ordering::Acquire).min(count - 1);
+        let active = item.selection.active_index().min(count - 1);
         unsafe { *output = RawVariant::integer(active as i32 + 1) };
         S_OK
     }
@@ -573,7 +567,14 @@ unsafe extern "system" fn accessible_select(
     let Some((index, AccessibleChild::Tab(_))) = (unsafe { accessible_child(item, &child) }) else {
         return E_INVALIDARG;
     };
-    item.active_tab.store(index, Ordering::Release);
+    if !item.selection.select(index, tab_count(&item.children)) {
+        return E_INVALIDARG;
+    }
+    if !item.hwnd.is_null() {
+        unsafe {
+            InvalidateRect(item.hwnd, std::ptr::null(), 0);
+        }
+    }
     S_OK
 }
 
@@ -862,10 +863,11 @@ fn native_layout(item: &AccessibleProvider) -> TitleBarLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessibilityState, AccessibleChild, RawVariant, accessible_children,
+        AccessibilityState, AccessibleChild, RawVariant, VariantValue, accessible_children,
         accessible_default_action, accessible_get_default_action, accessible_get_focus,
         accessible_get_selection, accessible_get_state, accessible_select,
     };
+    use crate::window::tabs::{TabSelection, Tabs};
     use windows_sys::Win32::Foundation::{
         E_INVALIDARG, S_FALSE, S_OK, SysFreeString, SysStringLen,
     };
@@ -874,8 +876,30 @@ mod tests {
 
     #[test]
     fn raw_variant_matches_the_win32_variant_abi() {
-        assert_eq!(std::mem::size_of::<RawVariant>(), 16);
-        assert_eq!(std::mem::align_of::<RawVariant>(), 8);
+        use windows_sys::Win32::System::Variant::VARIANT;
+
+        assert_eq!(std::mem::size_of::<VARIANT>(), 24);
+        assert_eq!(std::mem::align_of::<VARIANT>(), 8);
+
+        let integer = RawVariant::integer(7);
+        let integer_fields = unsafe { integer.Anonymous.Anonymous };
+        assert_eq!(integer_fields.wReserved1, 0);
+        assert_eq!(integer_fields.wReserved2, 0);
+        assert_eq!(integer_fields.wReserved3, 0);
+        assert_eq!(unsafe { integer_fields.Anonymous.llVal }, 7);
+        assert!(
+            unsafe { integer_fields.Anonymous.Anonymous.pRecInfo }.is_null(),
+            "VT_I4 writer left the second half of the 16-byte payload uninitialized"
+        );
+
+        let empty = RawVariant::empty();
+        let empty_fields = unsafe { empty.Anonymous.Anonymous };
+        assert_eq!(
+            empty_fields.vt,
+            windows_sys::Win32::System::Variant::VT_EMPTY
+        );
+        assert_eq!(unsafe { empty_fields.Anonymous.llVal }, 0);
+        assert!(unsafe { empty_fields.Anonymous.Anonymous.pRecInfo }.is_null());
     }
 
     #[test]
@@ -903,7 +927,12 @@ mod tests {
     #[test]
     fn selection_is_bounded_to_tabs_and_updates_the_selected_state() {
         let mut state = AccessibilityState::default();
-        let provider = state.ensure(std::ptr::null_mut(), &["One", "Two"], 0);
+        let model_selection = TabSelection::new(0);
+        let provider = state.ensure(
+            std::ptr::null_mut(),
+            &["One", "Two"],
+            model_selection.clone(),
+        );
 
         assert_eq!(
             unsafe {
@@ -922,6 +951,7 @@ mod tests {
             S_OK
         );
         assert_eq!(selection.child_id(), Some(2));
+        assert_eq!(model_selection.active_index(), 1);
 
         let mut first_state = RawVariant::empty();
         let mut second_state = RawVariant::empty();
@@ -934,11 +964,11 @@ mod tests {
             S_OK
         );
         assert_eq!(
-            unsafe { first_state.data.l_val } as u32 & STATE_SYSTEM_SELECTED,
+            first_state.child_id().unwrap() as u32 & STATE_SYSTEM_SELECTED,
             0
         );
         assert_ne!(
-            unsafe { second_state.data.l_val } as u32 & STATE_SYSTEM_SELECTED,
+            second_state.child_id().unwrap() as u32 & STATE_SYSTEM_SELECTED,
             0
         );
 
@@ -960,20 +990,23 @@ mod tests {
     #[test]
     fn focus_is_not_fabricated_when_the_editor_owns_focus() {
         let mut state = AccessibilityState::default();
-        let provider = state.ensure(std::ptr::null_mut(), &["Untitled"], 0);
+        let provider = state.ensure(std::ptr::null_mut(), &["Untitled"], Tabs::new().selection());
         let mut focus = RawVariant::integer(99);
 
         assert_eq!(
             unsafe { accessible_get_focus(provider, &mut focus) },
             S_FALSE
         );
-        assert_eq!(focus.vt, super::VT_EMPTY);
+        assert_eq!(
+            unsafe { focus.Anonymous.Anonymous.vt },
+            windows_sys::Win32::System::Variant::VT_EMPTY
+        );
     }
 
     #[test]
     fn tabs_expose_close_as_their_default_action() {
         let mut state = AccessibilityState::default();
-        let provider = state.ensure(std::ptr::null_mut(), &["Untitled"], 0);
+        let provider = state.ensure(std::ptr::null_mut(), &["Untitled"], Tabs::new().selection());
         let mut action = std::ptr::null();
 
         assert_eq!(
