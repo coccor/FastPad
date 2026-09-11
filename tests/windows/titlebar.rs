@@ -2,21 +2,28 @@
 
 mod support;
 
+use fastpad::window::commands::CommandId;
 use fastpad::window::titlebar::{Size, TitleBarLayout};
 use std::error::Error;
 use std::ffi::c_void;
 use std::time::Duration;
 use support::process::FastPadProcess;
 use windows_sys::Win32::Foundation::{RECT, SysFreeString, SysStringLen};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
-use windows_sys::Win32::UI::Accessibility::{AccessibleObjectFromWindow, ObjectFromLresult};
+use windows_sys::Win32::UI::Accessibility::{
+    AccessibleObjectFromWindow, ObjectFromLresult, ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST,
+    ROLE_SYSTEM_PUSHBUTTON,
+};
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
     SetThreadDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowRect, HTLEFT, HTMAXBUTTON, OBJID_CLIENT, SendMessageW, WM_GETOBJECT,
-    WM_NCHITTEST,
+    GetClientRect, GetWindowRect, HTLEFT, HTMAXBUTTON, MINMAXINFO, OBJID_CLIENT, SendMessageW,
+    WM_COMMAND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_NCHITTEST,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -39,13 +46,26 @@ fn get_object_returns_a_marshaled_title_provider() -> TestResult<()> {
     process.close()
 }
 
+#[test]
+fn wm_command_exit_routes_through_app_execute() -> TestResult<()> {
+    let _dpi = DpiContext::per_monitor_v2()?;
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+    let process_id = process.id();
+
+    unsafe {
+        SendMessageW(hwnd, WM_COMMAND, CommandId::Exit as usize, 0);
+    }
+    support::process::wait_for_process_exit(process_id, Duration::from_secs(2))?;
+    drop(process);
+    Ok(())
+}
+
 struct ComApartment;
 
 impl ComApartment {
     fn initialize() -> TestResult<Self> {
-        let result = unsafe {
-            CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32)
-        };
+        let result = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
         if result < 0 {
             Err(format!("CoInitializeEx failed: {result:#x}").into())
         } else {
@@ -84,8 +104,7 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
         unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut screen_point) },
         0
     );
-    let packed =
-        (screen_point.x as u16 as u32 | ((screen_point.y as u16 as u32) << 16)) as isize;
+    let packed = (screen_point.x as u16 as u32 | ((screen_point.y as u16 as u32) << 16)) as isize;
     assert_eq!(
         unsafe { SendMessageW(hwnd, WM_NCHITTEST, 0, packed) },
         HTMAXBUTTON as isize
@@ -102,8 +121,7 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
         x: window.left + 1,
         y: client_origin.y + layout.height / 2,
     };
-    let packed =
-        (resize_point.x as u16 as u32 | ((resize_point.y as u16 as u32) << 16)) as isize;
+    let packed = (resize_point.x as u16 as u32 | ((resize_point.y as u16 as u32) << 16)) as isize;
     assert_eq!(
         unsafe { SendMessageW(hwnd, WM_NCHITTEST, 0, packed) },
         HTLEFT as isize,
@@ -120,20 +138,51 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
         client.bottom
     );
 
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    assert!(!monitor.is_null());
+    let mut monitor_info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    assert_ne!(unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }, 0);
+    let mut minmax = MINMAXINFO::default();
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            0,
+            (&mut minmax as *mut MINMAXINFO) as isize,
+        );
+    }
+    assert_eq!(
+        (minmax.ptMaxPosition.x, minmax.ptMaxPosition.y),
+        (
+            monitor_info.rcWork.left - monitor_info.rcMonitor.left,
+            monitor_info.rcWork.top - monitor_info.rcMonitor.top,
+        )
+    );
+    assert_eq!(
+        (minmax.ptMaxSize.x, minmax.ptMaxSize.y),
+        (
+            monitor_info.rcWork.right - monitor_info.rcWork.left,
+            monitor_info.rcWork.bottom - monitor_info.rcWork.top,
+        )
+    );
+
     let accessible = Accessible::from_window(hwnd)?;
     assert_eq!(accessible.child_count()?, 6);
+    assert_eq!(accessible.role(0)?, ROLE_SYSTEM_PAGETABLIST as i32);
+    assert_eq!(accessible.role(1)?, ROLE_SYSTEM_PAGETAB as i32);
+    for child in 2..=6 {
+        assert_eq!(accessible.role(child)?, ROLE_SYSTEM_PUSHBUTTON as i32);
+    }
     let names = (1..=6)
         .map(|child| accessible.name(child))
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(
         names,
         vec![
-            "Untitled",
-            "New tab",
-            "Overflow",
-            "Minimize",
-            "Maximize",
-            "Close"
+            "Untitled", "New tab", "Overflow", "Minimize", "Maximize", "Close"
         ]
     );
 
@@ -144,9 +193,8 @@ struct DpiContext(DPI_AWARENESS_CONTEXT);
 
 impl DpiContext {
     fn per_monitor_v2() -> TestResult<Self> {
-        let previous = unsafe {
-            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-        };
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         if previous.is_null() {
             Err("SetThreadDpiAwarenessContext failed".into())
         } else {
@@ -175,8 +223,10 @@ struct AccessibleVtable {
     get_acc_parent: usize,
     get_acc_child_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
     get_acc_child: usize,
-    get_acc_name:
-        unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
+    get_acc_name: unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
+    get_acc_value: usize,
+    get_acc_description: usize,
+    get_acc_role: unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
 }
 
 #[repr(C)]
@@ -200,6 +250,10 @@ impl RawVariant {
             data: VariantData { l_val: id },
         }
     }
+
+    fn integer(&self) -> Option<i32> {
+        (self.vt == 3).then_some(unsafe { self.data.l_val })
+    }
 }
 
 struct Accessible(*mut c_void);
@@ -207,9 +261,7 @@ struct Accessible(*mut c_void);
 impl Accessible {
     fn from_lresult(result: isize, wparam: usize) -> TestResult<Self> {
         let mut object = std::ptr::null_mut();
-        let status = unsafe {
-            ObjectFromLresult(result, &IID_IACCESSIBLE, wparam, &mut object)
-        };
+        let status = unsafe { ObjectFromLresult(result, &IID_IACCESSIBLE, wparam, &mut object) };
         if status < 0 || object.is_null() {
             return Err(format!("ObjectFromLresult failed: {status:#x}").into());
         }
@@ -243,9 +295,8 @@ impl Accessible {
 
     fn name(&self, child: i32) -> TestResult<String> {
         let mut value: BSTR = std::ptr::null();
-        let result = unsafe {
-            (self.vtable().get_acc_name)(self.0, RawVariant::child(child), &mut value)
-        };
+        let result =
+            unsafe { (self.vtable().get_acc_name)(self.0, RawVariant::child(child), &mut value) };
         if result < 0 || value.is_null() {
             return Err(format!("get_accName({child}) failed: {result:#x}").into());
         }
@@ -255,6 +306,18 @@ impl Accessible {
             SysFreeString(value);
         }
         Ok(name)
+    }
+
+    fn role(&self, child: i32) -> TestResult<i32> {
+        let mut value = RawVariant::child(0);
+        let result =
+            unsafe { (self.vtable().get_acc_role)(self.0, RawVariant::child(child), &mut value) };
+        if result < 0 {
+            return Err(format!("get_accRole({child}) failed: {result:#x}").into());
+        }
+        value
+            .integer()
+            .ok_or_else(|| format!("get_accRole({child}) returned a non-integer").into())
     }
 }
 

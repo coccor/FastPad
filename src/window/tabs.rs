@@ -20,6 +20,7 @@ impl Tabs {
         self.active
     }
 
+    #[cfg(test)]
     pub fn title(&self, index: usize) -> &str {
         &self.titles[index]
     }

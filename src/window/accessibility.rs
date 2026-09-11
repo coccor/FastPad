@@ -1,3 +1,31 @@
+use crate::window::commands::CommandId;
+use crate::window::titlebar::{Point, Size, TitleBarLayout};
+use std::ffi::c_void;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
+use windows_sys::Win32::Foundation::{
+    DISP_E_MEMBERNOTFOUND, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HWND, LRESULT, S_FALSE, S_OK,
+    SysAllocStringLen, WPARAM,
+};
+use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+use windows_sys::Win32::UI::Accessibility::{
+    LresultFromObject, NAVDIR_FIRSTCHILD, NAVDIR_LASTCHILD, NAVDIR_NEXT, NAVDIR_PREVIOUS,
+    ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST, ROLE_SYSTEM_PUSHBUTTON,
+};
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetWindowRect, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
+    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, WM_COMMAND, WM_SYSCOMMAND,
+};
+use windows_sys::core::{BSTR, GUID, HRESULT};
+
+const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
+const IID_IACCESSIBLE: GUID = GUID::from_u128(0x618736e0_3c3d_11cf_810c_00aa00389b71);
+const VT_EMPTY: u16 = 0;
+const VT_I4: u16 = 3;
+const STATE_SYSTEM_FOCUSABLE: u32 = 0x0010_0000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AccessibleChild {
     Tab(String),
@@ -5,6 +33,7 @@ pub enum AccessibleChild {
 }
 
 impl AccessibleChild {
+    #[cfg(test)]
     pub fn button_name(&self) -> Option<&str> {
         match self {
             Self::Tab(_) => None,
@@ -87,8 +116,7 @@ struct AccessibleVtable {
     add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     release: unsafe extern "system" fn(*mut c_void) -> u32,
     get_type_info_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
-    get_type_info:
-        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
+    get_type_info: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
     get_ids_of_names: unsafe extern "system" fn(
         *mut c_void,
         *const GUID,
@@ -110,16 +138,12 @@ struct AccessibleVtable {
     ) -> HRESULT,
     get_acc_parent: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
     get_acc_child_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
-    get_acc_child:
-        unsafe extern "system" fn(*mut c_void, RawVariant, *mut *mut c_void) -> HRESULT,
+    get_acc_child: unsafe extern "system" fn(*mut c_void, RawVariant, *mut *mut c_void) -> HRESULT,
     get_acc_name: unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
     get_acc_value: unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
-    get_acc_description:
-        unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
-    get_acc_role:
-        unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
-    get_acc_state:
-        unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
+    get_acc_description: unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
+    get_acc_role: unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
+    get_acc_state: unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
     get_acc_help: unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
     get_acc_help_topic:
         unsafe extern "system" fn(*mut c_void, *mut BSTR, RawVariant, *mut i32) -> HRESULT,
@@ -138,14 +162,9 @@ struct AccessibleVtable {
         *mut i32,
         RawVariant,
     ) -> HRESULT,
-    acc_navigate: unsafe extern "system" fn(
-        *mut c_void,
-        i32,
-        RawVariant,
-        *mut RawVariant,
-    ) -> HRESULT,
-    acc_hit_test:
-        unsafe extern "system" fn(*mut c_void, i32, i32, *mut RawVariant) -> HRESULT,
+    acc_navigate:
+        unsafe extern "system" fn(*mut c_void, i32, RawVariant, *mut RawVariant) -> HRESULT,
+    acc_hit_test: unsafe extern "system" fn(*mut c_void, i32, i32, *mut RawVariant) -> HRESULT,
     acc_do_default_action: unsafe extern "system" fn(*mut c_void, RawVariant) -> HRESULT,
     put_acc_name: unsafe extern "system" fn(*mut c_void, RawVariant, BSTR) -> HRESULT,
     put_acc_value: unsafe extern "system" fn(*mut c_void, RawVariant, BSTR) -> HRESULT,
@@ -183,7 +202,7 @@ impl RawVariant {
     }
 
     fn child_id(&self) -> Option<i32> {
-        (self.vt == VT_I4).then(|| unsafe { self.data.l_val })
+        (self.vt == VT_I4).then_some(unsafe { self.data.l_val })
     }
 }
 
@@ -761,30 +780,3 @@ mod tests {
         assert!(state.is_created());
     }
 }
-use crate::window::commands::CommandId;
-use crate::window::titlebar::{Point, Size, TitleBarLayout};
-use std::ffi::c_void;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, Ordering};
-use windows_sys::Win32::Foundation::{
-    DISP_E_MEMBERNOTFOUND, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HWND, LRESULT, S_FALSE, S_OK,
-    SysAllocStringLen, WPARAM,
-};
-use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
-use windows_sys::Win32::UI::Accessibility::{
-    LresultFromObject, NAVDIR_FIRSTCHILD, NAVDIR_LASTCHILD, NAVDIR_NEXT, NAVDIR_PREVIOUS,
-    ROLE_SYSTEM_PAGETAB, ROLE_SYSTEM_PAGETABLIST, ROLE_SYSTEM_PUSHBUTTON,
-};
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowRect, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
-    STATE_SYSTEM_SELECTED, STATE_SYSTEM_SELECTABLE, WM_COMMAND, WM_SYSCOMMAND,
-};
-use windows_sys::core::{BSTR, GUID, HRESULT};
-
-const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
-const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
-const IID_IACCESSIBLE: GUID = GUID::from_u128(0x618736e0_3c3d_11cf_810c_00aa00389b71);
-const VT_EMPTY: u16 = 0;
-const VT_I4: u16 = 3;
-const STATE_SYSTEM_FOCUSABLE: u32 = 0x0010_0000;

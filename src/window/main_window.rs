@@ -18,13 +18,12 @@ use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_F10, VK_MENU};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetWindowLongPtrW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage,
-    QS_INPUT, RegisterClassW, SC_KEYMENU, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW,
-    SetWindowPos, UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_DPICHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONUP,
-    WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETTINGCHANGE,
-    WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_THEMECHANGED, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    GetWindowLongPtrW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT,
+    RegisterClassW, SC_KEYMENU, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
+    UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_EXITMENULOOP,
+    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -130,7 +129,8 @@ unsafe extern "system" fn main_window_proc(
         WM_SIZE => {
             if let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) } {
                 let mut rect = Default::default();
-                let title_height = crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd)).height;
+                let title_height =
+                    crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd)).height;
                 unsafe {
                     GetClientRect(hwnd, &mut rect);
                     MoveWindow(
@@ -166,24 +166,30 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_PAINT => {
-            let identity = unsafe { window_identity(hwnd) };
-            let (titles, active) = tab_snapshot(hwnd);
-            let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
-            unsafe { crate::window::titlebar::paint(hwnd, &title_refs, active) };
-            if identity
-                .as_ref()
-                .is_some_and(|identity| identity.is_live_for(hwnd))
-            {
-                unsafe { mark_first_paint_complete(hwnd) };
+            let paint_title_strip = |hwnd, _, _, _| {
+                let (titles, active) = tab_snapshot(hwnd);
+                let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
+                unsafe { crate::window::titlebar::paint(hwnd, &title_refs, active) };
+                0
+            };
+            let complete_first_paint = |hwnd| unsafe {
+                mark_first_paint_complete(hwnd);
+            };
+            unsafe {
+                handle_paint_with(
+                    hwnd,
+                    message,
+                    wparam,
+                    lparam,
+                    paint_title_strip,
+                    complete_first_paint,
+                )
             }
-            0
         }
         WM_NCHITTEST => unsafe {
             crate::window::titlebar::nonclient_hit_test(hwnd, wparam, lparam, tab_count(hwnd))
         },
-        WM_NCCALCSIZE => unsafe {
-            crate::window::titlebar::reclaim_caption(hwnd, wparam, lparam)
-        },
+        WM_NCCALCSIZE => unsafe { crate::window::titlebar::reclaim_caption(hwnd, wparam, lparam) },
         WM_GETMINMAXINFO => unsafe {
             crate::window::titlebar::constrain_maximized_window(hwnd, lparam)
         },
@@ -199,9 +205,7 @@ unsafe extern "system" fn main_window_proc(
                         execute_command(hwnd, command);
                     }
                 }
-                crate::window::titlebar::HitTarget::NewTab => {
-                    execute_command(hwnd, CommandId::New)
-                }
+                crate::window::titlebar::HitTarget::NewTab => execute_command(hwnd, CommandId::New),
                 crate::window::titlebar::HitTarget::CloseTab(_) => {
                     execute_command(hwnd, CommandId::CloseTab)
                 }
@@ -551,8 +555,12 @@ pub(crate) unsafe fn translate_accelerator(
     if !identity.is_live_for(hwnd) {
         return false;
     }
-    let accelerator = unsafe { app_ptr(hwnd) }
-        .and_then(|app| unsafe { app.as_ref() }.accelerators.as_ref().map(|table| table.raw()));
+    let accelerator = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        unsafe { app.as_ref() }
+            .accelerators
+            .as_ref()
+            .map(|table| table.raw())
+    });
     accelerator.is_some_and(|accelerator| menus::translate_accelerator(accelerator, hwnd, message))
 }
 

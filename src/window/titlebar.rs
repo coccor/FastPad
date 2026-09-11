@@ -1,3 +1,20 @@
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::DwmDefWindowProc;
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
+    COLOR_WINDOWTEXT, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint,
+    FillRect, GetMonitorInfoW, GetSysColor, GetSysColorBrush, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromWindow, PAINTSTRUCT, ScreenToClient, SetBkMode, SetTextColor,
+    TRANSPARENT,
+};
+use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DefWindowProcW, GetClientRect, HTCAPTION, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON,
+    MINMAXINFO, NCCALCSIZE_PARAMS, SM_CXSIZE, SM_CYSIZE, SPI_GETHIGHCONTRAST,
+    SystemParametersInfoW,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Point {
     pub x: i32,
@@ -53,10 +70,7 @@ impl Rect {
     }
 
     pub const fn contains(self, point: Point) -> bool {
-        point.x >= self.left
-            && point.x < self.right
-            && point.y >= self.top
-            && point.y < self.bottom
+        point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
     }
 }
 
@@ -242,11 +256,21 @@ pub(crate) unsafe fn paint(hwnd: HWND, titles: &[&str], active: usize) {
                 }),
             );
         }
-        let close_width = ((24_i64 * i64::from(unsafe { GetDpiForWindow(hwnd) }.max(96)) + 48)
-            / 96) as i32;
-        let label = Rect::new(tab.left + 8, tab.top, (tab.right - close_width).max(tab.left), tab.bottom);
+        let close_width =
+            ((24_i64 * i64::from(unsafe { GetDpiForWindow(hwnd) }.max(96)) + 48) / 96) as i32;
+        let label = Rect::new(
+            tab.left + 8,
+            tab.top,
+            (tab.right - close_width).max(tab.left),
+            tab.bottom,
+        );
         unsafe {
-            draw_text(dc, title, label, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS);
+            draw_text(
+                dc,
+                title,
+                label,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS,
+            );
             draw_text(
                 dc,
                 "×",
@@ -299,8 +323,15 @@ pub(crate) unsafe fn nonclient_hit_test(
     tab_count: usize,
 ) -> LRESULT {
     let mut dwm_result = 0;
-    if unsafe { DwmDefWindowProc(hwnd, windows_sys::Win32::UI::WindowsAndMessaging::WM_NCHITTEST, wparam, lparam, &mut dwm_result) }
-        != 0
+    if unsafe {
+        DwmDefWindowProc(
+            hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_NCHITTEST,
+            wparam,
+            lparam,
+            &mut dwm_result,
+        )
+    } != 0
     {
         return dwm_result;
     }
@@ -313,11 +344,7 @@ pub(crate) unsafe fn nonclient_hit_test(
         ScreenToClient(hwnd, &mut point);
     }
     let layout = layout_for_window(hwnd, tab_count);
-    if point.x < 0
-        || point.x >= layout.close.right
-        || point.y < 0
-        || point.y >= layout.height
-    {
+    if point.x < 0 || point.x >= layout.close.right || point.y < 0 || point.y >= layout.height {
         return unsafe {
             DefWindowProcW(
                 hwnd,
@@ -340,11 +367,7 @@ pub(crate) unsafe fn nonclient_hit_test(
     }
 }
 
-pub(crate) unsafe fn reclaim_caption(
-    hwnd: HWND,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+pub(crate) unsafe fn reclaim_caption(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if lparam == 0 {
         return unsafe {
             DefWindowProcW(
@@ -371,13 +394,11 @@ pub(crate) unsafe fn reclaim_caption(
     }
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let border = unsafe {
-        GetSystemMetricsForDpi(
-            windows_sys::Win32::UI::WindowsAndMessaging::SM_CYFRAME,
-            dpi,
-        ) + GetSystemMetricsForDpi(
-            windows_sys::Win32::UI::WindowsAndMessaging::SM_CXPADDEDBORDER,
-            dpi,
-        )
+        GetSystemMetricsForDpi(windows_sys::Win32::UI::WindowsAndMessaging::SM_CYFRAME, dpi)
+            + GetSystemMetricsForDpi(
+                windows_sys::Win32::UI::WindowsAndMessaging::SM_CXPADDEDBORDER,
+                dpi,
+            )
     };
     client.top = proposed_top + border.max(1);
     0
@@ -448,7 +469,10 @@ mod tests {
     #[test]
     fn hit_test_preserves_drag_and_maximize_regions() {
         let layout = TitleBarLayout::calculate(Size::new(1200, 800), 144, 2);
-        assert_eq!(layout.hit_test(layout.maximize.center()), HitTarget::Maximize);
+        assert_eq!(
+            layout.hit_test(layout.maximize.center()),
+            HitTarget::Maximize
+        );
         assert_eq!(layout.hit_test(layout.tab(0).center()), HitTarget::Tab(0));
         assert_eq!(
             layout.hit_test(layout.drag_region.center()),
@@ -470,22 +494,10 @@ mod tests {
             layout.hit_test(layout.overflow.center()),
             HitTarget::Overflow
         );
-        assert_eq!(layout.hit_test(layout.minimize.center()), HitTarget::Minimize);
+        assert_eq!(
+            layout.hit_test(layout.minimize.center()),
+            HitTarget::Minimize
+        );
         assert_eq!(layout.hit_test(layout.close.center()), HitTarget::Close);
     }
 }
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Dwm::DwmDefWindowProc;
-use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
-    COLOR_WINDOWTEXT, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint,
-    FillRect, GetMonitorInfoW, GetSysColor, GetSysColorBrush, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow, PAINTSTRUCT, ScreenToClient, SetBkMode, SetTextColor, TRANSPARENT,
-};
-use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
-use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetClientRect, HTCAPTION, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON,
-    MINMAXINFO, NCCALCSIZE_PARAMS, SM_CXSIZE, SM_CYSIZE, SPI_GETHIGHCONTRAST,
-    SystemParametersInfoW,
-};

@@ -57,10 +57,6 @@ impl AcceleratorTable {
         }
     }
 
-    pub(crate) fn translate(&self, hwnd: HWND, message: &MSG) -> bool {
-        unsafe { TranslateAcceleratorW(hwnd, self.0, message) != 0 }
-    }
-
     pub(crate) fn raw(&self) -> HACCEL {
         self.0
     }
@@ -128,20 +124,6 @@ impl MenuBar {
         }
     }
 
-    pub(crate) fn attach(&self, hwnd: HWND) {
-        unsafe {
-            SetMenu(hwnd, self.0);
-            DrawMenuBar(hwnd);
-        }
-    }
-
-    pub(crate) fn detach(&self, hwnd: HWND) {
-        unsafe {
-            SetMenu(hwnd, std::ptr::null_mut());
-            DrawMenuBar(hwnd);
-        }
-    }
-
     pub(crate) fn raw(&self) -> HMENU {
         self.0
     }
@@ -195,9 +177,7 @@ fn create_popup(entries: &[MenuEntry]) -> Result<HMENU> {
                 let label = wide_null(label);
                 unsafe { AppendMenuW(menu, MF_STRING, *command as usize, label.as_ptr()) }
             }
-            MenuEntry::Separator => unsafe {
-                AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null())
-            },
+            MenuEntry::Separator => unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null()) },
         };
         if ok == 0 {
             unsafe {
@@ -265,7 +245,11 @@ mod tests {
         let specs = accelerator_specs();
         assert!(specs.iter().any(|item| item.command == CommandId::New));
         assert!(specs.iter().any(|item| item.command == CommandId::SaveAs));
-        assert!(specs.iter().any(|item| item.command == CommandId::FormatJson));
+        assert!(
+            specs
+                .iter()
+                .any(|item| item.command == CommandId::FormatJson)
+        );
         assert_eq!(specs.len(), 9);
     }
 }
