@@ -36,6 +36,14 @@ pub struct Editor {
     endpoint: Rc<EditorEndpoint>,
 }
 
+impl Clone for Editor {
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: Rc::clone(&self.endpoint),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct EditorDocument {
     raw: isize,
@@ -49,6 +57,8 @@ struct EditorEndpoint {
     direct_ptr: isize,
     destroyed: AtomicBool,
     destroy_window_on_drop: bool,
+    #[cfg(test)]
+    release_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Editor {
@@ -298,6 +308,23 @@ impl EditorDocument {
     }
 
     #[cfg(test)]
+    pub fn test_fixture_with_release_counter(
+        releases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            raw: 1,
+            endpoint: Rc::new(EditorEndpoint {
+                hwnd: std::ptr::null_mut(),
+                direct_fn: inert_direct_call,
+                direct_ptr: 0,
+                destroyed: AtomicBool::new(false),
+                destroy_window_on_drop: false,
+                release_counter: Some(releases),
+            }),
+        }
+    }
+
+    #[cfg(test)]
     fn test_fixture_with_raw(raw: isize, editor: &Editor) -> Self {
         Self {
             raw,
@@ -324,6 +351,8 @@ impl EditorEndpoint {
             direct_ptr,
             destroyed: AtomicBool::new(false),
             destroy_window_on_drop,
+            #[cfg(test)]
+            release_counter: None,
         }
     }
 
@@ -371,6 +400,10 @@ impl EditorEndpoint {
     fn release_document(&self, raw: isize) {
         if raw == 0 {
             return;
+        }
+        #[cfg(test)]
+        if let Some(counter) = &self.release_counter {
+            counter.fetch_add(1, Ordering::SeqCst);
         }
         let _ = self.send_direct_if_alive(SCI_RELEASEDOCUMENT, 0, raw);
     }

@@ -1,4 +1,5 @@
 use crate::editor::Editor;
+use crate::document::{DocumentId, RecoveryId};
 use crate::launch::LaunchOptions;
 use crate::perf::{Milestone, StartupMetrics};
 use crate::window::accessibility::AccessibilityState;
@@ -37,6 +38,8 @@ pub struct App {
     deferred_start_pending: bool,
     prioritize_input: bool,
     menu_alt_pending: bool,
+    next_document_id: u64,
+    next_recovery_id: u128,
 }
 
 impl App {
@@ -57,6 +60,8 @@ impl App {
             deferred_start_pending: false,
             prioritize_input: false,
             menu_alt_pending: false,
+            next_document_id: 2,
+            next_recovery_id: 2,
         }
     }
 
@@ -107,10 +112,19 @@ impl App {
         }
     }
 
+    pub(crate) fn allocate_document_identity(&mut self) -> (DocumentId, RecoveryId) {
+        let id = DocumentId(self.next_document_id);
+        let recovery_id = RecoveryId(self.next_recovery_id);
+        self.next_document_id = self.next_document_id.saturating_add(1);
+        self.next_recovery_id = self.next_recovery_id.saturating_add(1);
+        (id, recovery_id)
+    }
+
     pub(crate) fn ensure_accessibility(&mut self) -> *mut c_void {
         let titles = self.tabs.titles().collect::<Vec<_>>();
+        let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
         self.accessibility
-            .ensure(self.hwnd, &titles, self.tabs.selection())
+            .ensure(self.hwnd, &title_refs, self.tabs.selection())
     }
 
     pub(crate) fn window_identity(&self) -> WindowIdentity {

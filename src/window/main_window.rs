@@ -1,6 +1,7 @@
 use crate::Result;
 use crate::app::{App, WindowIdentity};
 use crate::editor::Editor;
+use crate::document::{CloseDecision, Document, DocumentId, RecoveryId};
 use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
 use crate::window::accessibility;
@@ -9,6 +10,7 @@ use crate::window::menus::{self, MenuBar};
 use crate::window::messages::{
     DeferredAction, classify_deferred_message, completed_milestone, deferred_start_message,
 };
+use crate::window::tabs::Tabs;
 #[cfg(test)]
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -18,14 +20,16 @@ use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
 };
+use windows_sys::Win32::UI::Controls::NMHDR;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
     GetWindowLongPtrW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT,
-    RegisterClassW, SC_KEYMENU, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
-    UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_EXITMENULOOP,
+    IDCANCEL, IDNO, IDYES, MB_ICONWARNING, MB_YESNOCANCEL, MessageBoxW, RegisterClassW, SC_KEYMENU,
+    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, UnregisterClassW, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_EXITMENULOOP,
     WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    WM_NCDESTROY, WM_NCHITTEST, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -156,8 +160,11 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_CLOSE => {
-            unsafe {
-                DestroyWindow(hwnd);
+            if review_dirty_documents(hwnd) {
+                clear_documents_for_shutdown(hwnd);
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
             }
             0
         }
@@ -208,11 +215,17 @@ unsafe extern "system" fn main_window_proc(
                     }
                 }
                 crate::window::titlebar::HitTarget::NewTab => execute_command(hwnd, CommandId::New),
-                crate::window::titlebar::HitTarget::CloseTab(_) => {
-                    execute_command(hwnd, CommandId::CloseTab)
+                crate::window::titlebar::HitTarget::CloseTab(index) => {
+                    activate_tab(hwnd, index);
+                    execute_command(hwnd, CommandId::CloseTab);
                 }
+                crate::window::titlebar::HitTarget::Tab(index) => activate_tab(hwnd, index),
                 _ => {}
             }
+            0
+        }
+        WM_NOTIFY => {
+            handle_editor_notification(hwnd, lparam);
             0
         }
         WM_COMMAND => {
@@ -428,8 +441,19 @@ where
         ));
     }
 
+    let document = Document::untitled(
+        DocumentId(1),
+        RecoveryId(1),
+        editor.current_document()?,
+    );
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed while adopting the initial document",
+        ));
+    }
+
     unsafe {
-        install_editor(hwnd, editor)?;
+        install_editor(hwnd, editor, document)?;
         record_milestone(hwnd, Milestone::EditorCreated)?;
     }
     Ok(editor_hwnd)
@@ -507,7 +531,7 @@ fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize) {
         .map(|app| {
             let app = unsafe { app.as_ref() };
             (
-                app.tabs.titles().map(str::to_owned).collect(),
+                app.tabs.titles().collect(),
                 app.tabs.active_index(),
             )
         })
@@ -515,8 +539,207 @@ fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize) {
 }
 
 fn execute_command(hwnd: HWND, command: CommandId) {
+    match command {
+        CommandId::New => {
+            let _ = create_new_document(hwnd);
+        }
+        CommandId::CloseTab => close_active_document(hwnd),
+        _ => {
+            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                unsafe { app.as_mut() }.execute(command);
+            }
+        }
+    }
+}
+
+fn create_new_document(hwnd: HWND) -> Result<()> {
+    let identity = unsafe { window_identity(hwnd) }.ok_or(crate::FastPadError::Invariant(
+        "main window app state was not available",
+    ))?;
+    let (editor, id, recovery_id) = {
+        let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+            return Err(crate::FastPadError::Invariant(
+                "main window app state was not available",
+            ));
+        };
+        let app = unsafe { app.as_mut() };
+        let editor = app.editor.clone().ok_or(crate::FastPadError::Invariant(
+            "editor was not initialized",
+        ))?;
+        let (id, recovery_id) = app.allocate_document_identity();
+        (editor, id, recovery_id)
+    };
+
+    let document = Document::untitled(id, recovery_id, editor.create_document()?);
+    editor.use_document(&document.handle)?;
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed while creating a document",
+        ));
+    }
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        return Err(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ));
+    };
+    unsafe { app.as_mut() }
+        .tabs
+        .push(document)
+        .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))?;
+    invalidate_title_strip(hwnd);
+    Ok(())
+}
+
+fn activate_tab(hwnd: HWND, index: usize) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let target = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        app.tabs.activate_index(index).ok()?;
+        Some((app.editor.clone()?, app.tabs.active_handle().clone()))
+    });
+    let Some((editor, handle)) = target else {
+        return;
+    };
+    if editor.use_document(&handle).is_err() || !identity.is_live_for(hwnd) {
+        return;
+    }
+    invalidate_title_strip(hwnd);
+}
+
+fn close_active_document(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let snapshot = unsafe { app_ptr(hwnd) }.map(|app| {
+        let app = unsafe { app.as_ref() };
+        (
+            app.tabs.active().dirty,
+            app.tabs.active().title(),
+            app.tabs.len(),
+            app.editor.clone(),
+        )
+    });
+    let Some((dirty, title, len, Some(editor))) = snapshot else {
+        return;
+    };
+    let decision = if dirty {
+        prompt_close_decision(hwnd, &title)
+    } else {
+        CloseDecision::Discard
+    };
+    if decision == CloseDecision::Cancel || !identity.is_live_for(hwnd) {
+        return;
+    }
+
+    let replacement = if len == 1 {
+        let ids = unsafe { app_ptr(hwnd) }
+            .map(|mut app| unsafe { app.as_mut() }.allocate_document_identity());
+        let Some((id, recovery_id)) = ids else {
+            return;
+        };
+        let Ok(handle) = editor.create_document() else {
+            return;
+        };
+        Some(Document::untitled(id, recovery_id, handle))
+    } else {
+        None
+    };
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+
+    let switched = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let closed = app
+            .tabs
+            .close_active(decision, || replacement.expect("last tab needs replacement"))
+            .ok()?;
+        Some((closed, app.tabs.active_handle().clone()))
+    });
+    let Some((closed, active)) = switched else {
+        return;
+    };
+    let _ = editor.use_document(&active);
+    drop(active);
+    drop(closed);
+    if identity.is_live_for(hwnd) {
+        invalidate_title_strip(hwnd);
+    }
+}
+
+fn review_dirty_documents(hwnd: HWND) -> bool {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return false;
+    };
+    let dirty = unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            let app = unsafe { app.as_ref() };
+            app.tabs
+                .dirty_ids()
+                .filter_map(|id| app.tabs.document(id).map(Document::title))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for title in dirty {
+        if prompt_close_decision(hwnd, &title) == CloseDecision::Cancel
+            || !identity.is_live_for(hwnd)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn prompt_close_decision(hwnd: HWND, title: &str) -> CloseDecision {
+    let message = wide_null(&format!("Save changes to {title} before closing?"));
+    let caption = wide_null("FastPad");
+    match unsafe {
+        MessageBoxW(
+            hwnd,
+            message.as_ptr(),
+            caption.as_ptr(),
+            MB_YESNOCANCEL | MB_ICONWARNING,
+        )
+    } {
+        IDYES => CloseDecision::Save,
+        IDNO => CloseDecision::Discard,
+        IDCANCEL => CloseDecision::Cancel,
+        _ => CloseDecision::Cancel,
+    }
+}
+
+fn clear_documents_for_shutdown(hwnd: HWND) {
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-        unsafe { app.as_mut() }.execute(command);
+        unsafe { app.as_mut() }.tabs.clear_for_shutdown();
+    }
+}
+
+fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
+    if lparam == 0 {
+        return;
+    }
+    let notification = unsafe { &*(lparam as *const NMHDR) };
+    if unsafe { editor_hwnd(hwnd) } != Some(notification.hwndFrom) {
+        return;
+    }
+    let dirty = match notification.code {
+        crate::editor::scintilla_constants::SCN_SAVEPOINTLEFT => true,
+        crate::editor::scintilla_constants::SCN_SAVEPOINTREACHED => false,
+        _ => return,
+    };
+    let changed = unsafe { app_ptr(hwnd) }
+        .map(|mut app| unsafe { app.as_mut() }.tabs.set_active_dirty(dirty))
+        .unwrap_or(false);
+    if changed {
+        invalidate_title_strip(hwnd);
+    }
+}
+
+fn invalidate_title_strip(hwnd: HWND) {
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 0);
     }
 }
 
@@ -596,7 +819,7 @@ fn transient_menu_syscommand(wparam: WPARAM, lparam: LPARAM) -> bool {
     wparam & 0xfff0 == SC_KEYMENU as usize && lparam == 0
 }
 
-unsafe fn install_editor(hwnd: HWND, editor: Editor) -> Result<()> {
+unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Result<()> {
     // SAFETY: The App pointer is re-fetched after editor creation so initialization never mutates
     // an App reference borrowed across a reentrant Win32 call.
     let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
@@ -604,7 +827,9 @@ unsafe fn install_editor(hwnd: HWND, editor: Editor) -> Result<()> {
             "main window app state was not available",
         ));
     };
-    unsafe { app.as_mut() }.editor = Some(editor);
+    let app = unsafe { app.as_mut() };
+    app.tabs = Tabs::with_document(document);
+    app.editor = Some(editor);
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod bootstrap;
+pub mod document;
 pub mod editor;
 pub mod error;
 pub mod file;
