@@ -10,8 +10,7 @@ use windows_sys::Win32::System::Com::{
     CoTaskMemFree, CoUninitialize,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FileOpenDialog, FileSaveDialog,
-    SIGDN_FILESYSPATH,
+    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FileOpenDialog, FileSaveDialog, SIGDN_FILESYSPATH,
 };
 use windows_sys::core::{GUID, HRESULT};
 
@@ -207,15 +206,13 @@ pub fn show_save_dialog(owner: HWND, suggested_name: &str) -> Result<Option<Path
     let mut options = 0;
     check(unsafe { (dialog.dialog().get_options)(dialog.0, &mut options) })?;
     // IFileSaveDialog defaults to FOS_OVERWRITEPROMPT (confirmed via GetOptions: 0x880a on this
-    // host). FastPad's own atomic replace already makes an overwrite safe, and clearing this
-    // flag keeps the native dialog single-window instead of layering the shell's own
-    // "Confirm Save As" prompt on top of it.
-    check(unsafe {
-        (dialog.dialog().set_options)(
-            dialog.0,
-            (options & !FOS_OVERWRITEPROMPT) | FOS_FORCEFILESYSTEM,
-        )
-    })?;
+    // host); that default is left alone deliberately. FastPad's own atomic replace makes an
+    // overwrite safe from partial-content corruption, but that is a different property from user
+    // *consent* to overwrite: a user picking an existing, unrelated file in Save As should still
+    // see the shell's standard "this file already exists, replace it?" confirmation before FastPad
+    // replaces it. (A colliding path already open in another FastPad tab is rejected separately by
+    // `Tabs::set_active_path`, before that file is ever touched.)
+    check(unsafe { (dialog.dialog().set_options)(dialog.0, options | FOS_FORCEFILESYSTEM) })?;
     let name = suggested_name
         .encode_utf16()
         .chain(std::iter::once(0))

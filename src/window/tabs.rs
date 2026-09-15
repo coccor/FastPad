@@ -364,6 +364,17 @@ impl Tabs {
         self.view.update(&self.documents);
         Ok(())
     }
+
+    /// Reverts the active document's path back to a value it previously, legitimately held (or
+    /// `None`, if it had not yet claimed a path), e.g. after a Save As write that renamed the
+    /// path via `set_active_path` but then failed before anything was actually written to the
+    /// new location. No collision check is needed: `original` was already valid for this
+    /// document, so restoring it cannot newly collide with any other tab.
+    pub(crate) fn revert_active_path(&mut self, original: Option<PathBuf>) {
+        let active = self.active_index();
+        self.documents[active].path = original;
+        self.view.update(&self.documents);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

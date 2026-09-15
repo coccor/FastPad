@@ -1008,9 +1008,17 @@ pub(crate) fn save_path_as(hwnd: HWND, path: &std::path::Path) {
 /// Shared tail of plain Save and Save As. `new_path` is `Some` only for Save As: the active
 /// document's path is renamed (and checked against other open tabs' canonical paths) before the
 /// write. Plain Save (`new_path: None`) writes to the document's existing path unchanged.
+///
+/// For Save As, every failure after a successful rename (missing editor, a failed
+/// `editor.text()` read, or a failed `save_atomic`) reverts the tab's path back to whatever it
+/// held before this call: a failed write must never leave the tab claiming a path nothing was
+/// actually written to, orphaning it from the path it was last genuinely saved at.
 fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::path::PathBuf>) {
     let is_save_as = new_path.is_some();
+    let mut original_path: Option<std::path::PathBuf> = None;
     if let Some(path) = new_path {
+        original_path = unsafe { app_ptr(hwnd) }
+            .and_then(|app| unsafe { app.as_ref() }.tabs.active().path.clone());
         let outcome = unsafe { app_ptr(hwnd) }
             .map(|mut app| unsafe { app.as_mut() }.tabs.set_active_path(path));
         match outcome {
@@ -1034,9 +1042,15 @@ fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::pa
         let document = app.tabs.active();
         Some((editor, document.path.clone()?, document.encoding))
     }) else {
+        if is_save_as {
+            revert_active_path(hwnd, original_path);
+        }
         return;
     };
     let Ok(text) = editor.text() else {
+        if is_save_as {
+            revert_active_path(hwnd, original_path);
+        }
         return;
     };
     let bytes = crate::file::encoding::encode(&text, encoding);
@@ -1055,11 +1069,22 @@ fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::pa
             }
         }
         Err(_) => {
+            if is_save_as {
+                revert_active_path(hwnd, original_path);
+            }
             show_save_error(
                 hwnd,
                 "FastPad could not save this file. The previous version on disk was not modified.",
             );
         }
+    }
+}
+
+fn revert_active_path(hwnd: HWND, original_path: Option<std::path::PathBuf>) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }
+            .tabs
+            .revert_active_path(original_path);
     }
 }
 

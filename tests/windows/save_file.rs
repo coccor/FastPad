@@ -158,6 +158,36 @@ fn save_as_onto_another_open_tabs_path_shows_an_error_and_does_not_overwrite() {
     });
 }
 
+#[test]
+fn save_as_failure_reverts_the_tabs_path_to_its_original_value() {
+    // Break caught: Save As renames the tab's path before writing. If the write then fails, the
+    // tab must not keep claiming the new, never-written path as its own -- it should still claim
+    // whatever path it was last actually saved at, and the original file must be untouched.
+    let fixture = Fixture::new(b"already saved");
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let editor = main.editor;
+    window::open_path(main.hwnd, &fixture.path).unwrap();
+    wait_text(editor, "already saved");
+    let scratch = ScratchDir::new("save-as-rename-failure");
+    // The parent directory does not exist, so save_atomic's temp-file creation fails
+    // deterministically without needing any file-locking trickery.
+    let target = scratch.path().join("missing-subdir").join("out.txt");
+
+    window::save_path_as(main.hwnd, &target);
+
+    let errors = window::take_save_errors();
+    assert_eq!(errors.len(), 1);
+    assert!(!target.exists());
+    main.with_app(|app| {
+        assert_eq!(
+            app.tabs.active().path.as_deref(),
+            Some(fixture.path.as_path())
+        );
+    });
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), b"already saved");
+}
+
 /// Drives a Save/Save As command and immediately cancels the native dialog.
 fn cancel_save_dialog(owner: HWND, command: CommandId) {
     let pid = std::process::id();
