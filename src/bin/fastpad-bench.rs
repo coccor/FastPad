@@ -662,6 +662,12 @@ fn run_once() -> Result<BenchmarkRecord, String> {
     std::thread::sleep(std::time::Duration::from_secs(2));
     record.idle_private_working_set_bytes = private_working_set(child.process.as_raw())?;
     validate_record(&record, child.pid)?;
+    // The benchmark character dirties the document; a save prompt would block WM_CLOSE.
+    send_scintilla_scalar(
+        scintilla,
+        fastpad::editor::scintilla_constants::SCI_SETSAVEPOINT,
+        0,
+    )?;
     child.close(main_hwnd)?;
     Ok(record)
 }

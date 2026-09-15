@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$OutputDirectory
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -7,18 +9,20 @@ $ErrorActionPreference = "Stop"
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 $NativeRoot = Join-Path $RepositoryRoot "native"
 $SourceRoot = Join-Path $NativeRoot "src"
-$OutputRoot = Join-Path $NativeRoot "out\x64"
+$OutputRoot = if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { Join-Path $NativeRoot "out\x64" } else { $OutputDirectory }
 $LicensesRoot = Join-Path $RepositoryRoot "licenses"
+
+. (Join-Path $PSScriptRoot "msvc.ps1")
 
 & (Join-Path $PSScriptRoot "fetch-native.ps1")
 if (-not $?) {
     throw "Native dependency fetch failed"
 }
 
-foreach ($command in @("nmake.exe", "dumpbin.exe")) {
-    if ($null -eq (Get-Command $command -ErrorAction SilentlyContinue)) {
-        throw "Required MSVC tool '$command' was not found. Run this script from an x64 Native Tools Command Prompt."
-    }
+Enter-MsvcEnvironment
+$Dumpbin = Find-MsvcTool -Name "dumpbin.exe"
+if ($null -eq (Get-Command nmake.exe -ErrorAction SilentlyContinue)) {
+    throw "nmake.exe was not found after entering the Visual Studio x64 developer environment."
 }
 
 Push-Location (Join-Path $SourceRoot "scintilla\win32")
@@ -58,7 +62,7 @@ foreach ($dll in @(
     (Join-Path $OutputRoot "Scintilla.dll"),
     (Join-Path $OutputRoot "Lexilla.dll")
 )) {
-    $headers = (& dumpbin.exe /headers $dll) -join [Environment]::NewLine
+    $headers = (& $Dumpbin /headers $dll) -join [Environment]::NewLine
     if ($LASTEXITCODE -ne 0) {
         throw "dumpbin failed for '$dll'."
     }

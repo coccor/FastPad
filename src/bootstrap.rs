@@ -13,7 +13,7 @@ use crate::window::{
 use crate::{FastPadError, Result};
 #[cfg(test)]
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{HMODULE, HWND, WAIT_FAILED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleHandleW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -112,7 +112,9 @@ fn configure_dpi() {
 }
 
 fn load_scintilla_module() -> Result<OwnedModule> {
-    let path = native_scintilla_path();
+    let path = native_scintilla_path().ok_or(FastPadError::Invariant(
+        "could not locate the directory of the running executable",
+    ))?;
     let text = path.to_str().ok_or(FastPadError::Invariant(
         "Scintilla path was not valid Unicode",
     ))?;
@@ -127,12 +129,46 @@ fn load_scintilla_module() -> Result<OwnedModule> {
     unsafe { OwnedModule::from_raw_owned(raw) }
 }
 
-fn native_scintilla_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("native")
-        .join("out")
-        .join("x64")
-        .join("Scintilla.dll")
+const SCINTILLA_DLL: &str = "Scintilla.dll";
+
+fn native_scintilla_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    let dev_dir = dev_scintilla_dir();
+    select_scintilla_path(
+        exe.as_deref().and_then(Path::parent),
+        dev_dir.as_deref(),
+        Path::is_file,
+    )
+}
+
+// Unpackaged dev, test, and benchmark runs have no DLL beside target\<profile>\fastpad.exe.
+#[cfg(not(feature = "release-package"))]
+fn dev_scintilla_dir() -> Option<PathBuf> {
+    Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("native")
+            .join("out")
+            .join("x64"),
+    )
+}
+
+#[cfg(feature = "release-package")]
+fn dev_scintilla_dir() -> Option<PathBuf> {
+    None
+}
+
+fn select_scintilla_path(
+    exe_dir: Option<&Path>,
+    dev_dir: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let staged = exe_dir.map(|dir| dir.join(SCINTILLA_DLL));
+    if let Some(path) = &staged
+        && exists(path)
+    {
+        return staged;
+    }
+    dev_dir.map(|dir| dir.join(SCINTILLA_DLL)).or(staged)
 }
 
 fn current_module() -> Result<HMODULE> {
@@ -567,6 +603,31 @@ mod tests {
         DestroyWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW, PostMessageW, QS_POSTMESSAGE,
         WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN,
     };
+
+    #[test]
+    fn scintilla_path_prefers_the_executable_directory_over_the_dev_fallback() {
+        // Break caught: a shipped FastPad.exe loading Scintilla.dll from a build-machine checkout
+        // path instead of the DLL staged next to it in the portable package.
+        use super::select_scintilla_path;
+        use std::path::Path;
+        let exe_dir = Path::new(r"C:\portable\FastPad");
+        let dev_dir = Path::new(r"D:\checkout\native\out\x64");
+        let staged = exe_dir.join("Scintilla.dll");
+
+        assert_eq!(
+            select_scintilla_path(Some(exe_dir), Some(dev_dir), |path| path == staged),
+            Some(staged.clone())
+        );
+        assert_eq!(
+            select_scintilla_path(Some(exe_dir), Some(dev_dir), |_| false),
+            Some(dev_dir.join("Scintilla.dll"))
+        );
+        assert_eq!(
+            select_scintilla_path(Some(exe_dir), None, |_| false),
+            Some(staged)
+        );
+        assert_eq!(select_scintilla_path(None, None, |_| true), None);
+    }
 
     #[test]
     fn startup_stage_exit_codes_match_bootstrap_contract() {

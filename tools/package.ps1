@@ -1,0 +1,136 @@
+[CmdletBinding()]
+param(
+    [ValidateSet("release", "release-size", "release-thin")]
+    [string]$BuildProfile = "release"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$RepositoryRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "msvc.ps1")
+. (Join-Path $PSScriptRoot "package-layout.ps1")
+
+$Target = "x86_64-pc-windows-msvc"
+$DistRoot = Join-Path $RepositoryRoot "dist"
+# Kept apart from native\out\x64, which holds the development test fixtures.
+$NativeOutput = Join-Path $RepositoryRoot "native\out\package-x64"
+$TargetDirectory = Join-Path $RepositoryRoot "target\package"
+$StageRoot = Join-Path $DistRoot $PackageName
+$ZipPath = Join-Path $DistRoot "$PackageName.zip"
+$HashPath = Join-Path $DistRoot "$PackageName.sha256"
+$CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
+
+& (Join-Path $PSScriptRoot "build-native.ps1") -OutputDirectory $NativeOutput
+if (-not $?) {
+    throw "Native build from pinned sources failed."
+}
+
+$previousRustFlags = $env:RUSTFLAGS
+# Panic locations would otherwise embed this checkout and the Cargo registry path.
+$env:RUSTFLAGS = "--remap-path-prefix=$RepositoryRoot=fastpad --remap-path-prefix=$CargoHome=cargo"
+Push-Location $RepositoryRoot
+try {
+    & cargo build --locked --profile $BuildProfile --features release-package --bin fastpad --target $Target --target-dir $TargetDirectory
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build --profile $BuildProfile --features release-package failed."
+    }
+}
+finally {
+    Pop-Location
+    $env:RUSTFLAGS = $previousRustFlags
+}
+
+$Sources = [ordered]@{
+    "FastPad.exe"            = Join-Path $TargetDirectory "$Target\$BuildProfile\fastpad.exe"
+    "Scintilla.dll"          = Join-Path $NativeOutput "Scintilla.dll"
+    "Lexilla.dll"            = Join-Path $NativeOutput "Lexilla.dll"
+    "README.md"              = Join-Path $RepositoryRoot "README.md"
+    "LICENSES.md"            = Join-Path $RepositoryRoot "LICENSES.md"
+    "licenses\Scintilla.txt" = Join-Path $RepositoryRoot "licenses\Scintilla.txt"
+    "licenses\Lexilla.txt"   = Join-Path $RepositoryRoot "licenses\Lexilla.txt"
+}
+if ((@($Sources.Keys | Sort-Object) -join "|") -ne (@($PackageFiles | Sort-Object) -join "|")) {
+    throw "Package sources do not match the package layout."
+}
+
+$exeBytes = [System.IO.File]::ReadAllBytes($Sources["FastPad.exe"])
+$exeAnsi = [System.Text.Encoding]::Latin1.GetString($exeBytes)
+$exeWide = [System.Text.Encoding]::Unicode.GetString($exeBytes)
+foreach ($buildPath in @($RepositoryRoot, $CargoHome, $HOME)) {
+    foreach ($spelling in @($buildPath, $buildPath.Replace("\", "/"), $buildPath.Replace("\", "\\"))) {
+        if ($exeAnsi.IndexOf($spelling, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $exeWide.IndexOf($spelling, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "FastPad.exe embeds the build-machine path '$spelling'."
+        }
+    }
+}
+
+if (Test-Path -LiteralPath $StageRoot) {
+    Remove-Item -LiteralPath $StageRoot -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $StageRoot "licenses") | Out-Null
+foreach ($entry in $Sources.GetEnumerator()) {
+    if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) {
+        throw "Package input '$($entry.Value)' is missing."
+    }
+    Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $StageRoot $entry.Key) -Force
+}
+
+foreach ($binary in $PackageBinaries) {
+    Assert-Amd64Image -Path (Join-Path $StageRoot $binary)
+}
+
+if ($env:FASTPAD_SIGNING_CERTIFICATE) {
+    $signTool = Find-SignTool
+    $signArguments = @("sign", "/fd", "SHA256")
+    if ($env:FASTPAD_SIGNING_CERTIFICATE -match '^[0-9A-Fa-f]{40}$') {
+        $signArguments += @("/sha1", $env:FASTPAD_SIGNING_CERTIFICATE)
+    }
+    elseif (Test-Path -LiteralPath $env:FASTPAD_SIGNING_CERTIFICATE -PathType Leaf) {
+        $signArguments += @("/f", $env:FASTPAD_SIGNING_CERTIFICATE)
+        if ($env:FASTPAD_SIGNING_PASSWORD) {
+            $signArguments += @("/p", $env:FASTPAD_SIGNING_PASSWORD)
+        }
+    }
+    else {
+        throw "FASTPAD_SIGNING_CERTIFICATE must be a certificate SHA-1 thumbprint or a PFX file path."
+    }
+    if ($env:FASTPAD_TIMESTAMP_URL) {
+        $signArguments += @("/tr", $env:FASTPAD_TIMESTAMP_URL, "/td", "SHA256")
+    }
+    $binaries = @($PackageBinaries | ForEach-Object { Join-Path $StageRoot $_ })
+    & $signTool @signArguments @binaries
+    if ($LASTEXITCODE -ne 0) {
+        throw "signtool sign failed."
+    }
+    & $signTool verify /pa @binaries
+    if ($LASTEXITCODE -ne 0) {
+        throw "signtool verify failed after signing."
+    }
+}
+else {
+    Write-Warning "FASTPAD_SIGNING_CERTIFICATE is not set; the package binaries are unsigned."
+}
+
+$hashLines = foreach ($relative in $PackageFiles) {
+    $staged = Join-Path $StageRoot $relative
+    $stagedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $staged).Hash.ToLowerInvariant()
+    if (-not ($PackageBinaries -contains $relative) -or -not $env:FASTPAD_SIGNING_CERTIFICATE) {
+        $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Sources[$relative]).Hash.ToLowerInvariant()
+        if ($stagedHash -ne $sourceHash) {
+            throw "Staged '$relative' does not match its source hash."
+        }
+    }
+    "$stagedHash  $($relative.Replace('\', '/'))"
+}
+
+if (Test-Path -LiteralPath $ZipPath) {
+    Remove-Item -LiteralPath $ZipPath -Force
+}
+Compress-Archive -Path (Join-Path $StageRoot "*") -DestinationPath $ZipPath -CompressionLevel Optimal
+$zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ZipPath).Hash.ToLowerInvariant()
+Set-Content -LiteralPath $HashPath -Value (@($hashLines) + "$zipHash  $PackageName.zip") -Encoding utf8NoBOM
+
+Write-Output "Package: $ZipPath"
+Write-Output "SHA-256: $zipHash"

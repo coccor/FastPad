@@ -34,6 +34,31 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[features]
+# Portable-package builds resolve Scintilla.dll only beside FastPad.exe.
+release-package = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-size]
+inherits = "release"
+opt-level = "z"
+lto = "thin"
+
+[profile.release-thin]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+
+[[test]]
+name = "acceptance"
+path = "tests/windows/acceptance.rs"
+
 [[test]]
 name = "editor_control"
 path = "tests/windows/editor_control.rs"
