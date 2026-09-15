@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use support::process::FastPadProcess;
 use support::win32::{find_child_by_class, scintilla_text, send_text};
-use windows_sys::Win32::Foundation::{HWND, LPARAM};
+use windows_sys::Win32::Foundation::{E_INVALIDARG, HWND, LPARAM, SysFreeString, SysStringLen};
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{AccessibleObjectFromWindow, SELFLAG_TAKESELECTION};
@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_CLICK, EnumWindows, GetClientRect, GetDlgItem, GetWindowThreadProcessId, IDCANCEL, IDNO,
     IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CLOSE, WM_COMMAND, WM_LBUTTONUP,
 };
-use windows_sys::core::{BOOL, GUID, HRESULT};
+use windows_sys::core::{BOOL, BSTR, GUID, HRESULT};
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 static NATIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -67,6 +67,33 @@ fn accessibility_selection_switches_the_native_editor_document() -> TestResult<(
     let accessible = Accessible::from_window(hwnd)?;
     assert_eq!(accessible.select(1), windows_sys::Win32::Foundation::S_OK);
     wait_for_editor_text(editor, "first", Duration::from_secs(2))?;
+
+    process.close()
+}
+
+#[test]
+fn retained_accessibility_provider_tracks_current_tabs_and_rejects_removed_tab() -> TestResult<()> {
+    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _com = ComApartment::initialize()?;
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+    let editor = find_child_by_class(hwnd, "Scintilla")?;
+    send_text(editor, "first")?;
+    unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
+    let accessible = Accessible::from_window(hwnd)?;
+    assert_eq!(accessible.child_count()?, 6);
+
+    unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };
+    send_text(editor, "second")?;
+    assert_eq!(accessible.child_count()?, 7);
+    assert_eq!(accessible.name(2)?, "Untitled *");
+
+    unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
+    unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0) };
+    wait_for_editor_text(editor, "first", Duration::from_secs(2))?;
+    assert_eq!(accessible.child_count()?, 6);
+    assert_eq!(accessible.select(2), E_INVALIDARG);
+    assert_eq!(scintilla_text(editor)?, "first");
 
     process.close()
 }
@@ -271,9 +298,9 @@ struct AccessibleVtable {
     get_ids_of_names: usize,
     invoke: usize,
     get_acc_parent: usize,
-    get_acc_child_count: usize,
+    get_acc_child_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
     get_acc_child: usize,
-    get_acc_name: usize,
+    get_acc_name: unsafe extern "system" fn(*mut c_void, VARIANT, *mut BSTR) -> HRESULT,
     get_acc_value: usize,
     get_acc_description: usize,
     get_acc_role: usize,
@@ -307,11 +334,41 @@ impl Accessible {
     }
 
     fn select(&self, child: i32) -> HRESULT {
-        let mut value = VARIANT::default();
-        value.Anonymous.Anonymous.vt = VT_I4;
-        value.Anonymous.Anonymous.Anonymous.lVal = child;
-        unsafe { (self.vtable().acc_select)(self.0, SELFLAG_TAKESELECTION as i32, value) }
+        unsafe {
+            (self.vtable().acc_select)(self.0, SELFLAG_TAKESELECTION as i32, child_variant(child))
+        }
     }
+
+    fn child_count(&self) -> TestResult<i32> {
+        let mut count = 0;
+        let status = unsafe { (self.vtable().get_acc_child_count)(self.0, &mut count) };
+        if status < 0 {
+            Err(format!("get_accChildCount failed: {status:#x}").into())
+        } else {
+            Ok(count)
+        }
+    }
+
+    fn name(&self, child: i32) -> TestResult<String> {
+        let mut name: BSTR = std::ptr::null();
+        let status = unsafe {
+            (self.vtable().get_acc_name)(self.0, child_variant(child), &mut name)
+        };
+        if status < 0 || name.is_null() {
+            return Err(format!("get_accName({child}) failed: {status:#x}").into());
+        }
+        let len = unsafe { SysStringLen(name) } as usize;
+        let text = String::from_utf16(unsafe { std::slice::from_raw_parts(name, len) })?;
+        unsafe { SysFreeString(name) };
+        Ok(text)
+    }
+}
+
+fn child_variant(child: i32) -> VARIANT {
+    let mut value = VARIANT::default();
+    value.Anonymous.Anonymous.vt = VT_I4;
+    value.Anonymous.Anonymous.Anonymous.lVal = child;
+    value
 }
 
 impl Drop for Accessible {

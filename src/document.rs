@@ -94,7 +94,7 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::{CloseCancelled, CloseDecision, Document, DocumentId};
-    use crate::window::tabs::Tabs;
+    use crate::window::tabs::{CloseReviewError, Tabs};
     use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn cancel_preserves_dirty_tab_and_order() {
         // Break caught: a cancelled dirty close can still remove or reorder a document.
-        let mut tabs = Tabs::from_documents([dirty_document(1), document(2)]);
+        let mut tabs = Tabs::from_documents([dirty_document(1), document(2)]).unwrap();
         tabs.activate(DocumentId(1)).unwrap();
         assert_eq!(
             tabs.close_active(CloseDecision::Cancel, || document(3)),
@@ -138,7 +138,8 @@ mod tests {
     fn closing_an_active_middle_tab_selects_its_successor() {
         // Break caught: closing a middle document can select the previous tab or leave a stale
         // active index.
-        let mut tabs = Tabs::from_documents([document(1), document(2), document(3)]);
+        let mut tabs =
+            Tabs::from_documents([document(1), document(2), document(3)]).unwrap();
         tabs.activate(DocumentId(2)).unwrap();
 
         let closed = tabs
@@ -157,7 +158,7 @@ mod tests {
     fn confirmed_save_allows_a_dirty_document_to_close() {
         // Break caught: the tab model can ignore a caller's successful save decision and leave
         // the already-saved document open.
-        let mut tabs = Tabs::from_documents([dirty_document(1), document(2)]);
+        let mut tabs = Tabs::from_documents([dirty_document(1), document(2)]).unwrap();
 
         let closed = tabs
             .close_active(CloseDecision::Save, || document(3))
@@ -171,7 +172,7 @@ mod tests {
     fn save_point_notifications_change_only_the_active_document() {
         // Break caught: Scintilla save-point notifications can mark every tab, or a stale tab,
         // instead of the document installed in the editor.
-        let mut tabs = Tabs::from_documents([document(1), document(2)]);
+        let mut tabs = Tabs::from_documents([document(1), document(2)]).unwrap();
         tabs.activate(DocumentId(2)).unwrap();
 
         assert!(tabs.set_active_dirty(true));
@@ -211,10 +212,64 @@ mod tests {
     }
 
     #[test]
+    fn bulk_construction_rejects_duplicate_canonical_paths() {
+        // Break caught: constructing Tabs from an iterator can bypass the canonical-path
+        // ownership invariant enforced by push.
+        let root = std::env::temp_dir().join(format!(
+            "fastpad-task9-bulk-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("same.txt");
+        fs::write(&path, b"same").unwrap();
+
+        let mut first = document(1);
+        first.path = Some(path.clone());
+        let mut duplicate = document(2);
+        duplicate.path = Some(root.join(".").join("same.txt"));
+
+        assert!(Tabs::from_documents([first, duplicate]).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reentrant_active_change_invalidates_a_close_review() {
+        // Break caught: a modal prompt can reenter, activate a different tab, and make the old
+        // decision close whichever document happens to be active afterward.
+        let mut tabs = Tabs::from_documents([dirty_document(1), document(2)]).unwrap();
+        let review = tabs.active_close_review().unwrap();
+        tabs.activate(DocumentId(2)).unwrap();
+
+        assert_eq!(
+            tabs.close_reviewed(review, CloseDecision::Discard, None),
+            Err(CloseReviewError::Stale)
+        );
+        assert_eq!(tabs.ids().collect::<Vec<_>>(), [DocumentId(1), DocumentId(2)]);
+    }
+
+    #[test]
+    fn reentrant_dirty_change_is_included_in_window_close_review() {
+        // Break caught: snapshotting dirty IDs once before modal prompts can silently omit a tab
+        // that becomes dirty while an earlier document is being reviewed.
+        let mut tabs = Tabs::from_documents([dirty_document(1), document(2)]).unwrap();
+        let first = tabs.next_dirty_review(&[]).unwrap();
+
+        tabs.activate(DocumentId(2)).unwrap();
+        tabs.set_active_dirty(true);
+        let reviewed = [first.key()];
+
+        assert_eq!(tabs.next_dirty_review(&reviewed).unwrap().id, DocumentId(2));
+    }
+
+    #[test]
     fn dirty_titles_expose_the_save_point_state() {
         // Break caught: title-strip and accessibility snapshots cannot show which document has
         // left its save point.
-        let tabs = Tabs::from_documents([document(1), dirty_document(2)]);
+        let tabs = Tabs::from_documents([document(1), dirty_document(2)]).unwrap();
         assert_eq!(
             tabs.titles().collect::<Vec<_>>(),
             ["Untitled", "Untitled *"]
@@ -229,7 +284,7 @@ mod tests {
         let handle =
             crate::editor::EditorDocument::test_fixture_with_release_counter(Arc::clone(&releases));
         let first = Document::untitled(DocumentId(1), super::RecoveryId(1), handle);
-        let mut tabs = Tabs::from_documents([first, document(2)]);
+        let mut tabs = Tabs::from_documents([first, document(2)]).unwrap();
 
         let closed = tabs
             .close_active(CloseDecision::Discard, || document(3))
@@ -254,7 +309,7 @@ mod tests {
             super::RecoveryId(2),
             crate::editor::EditorDocument::test_fixture_with_release_counter(Arc::clone(&releases)),
         );
-        let mut tabs = Tabs::from_documents([first, second]);
+        let mut tabs = Tabs::from_documents([first, second]).unwrap();
 
         tabs.clear_for_shutdown();
 

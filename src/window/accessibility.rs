@@ -1,5 +1,6 @@
+use crate::document::DocumentId;
 use crate::window::commands::CommandId;
-use crate::window::tabs::TabSelection;
+use crate::window::tabs::{TabSelection, TabView, TabViewSnapshot};
 use crate::window::titlebar::{Point, Size, TitleBarLayout};
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -8,7 +9,7 @@ use windows_sys::Win32::Foundation::{
     DISP_E_MEMBERNOTFOUND, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HWND, LRESULT, S_FALSE, S_OK,
     SysAllocStringLen, WPARAM,
 };
-use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
+use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{
     LresultFromObject, NAVDIR_FIRSTCHILD, NAVDIR_LASTCHILD, NAVDIR_NEXT, NAVDIR_PREVIOUS,
@@ -16,8 +17,8 @@ use windows_sys::Win32::UI::Accessibility::{
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowRect, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
-    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, WM_COMMAND, WM_LBUTTONUP, WM_SYSCOMMAND,
+    GetClientRect, GetWindowRect, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SendMessageW,
+    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, WM_APP, WM_COMMAND, WM_LBUTTONUP, WM_SYSCOMMAND,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -25,6 +26,14 @@ const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_00000000004
 const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
 const IID_IACCESSIBLE: GUID = GUID::from_u128(0x618736e0_3c3d_11cf_810c_00aa00389b71);
 const STATE_SYSTEM_FOCUSABLE: u32 = 0x0010_0000;
+pub(crate) const WM_FASTPAD_ACCESSIBLE_SELECT: u32 = WM_APP + 0x31;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub(crate) struct AccessibleSelectRequest {
+    pub(crate) document_id: DocumentId,
+    pub(crate) revision: u64,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AccessibleChild {
@@ -66,7 +75,7 @@ impl AccessibilityState {
     pub(crate) fn ensure(
         &mut self,
         hwnd: HWND,
-        tab_titles: &[&str],
+        view: TabView,
         selection: TabSelection,
     ) -> *mut c_void {
         let provider = *self.provider.get_or_insert_with(|| {
@@ -74,7 +83,7 @@ impl AccessibilityState {
                 vtable: &ACCESSIBLE_VTABLE,
                 references: AtomicU32::new(1),
                 hwnd,
-                children: accessible_children(tab_titles),
+                view,
                 selection,
             });
             NonNull::new(Box::into_raw(provider)).expect("Box never creates a null pointer")
@@ -82,21 +91,12 @@ impl AccessibilityState {
         provider.as_ptr().cast()
     }
 
-    pub(crate) fn invalidate_tabs(&mut self) {
-        if let Some(provider) = self.provider.take() {
-            unsafe {
-                accessible_release(provider.as_ptr().cast());
-            }
-        }
-    }
-
     #[cfg(test)]
     fn ensure_for_test(&mut self) {
-        let _ = self.ensure(
-            std::ptr::null_mut(),
-            &["Untitled"],
-            crate::window::tabs::Tabs::new().selection(),
+        let tabs = crate::window::tabs::Tabs::with_document(
+            crate::document::Document::test_fixture(crate::document::DocumentId(1), false),
         );
+        let _ = self.ensure(std::ptr::null_mut(), tabs.view(), tabs.selection());
     }
 
     #[cfg(test)]
@@ -124,7 +124,7 @@ struct AccessibleProvider {
     vtable: &'static AccessibleVtable,
     references: AtomicU32,
     hwnd: HWND,
-    children: Vec<AccessibleChild>,
+    view: TabView,
     selection: TabSelection,
 }
 
@@ -372,7 +372,8 @@ unsafe extern "system" fn accessible_get_child_count(
     if count.is_null() {
         return E_INVALIDARG;
     }
-    unsafe { *count = provider(this).children.len() as i32 };
+    let children = current_children(unsafe { provider(this) });
+    unsafe { *count = children.len() as i32 };
     S_OK
 }
 
@@ -385,7 +386,8 @@ unsafe extern "system" fn accessible_get_child(
         return E_INVALIDARG;
     }
     unsafe { *output = std::ptr::null_mut() };
-    if unsafe { accessible_child(provider(this), &child) }.is_some() {
+    let children = current_children(unsafe { provider(this) });
+    if accessible_child(&children, &child).is_some() {
         S_FALSE
     } else {
         E_INVALIDARG
@@ -397,7 +399,8 @@ unsafe extern "system" fn accessible_get_name(
     child: RawVariant,
     output: *mut BSTR,
 ) -> HRESULT {
-    let Some(name) = (unsafe { child_name(provider(this), &child) }) else {
+    let children = current_children(unsafe { provider(this) });
+    let Some(name) = child_name(&children, &child) else {
         return E_INVALIDARG;
     };
     unsafe { allocate_bstr(name, output) }
@@ -408,7 +411,8 @@ unsafe extern "system" fn accessible_get_value(
     child: RawVariant,
     output: *mut BSTR,
 ) -> HRESULT {
-    if unsafe { accessible_target(provider(this), &child) }.is_none() {
+    let children = current_children(unsafe { provider(this) });
+    if accessible_target(&children, &child).is_none() {
         return E_INVALIDARG;
     }
     unsafe { allocate_bstr("", output) }
@@ -419,7 +423,8 @@ unsafe extern "system" fn accessible_get_description(
     child: RawVariant,
     output: *mut BSTR,
 ) -> HRESULT {
-    let description = match unsafe { accessible_target(provider(this), &child) } {
+    let children = current_children(unsafe { provider(this) });
+    let description = match accessible_target(&children, &child) {
         Some(AccessibleTarget::SelfObject) => "Title bar tab list",
         Some(AccessibleTarget::Child(AccessibleChild::Tab(_))) => "Selectable and closable tab",
         Some(AccessibleTarget::Child(AccessibleChild::Button(_))) => "Title bar button",
@@ -442,7 +447,8 @@ unsafe extern "system" fn accessible_get_role(
     let role = if id == 0 {
         ROLE_SYSTEM_PAGETABLIST
     } else {
-        match unsafe { accessible_child(provider(this), &child) }.map(|(_, child)| child) {
+        let children = current_children(unsafe { provider(this) });
+        match accessible_child(&children, &child).map(|(_, child)| child) {
             Some(AccessibleChild::Tab(_)) => ROLE_SYSTEM_PAGETAB,
             Some(AccessibleChild::Button(_)) => ROLE_SYSTEM_PUSHBUTTON,
             None => return E_INVALIDARG,
@@ -463,12 +469,14 @@ unsafe extern "system" fn accessible_get_state(
     let Some(id) = child.child_id() else {
         return E_INVALIDARG;
     };
+    let item = unsafe { provider(this) };
+    let children = current_children(item);
     let state = if id == 0 {
         0
     } else {
-        match unsafe { accessible_child(provider(this), &child) } {
+        match accessible_child(&children, &child) {
             Some((index, AccessibleChild::Tab(_))) => {
-                let selected = if index == unsafe { provider(this) }.selection.active_index() {
+                let selected = if index == item.selection.active_index() {
                     STATE_SYSTEM_SELECTED
                 } else {
                     0
@@ -488,7 +496,8 @@ unsafe extern "system" fn accessible_get_help(
     child: RawVariant,
     output: *mut BSTR,
 ) -> HRESULT {
-    if unsafe { accessible_target(provider(this), &child) }.is_none() {
+    let children = current_children(unsafe { provider(this) });
+    if accessible_target(&children, &child).is_none() {
         return E_INVALIDARG;
     }
     unsafe { allocate_bstr("", output) }
@@ -514,7 +523,8 @@ unsafe extern "system" fn accessible_get_keyboard_shortcut(
     child: RawVariant,
     output: *mut BSTR,
 ) -> HRESULT {
-    if unsafe { accessible_target(provider(this), &child) }.is_none() {
+    let children = current_children(unsafe { provider(this) });
+    if accessible_target(&children, &child).is_none() {
         return E_INVALIDARG;
     }
     unsafe { allocate_bstr("", output) }
@@ -539,7 +549,8 @@ unsafe extern "system" fn accessible_get_selection(
         return E_INVALIDARG;
     }
     let item = unsafe { provider(this) };
-    let count = tab_count(&item.children);
+    let children = current_children(item);
+    let count = tab_count(&children);
     if count == 0 {
         unsafe { *output = RawVariant::empty() };
         S_FALSE
@@ -555,7 +566,8 @@ unsafe extern "system" fn accessible_get_default_action(
     child: RawVariant,
     output: *mut BSTR,
 ) -> HRESULT {
-    let action = match unsafe { accessible_child(provider(this), &child) } {
+    let children = current_children(unsafe { provider(this) });
+    let action = match accessible_child(&children, &child) {
         Some((_, AccessibleChild::Tab(_))) => "Close",
         Some((_, AccessibleChild::Button(_))) => "Press",
         None => return E_INVALIDARG,
@@ -572,21 +584,34 @@ unsafe extern "system" fn accessible_select(
         return E_INVALIDARG;
     }
     let item = unsafe { provider(this) };
-    let Some((index, AccessibleChild::Tab(_))) = (unsafe { accessible_child(item, &child) }) else {
+    let view = item.view.snapshot();
+    let children = children_from_view(&view);
+    let Some((index, AccessibleChild::Tab(_))) = accessible_child(&children, &child) else {
         return E_INVALIDARG;
     };
-    if !item.selection.select(index, tab_count(&item.children)) {
+    let Some(tab) = view.tabs.get(index) else {
         return E_INVALIDARG;
+    };
+    if item.hwnd.is_null() {
+        return if item.selection.select(index, view.tabs.len()) {
+            S_OK
+        } else {
+            E_INVALIDARG
+        };
     }
-    if !item.hwnd.is_null() {
-        let center = native_layout(item).tab(index).center();
-        let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
-        unsafe {
-            InvalidateRect(item.hwnd, std::ptr::null(), 0);
-            PostMessageW(item.hwnd, WM_LBUTTONUP, 0, packed);
-        }
-    }
-    S_OK
+    let request = AccessibleSelectRequest {
+        document_id: tab.id,
+        revision: view.revision,
+    };
+    let selected = unsafe {
+        SendMessageW(
+            item.hwnd,
+            WM_FASTPAD_ACCESSIBLE_SELECT,
+            0,
+            &request as *const AccessibleSelectRequest as isize,
+        )
+    };
+    if selected != 0 { S_OK } else { E_INVALIDARG }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -632,19 +657,19 @@ enum AccessibleTarget<'a> {
     Child(&'a AccessibleChild),
 }
 
-unsafe fn accessible_target<'a>(
-    item: &'a AccessibleProvider,
+fn accessible_target<'a>(
+    children: &'a [AccessibleChild],
     child: &RawVariant,
 ) -> Option<AccessibleTarget<'a>> {
     match child.child_id()? {
         0 => Some(AccessibleTarget::SelfObject),
-        _ => unsafe { accessible_child(item, child) }
+        _ => accessible_child(children, child)
             .map(|(_, child)| AccessibleTarget::Child(child)),
     }
 }
 
-unsafe fn accessible_child<'a>(
-    item: &'a AccessibleProvider,
+fn accessible_child<'a>(
+    children: &'a [AccessibleChild],
     child: &RawVariant,
 ) -> Option<(usize, &'a AccessibleChild)> {
     let id = child.child_id()?;
@@ -652,7 +677,7 @@ unsafe fn accessible_child<'a>(
         return None;
     }
     let index = id as usize - 1;
-    item.children.get(index).map(|child| (index, child))
+    children.get(index).map(|child| (index, child))
 }
 
 unsafe extern "system" fn accessible_location(
@@ -690,7 +715,7 @@ unsafe extern "system" fn accessible_navigate(
     let Some(id) = start.child_id() else {
         return E_INVALIDARG;
     };
-    let count = unsafe { provider(this) }.children.len() as i32;
+    let count = current_children(unsafe { provider(this) }).len() as i32;
     if id < 0 || id > count {
         return E_INVALIDARG;
     }
@@ -726,12 +751,9 @@ unsafe extern "system" fn accessible_hit_test(
         unsafe { *output = RawVariant::empty() };
         return S_FALSE;
     }
-    let target = native_layout(item).hit_test(Point::new(point.x, point.y));
-    let tab_count = item
-        .children
-        .iter()
-        .take_while(|child| matches!(child, AccessibleChild::Tab(_)))
-        .count();
+    let children = current_children(item);
+    let tab_count = tab_count(&children);
+    let target = native_layout(item, tab_count).hit_test(Point::new(point.x, point.y));
     let id = match target {
         crate::window::titlebar::HitTarget::Tab(index)
         | crate::window::titlebar::HitTarget::CloseTab(index) => Some(index as i32 + 1),
@@ -754,12 +776,14 @@ unsafe extern "system" fn accessible_do_default_action(
     let Some(id) = child.child_id() else {
         return E_INVALIDARG;
     };
-    match accessible_default_action(&item.children, id) {
+    let children = current_children(item);
+    let tabs = tab_count(&children);
+    match accessible_default_action(&children, id) {
         Some(AccessibleDefaultAction::Command(command)) => unsafe {
             PostMessageW(item.hwnd, WM_COMMAND, command as usize, 0)
         },
         Some(AccessibleDefaultAction::Overflow) => {
-            let center = native_layout(item).overflow.center();
+            let center = native_layout(item, tabs).overflow.center();
             let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
             unsafe { PostMessageW(item.hwnd, WM_LBUTTONUP, 0, packed) }
         }
@@ -787,10 +811,10 @@ unsafe extern "system" fn accessible_put_value(
     E_NOTIMPL
 }
 
-unsafe fn child_name<'a>(item: &'a AccessibleProvider, child: &RawVariant) -> Option<&'a str> {
+fn child_name<'a>(children: &'a [AccessibleChild], child: &RawVariant) -> Option<&'a str> {
     match child.child_id()? {
         0 => Some("FastPad title tabs"),
-        id if id > 0 => match item.children.get((id - 1) as usize)? {
+        id if id > 0 => match children.get((id - 1) as usize)? {
             AccessibleChild::Tab(name) => Some(name),
             AccessibleChild::Button(name) => Some(name),
         },
@@ -824,12 +848,9 @@ unsafe fn child_screen_rect(
     if id == 0 {
         return Some(window);
     }
-    let layout = native_layout(item);
-    let tab_count = item
-        .children
-        .iter()
-        .take_while(|entry| matches!(entry, AccessibleChild::Tab(_)))
-        .count();
+    let children = current_children(item);
+    let tab_count = tab_count(&children);
+    let layout = native_layout(item, tab_count);
     let rect = if id as usize <= tab_count {
         layout.tab(id as usize - 1)
     } else {
@@ -854,21 +875,29 @@ unsafe fn child_screen_rect(
     })
 }
 
-fn native_layout(item: &AccessibleProvider) -> TitleBarLayout {
+fn native_layout(item: &AccessibleProvider, tabs: usize) -> TitleBarLayout {
     let mut client = windows_sys::Win32::Foundation::RECT::default();
     unsafe {
         GetClientRect(item.hwnd, &mut client);
     }
-    let tabs = item
-        .children
-        .iter()
-        .take_while(|entry| matches!(entry, AccessibleChild::Tab(_)))
-        .count();
     TitleBarLayout::calculate(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(item.hwnd) }.max(96),
         tabs,
     )
+}
+
+fn current_children(item: &AccessibleProvider) -> Vec<AccessibleChild> {
+    children_from_view(&item.view.snapshot())
+}
+
+fn children_from_view(view: &TabViewSnapshot) -> Vec<AccessibleChild> {
+    let titles = view
+        .tabs
+        .iter()
+        .map(|tab| tab.title.as_str())
+        .collect::<Vec<_>>();
+    accessible_children(&titles)
 }
 
 #[cfg(test)]
@@ -878,7 +907,8 @@ mod tests {
         accessible_default_action, accessible_get_default_action, accessible_get_focus,
         accessible_get_selection, accessible_get_state, accessible_select,
     };
-    use crate::window::tabs::{TabSelection, Tabs};
+    use crate::window::tabs::Tabs;
+    use crate::document::{Document, DocumentId};
     use windows_sys::Win32::Foundation::{
         E_INVALIDARG, S_FALSE, S_OK, SysFreeString, SysStringLen,
     };
@@ -938,12 +968,9 @@ mod tests {
     #[test]
     fn selection_is_bounded_to_tabs_and_updates_the_selected_state() {
         let mut state = AccessibilityState::default();
-        let model_selection = TabSelection::new(0);
-        let provider = state.ensure(
-            std::ptr::null_mut(),
-            &["One", "Two"],
-            model_selection.clone(),
-        );
+        let tabs = fixture_tabs(2);
+        let model_selection = tabs.selection();
+        let provider = state.ensure(std::ptr::null_mut(), tabs.view(), model_selection.clone());
 
         assert_eq!(
             unsafe {
@@ -1001,7 +1028,8 @@ mod tests {
     #[test]
     fn focus_is_not_fabricated_when_the_editor_owns_focus() {
         let mut state = AccessibilityState::default();
-        let provider = state.ensure(std::ptr::null_mut(), &["Untitled"], Tabs::new().selection());
+        let tabs = fixture_tabs(1);
+        let provider = state.ensure(std::ptr::null_mut(), tabs.view(), tabs.selection());
         let mut focus = RawVariant::integer(99);
 
         assert_eq!(
@@ -1017,7 +1045,8 @@ mod tests {
     #[test]
     fn tabs_expose_close_as_their_default_action() {
         let mut state = AccessibilityState::default();
-        let provider = state.ensure(std::ptr::null_mut(), &["Untitled"], Tabs::new().selection());
+        let tabs = fixture_tabs(1);
+        let provider = state.ensure(std::ptr::null_mut(), tabs.view(), tabs.selection());
         let mut action = std::ptr::null();
 
         assert_eq!(
@@ -1046,5 +1075,12 @@ mod tests {
         );
         assert_eq!(accessible_default_action(&children, 0), None);
         assert_eq!(accessible_default_action(&children, 7), None);
+    }
+
+    fn fixture_tabs(count: u64) -> Tabs {
+        Tabs::from_documents(
+            (1..=count).map(|id| Document::test_fixture(DocumentId(id), false)),
+        )
+        .unwrap()
     }
 }

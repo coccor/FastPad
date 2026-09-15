@@ -3,7 +3,7 @@ pub mod commands;
 mod main_window;
 pub(crate) mod menus;
 mod messages;
-pub(crate) mod tabs;
+pub mod tabs;
 pub mod titlebar;
 
 #[cfg(test)]

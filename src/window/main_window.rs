@@ -4,13 +4,13 @@ use crate::document::{CloseDecision, Document, DocumentId, RecoveryId};
 use crate::editor::Editor;
 use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
-use crate::window::accessibility;
+use crate::window::accessibility::{self, AccessibleSelectRequest, WM_FASTPAD_ACCESSIBLE_SELECT};
 use crate::window::commands::CommandId;
 use crate::window::menus::{self, MenuBar};
 use crate::window::messages::{
     DeferredAction, classify_deferred_message, completed_milestone, deferred_start_message,
 };
-use crate::window::tabs::Tabs;
+use crate::window::tabs::{CloseReviewKey, Tabs};
 #[cfg(test)]
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -228,6 +228,7 @@ unsafe extern "system" fn main_window_proc(
             handle_editor_notification(hwnd, lparam);
             0
         }
+        WM_FASTPAD_ACCESSIBLE_SELECT => handle_accessible_select(hwnd, lparam),
         WM_COMMAND => {
             if let Ok(command) = CommandId::try_from((wparam & 0xffff) as u16) {
                 execute_command(hwnd, command);
@@ -580,27 +581,54 @@ fn create_new_document(hwnd: HWND) -> Result<()> {
     app.tabs
         .push(document)
         .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))?;
-    app.accessibility.invalidate_tabs();
     invalidate_title_strip(hwnd);
     Ok(())
 }
 
 fn activate_tab(hwnd: HWND, index: usize) {
+    let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let view = unsafe { app.as_ref() }.tabs.view().snapshot();
+        view.tabs
+            .get(index)
+            .map(|tab| (tab.id, view.revision))
+    });
+    if let Some((id, revision)) = target {
+        let _ = activate_document(hwnd, id, revision);
+    }
+}
+
+fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
-        return;
+        return false;
     };
     let target = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        app.tabs.activate_index(index).ok()?;
+        if app.tabs.view().snapshot().revision != revision {
+            return None;
+        }
+        app.tabs.activate(id).ok()?;
         Some((app.editor.clone()?, app.tabs.active_handle().clone()))
     });
     let Some((editor, handle)) = target else {
-        return;
+        return false;
     };
     if editor.use_document(&handle).is_err() || !identity.is_live_for(hwnd) {
-        return;
+        return false;
     }
     invalidate_title_strip(hwnd);
+    true
+}
+
+fn handle_accessible_select(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    if lparam == 0 {
+        return 0;
+    }
+    let request = unsafe { *(lparam as *const AccessibleSelectRequest) };
+    isize::from(activate_document(
+        hwnd,
+        request.document_id,
+        request.revision,
+    ))
 }
 
 fn close_active_document(hwnd: HWND) {
@@ -609,16 +637,11 @@ fn close_active_document(hwnd: HWND) {
     };
     let snapshot = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
-        (!app.tabs.is_empty()).then(|| {
-            (
-                app.tabs.active().dirty,
-                app.tabs.active().title(),
-                app.tabs.len(),
-                app.editor.clone(),
-            )
-        })
+        let review = app.tabs.active_close_review()?;
+        let document = app.tabs.document(review.id)?;
+        Some((review, document.dirty, document.title(), app.editor.clone()))
     });
-    let Some((dirty, title, len, Some(editor))) = snapshot else {
+    let Some((review, dirty, title, Some(editor))) = snapshot else {
         return;
     };
     let decision = if dirty {
@@ -630,7 +653,14 @@ fn close_active_document(hwnd: HWND) {
         return;
     }
 
-    let replacement = if len == 1 {
+    let current_len = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        (app.tabs.active_close_review() == Some(review)).then_some(app.tabs.len())
+    });
+    let Some(current_len) = current_len else {
+        return;
+    };
+    let replacement = if current_len == 1 {
         let ids = unsafe { app_ptr(hwnd) }
             .map(|mut app| unsafe { app.as_mut() }.allocate_document_identity());
         let Some((id, recovery_id)) = ids else {
@@ -649,13 +679,7 @@ fn close_active_document(hwnd: HWND) {
 
     let switched = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        let closed = app
-            .tabs
-            .close_active(decision, || {
-                replacement.expect("last tab needs replacement")
-            })
-            .ok()?;
-        app.accessibility.invalidate_tabs();
+        let closed = app.tabs.close_reviewed(review, decision, replacement).ok()?;
         Some((closed, app.tabs.active_handle().clone()))
     });
     let Some((closed, active)) = switched else {
@@ -673,23 +697,30 @@ fn review_dirty_documents(hwnd: HWND) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
-    let dirty = unsafe { app_ptr(hwnd) }
-        .map(|app| {
+    let mut reviewed = Vec::<CloseReviewKey>::new();
+    loop {
+        let pending = unsafe { app_ptr(hwnd) }.and_then(|app| {
             let app = unsafe { app.as_ref() };
-            app.tabs
-                .dirty_ids()
-                .filter_map(|id| app.tabs.document(id).map(Document::title))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for title in dirty {
-        if prompt_close_decision(hwnd, &title) == CloseDecision::Cancel
-            || !identity.is_live_for(hwnd)
-        {
+            let review = app.tabs.next_dirty_review(&reviewed)?;
+            let title = app.tabs.document(review.id)?.title();
+            Some((review, title))
+        });
+        let Some((review, title)) = pending else {
+            return true;
+        };
+        if prompt_close_decision(hwnd, &title) == CloseDecision::Cancel {
             return false;
         }
+        if !identity.is_live_for(hwnd) {
+            return false;
+        }
+        let current = unsafe { app_ptr(hwnd) }
+            .map(|app| unsafe { app.as_ref() }.tabs.dirty_review_is_current(review))
+            .unwrap_or(false);
+        if current {
+            reviewed.push(review.key());
+        }
     }
-    true
 }
 
 fn prompt_close_decision(hwnd: HWND, title: &str) -> CloseDecision {
@@ -733,9 +764,6 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         .map(|mut app| {
             let app = unsafe { app.as_mut() };
             let changed = app.tabs.set_active_dirty(dirty);
-            if changed {
-                app.accessibility.invalidate_tabs();
-            }
             changed
         })
         .unwrap_or(false);
@@ -836,7 +864,6 @@ unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Resu
     };
     let app = unsafe { app.as_mut() };
     app.tabs = Tabs::with_document(document);
-    app.accessibility.invalidate_tabs();
     app.editor = Some(editor);
     Ok(())
 }

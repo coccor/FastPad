@@ -1,6 +1,6 @@
 use crate::document::{CloseCancelled, CloseDecision, Document, DocumentId};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Debug)]
@@ -28,29 +28,103 @@ impl TabSelection {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct TabView {
+    state: Arc<RwLock<TabViewState>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TabViewSnapshot {
+    pub(crate) revision: u64,
+    pub(crate) tabs: Vec<TabViewTab>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TabViewTab {
+    pub(crate) id: DocumentId,
+    pub(crate) title: String,
+}
+
+#[derive(Debug)]
+struct TabViewState {
+    revision: u64,
+    tabs: Vec<TabViewTab>,
+}
+
+impl TabView {
+    fn new(documents: &[Document]) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(TabViewState {
+                revision: 0,
+                tabs: view_tabs(documents),
+            })),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> TabViewSnapshot {
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
+        TabViewSnapshot {
+            revision: state.revision,
+            tabs: state.tabs.clone(),
+        }
+    }
+
+    fn update(&self, documents: &[Document]) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        state.revision = state.revision.saturating_add(1);
+        state.tabs = view_tabs(documents);
+    }
+}
+
+fn view_tabs(documents: &[Document]) -> Vec<TabViewTab> {
+    documents
+        .iter()
+        .map(|document| TabViewTab {
+            id: document.id,
+            title: document.title(),
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct Tabs {
     documents: Vec<Document>,
     selection: TabSelection,
+    view: TabView,
 }
 
 impl Tabs {
     pub fn new() -> Self {
+        let documents = Vec::new();
         Self {
-            documents: Vec::new(),
+            view: TabView::new(&documents),
+            documents,
             selection: TabSelection::new(0),
         }
     }
 
     pub fn with_document(document: Document) -> Self {
-        Self::from_documents([document])
-    }
-
-    pub fn from_documents(documents: impl IntoIterator<Item = Document>) -> Self {
+        let documents = vec![document];
         Self {
-            documents: documents.into_iter().collect(),
+            view: TabView::new(&documents),
+            documents,
             selection: TabSelection::new(0),
         }
+    }
+
+    pub fn from_documents(
+        documents: impl IntoIterator<Item = Document>,
+    ) -> Result<Self, DuplicateDocumentPath> {
+        let documents = documents.into_iter().collect::<Vec<_>>();
+        validate_unique_paths(&documents)?;
+        Ok(Self {
+            view: TabView::new(&documents),
+            documents,
+            selection: TabSelection::new(0),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -67,6 +141,10 @@ impl Tabs {
 
     pub(crate) fn selection(&self) -> TabSelection {
         self.selection.clone()
+    }
+
+    pub(crate) fn view(&self) -> TabView {
+        self.view.clone()
     }
 
     pub fn active(&self) -> &Document {
@@ -121,6 +199,7 @@ impl Tabs {
         self.documents.push(document);
         let index = self.documents.len() - 1;
         self.selection.select(index, self.documents.len());
+        self.view.update(&self.documents);
         Ok(())
     }
 
@@ -139,12 +218,77 @@ impl Tabs {
         if self.documents.len() == 1 {
             let closed = std::mem::replace(&mut self.documents[0], replacement());
             self.selection.select(0, 1);
+            self.view.update(&self.documents);
             return Ok(closed);
         }
         let closed = self.documents.remove(index);
         self.selection
             .select(index.min(self.documents.len() - 1), self.documents.len());
+        self.view.update(&self.documents);
         Ok(closed)
+    }
+
+    pub fn active_close_review(&self) -> Option<CloseReview> {
+        let document = self.documents.get(self.active_index())?;
+        Some(CloseReview {
+            id: document.id,
+            generation: document.generation,
+        })
+    }
+
+    pub fn close_reviewed(
+        &mut self,
+        review: CloseReview,
+        decision: CloseDecision,
+        replacement: Option<Document>,
+    ) -> Result<Document, CloseReviewError> {
+        if decision == CloseDecision::Cancel {
+            return Err(CloseReviewError::Cancelled);
+        }
+        let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.id == review.id)
+        else {
+            return Err(CloseReviewError::Stale);
+        };
+        if index != self.active_index()
+            || self.documents[index].generation != review.generation
+        {
+            return Err(CloseReviewError::Stale);
+        }
+        let closed = if self.documents.len() == 1 {
+            let replacement = replacement.ok_or(CloseReviewError::MissingReplacement)?;
+            std::mem::replace(&mut self.documents[0], replacement)
+        } else {
+            self.documents.remove(index)
+        };
+        let active = index.min(self.documents.len() - 1);
+        self.selection.select(active, self.documents.len());
+        self.view.update(&self.documents);
+        Ok(closed)
+    }
+
+    pub fn next_dirty_review(&self, reviewed: &[CloseReviewKey]) -> Option<CloseReview> {
+        self.documents
+            .iter()
+            .find(|document| {
+                document.dirty
+                    && !reviewed.contains(&CloseReviewKey {
+                        id: document.id,
+                        generation: document.generation,
+                    })
+            })
+            .map(|document| CloseReview {
+                id: document.id,
+                generation: document.generation,
+            })
+    }
+
+    pub fn dirty_review_is_current(&self, review: CloseReview) -> bool {
+        self.document(review.id).is_some_and(|document| {
+            document.dirty && document.generation == review.generation
+        })
     }
 
     pub fn set_active_dirty(&mut self, dirty: bool) -> bool {
@@ -157,24 +301,48 @@ impl Tabs {
         }
         document.dirty = dirty;
         document.generation = document.generation.saturating_add(1);
+        self.view.update(&self.documents);
         true
     }
 
     pub fn clear_for_shutdown(&mut self) {
         self.documents.clear();
         self.selection.active.store(0, Ordering::Release);
+        self.view.update(&self.documents);
     }
 
     pub(crate) fn active_handle(&self) -> &crate::editor::EditorDocument {
         &self.active().handle
     }
 
-    pub(crate) fn dirty_ids(&self) -> impl Iterator<Item = DocumentId> + '_ {
-        self.documents
-            .iter()
-            .filter(|document| document.dirty)
-            .map(|document| document.id)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CloseReview {
+    pub id: DocumentId,
+    pub generation: u64,
+}
+
+impl CloseReview {
+    pub fn key(self) -> CloseReviewKey {
+        CloseReviewKey {
+            id: self.id,
+            generation: self.generation,
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CloseReviewKey {
+    id: DocumentId,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseReviewError {
+    Cancelled,
+    Stale,
+    MissingReplacement,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +363,21 @@ fn canonical_key(path: &Path) -> Result<PathBuf, DuplicateDocumentPath> {
     {
         Ok(canonical)
     }
+}
+
+fn validate_unique_paths(documents: &[Document]) -> Result<(), DuplicateDocumentPath> {
+    let mut paths = Vec::new();
+    for document in documents {
+        let Some(path) = document.path.as_deref() else {
+            continue;
+        };
+        let canonical = canonical_key(path)?;
+        if paths.contains(&canonical) {
+            return Err(DuplicateDocumentPath(canonical));
+        }
+        paths.push(canonical);
+    }
+    Ok(())
 }
 
 impl Default for Tabs {
@@ -223,7 +406,8 @@ mod tests {
         let tabs = Tabs::from_documents([
             Document::test_fixture(DocumentId(1), false),
             Document::test_fixture(DocumentId(2), false),
-        ]);
+        ])
+        .unwrap();
         let selection = tabs.selection();
 
         assert!(selection.select(1, tabs.len()));
