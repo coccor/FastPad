@@ -1,10 +1,16 @@
 pub mod snapshot;
 
 use crate::Result;
-use crate::document::Document;
+use crate::document::{Document, RecoveryId};
+use crate::platform::{OwnedHandle, wide_null};
 use std::path::{Path, PathBuf};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+};
 
-pub use snapshot::{Snapshot, SnapshotCandidate, discover_snapshots, write_snapshot};
+pub use snapshot::{
+    Snapshot, SnapshotCandidate, discover_snapshots, discover_snapshots_with, write_snapshot,
+};
 
 pub const RECOVERY_TIMER_ID: usize = 0x4650_5243;
 pub const IDLE_THRESHOLD_MS: u32 = 2_000;
@@ -46,6 +52,47 @@ pub fn owned_snapshot_files(root: &Path, document: &Document) -> Vec<PathBuf> {
     files
 }
 
+/// Files a close may delete: everything owned after an explicit Discard of a dirty document, or
+/// the own snapshot of a clean non-recovered document. A Save decision keeps everything.
+pub fn snapshots_removed_on_close(
+    root: &Path,
+    document: &Document,
+    discarded: bool,
+) -> Vec<PathBuf> {
+    if document.dirty {
+        if discarded {
+            owned_snapshot_files(root, document)
+        } else {
+            Vec::new()
+        }
+    } else if document.recovery_origin.is_none() {
+        vec![snapshot::snapshot_path(root, document.recovery_id)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Every recovery ID a process composes shares this name, so a live owner is detectable.
+pub fn owner_mutex_name(id: RecoveryId) -> String {
+    format!(
+        r"Local\FastPad-Recovery-{:016x}-{}",
+        (id.0 >> 64) as u64,
+        (id.0 >> 32) as u32
+    )
+}
+
+pub fn create_owner_mutex(id: RecoveryId) -> Result<OwnedHandle> {
+    let name = wide_null(&owner_mutex_name(id));
+    let raw = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    unsafe { OwnedHandle::from_raw_owned(raw) }
+}
+
+pub fn owner_is_alive(id: RecoveryId) -> bool {
+    let name = wide_null(&owner_mutex_name(id));
+    let raw = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
+    unsafe { OwnedHandle::from_raw_owned(raw) }.is_ok()
+}
+
 pub fn remove_snapshot_files(files: &[PathBuf]) {
     for file in files {
         let _ = std::fs::remove_file(file);
@@ -66,8 +113,11 @@ pub fn recovered_notice(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{input_idle, needs_snapshot, next_snapshot_document, owned_snapshot_files};
-    use crate::document::{Document, DocumentId, RecoveryOrigin};
+    use super::{
+        create_owner_mutex, input_idle, needs_snapshot, next_snapshot_document,
+        owned_snapshot_files, owner_is_alive, owner_mutex_name, snapshots_removed_on_close,
+    };
+    use crate::document::{Document, DocumentId, RecoveryId, RecoveryOrigin};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -99,6 +149,55 @@ mod tests {
             next_snapshot_document(&documents).map(|document| document.id),
             Some(DocumentId(3))
         );
+    }
+
+    #[test]
+    fn only_discard_or_a_clean_ordinary_close_removes_snapshots() {
+        // Break caught: a Save decision (which does not write) or a clean recovered tab deleting
+        // the only surviving copy of unsaved text.
+        let root = Path::new(r"C:\Recovery");
+        let origin = RecoveryOrigin {
+            snapshot_path: PathBuf::from(r"C:\Recovery\old.fps"),
+            original_path: None,
+        };
+        let mut dirty_recovered = Document::test_fixture(DocumentId(1), true);
+        dirty_recovered.recovery_origin = Some(origin.clone());
+        assert_eq!(
+            snapshots_removed_on_close(root, &dirty_recovered, true).len(),
+            2
+        );
+        assert!(snapshots_removed_on_close(root, &dirty_recovered, false).is_empty());
+
+        let clean = Document::test_fixture(DocumentId(2), false);
+        assert_eq!(snapshots_removed_on_close(root, &clean, false).len(), 1);
+
+        let mut clean_recovered = Document::test_fixture(DocumentId(3), false);
+        clean_recovered.recovery_origin = Some(origin);
+        assert!(snapshots_removed_on_close(root, &clean_recovered, true).is_empty());
+    }
+
+    #[test]
+    fn owner_mutex_names_are_shared_by_one_process_and_detect_liveness() {
+        // Break caught: a second instance treating a running instance's snapshots as crashed.
+        let process_start = 0x1122_3344_5566_7788;
+        let first = RecoveryId::compose(process_start, 4242, 7);
+        let second = RecoveryId::compose(process_start, 4242, 8);
+        assert_eq!(
+            owner_mutex_name(first),
+            r"Local\FastPad-Recovery-1122334455667788-4242"
+        );
+        assert_eq!(owner_mutex_name(first), owner_mutex_name(second));
+        assert_ne!(
+            owner_mutex_name(first),
+            owner_mutex_name(RecoveryId::compose(process_start, 4243, 7))
+        );
+
+        let live = RecoveryId::compose(0xC0FF_EE00_0000_0000, std::process::id(), 1);
+        assert!(!owner_is_alive(live));
+        let owner = create_owner_mutex(live).unwrap();
+        assert!(owner_is_alive(live));
+        drop(owner);
+        assert!(!owner_is_alive(live));
     }
 
     #[test]

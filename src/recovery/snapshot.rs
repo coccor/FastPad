@@ -125,6 +125,14 @@ pub fn write_snapshot(root: &Path, snapshot: &Snapshot) -> Result<PathBuf> {
 }
 
 pub fn discover_snapshots(root: &Path) -> Result<Vec<SnapshotCandidate>> {
+    discover_snapshots_with(root, |_| false)
+}
+
+/// Like `discover_snapshots`, but never reads, returns, or quarantines files for IDs `skip` claims.
+pub fn discover_snapshots_with(
+    root: &Path,
+    skip: impl Fn(RecoveryId) -> bool,
+) -> Result<Vec<SnapshotCandidate>> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -139,7 +147,17 @@ pub fn discover_snapshots(root: &Path) -> Result<Vec<SnapshotCandidate>> {
         if !is_snapshot || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
             continue;
         }
+        let named_id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| stem.len() == 32)
+            .and_then(|stem| u128::from_str_radix(stem, 16).ok())
+            .map(RecoveryId::from_u128);
+        if named_id.is_some_and(&skip) {
+            continue;
+        }
         match read_snapshot(&path) {
+            Ok(snapshot) if skip(snapshot.recovery_id) => {}
             Ok(snapshot) => candidates.push(SnapshotCandidate { path, snapshot }),
             Err(FastPadError::Io(_)) => {}
             Err(_) => quarantine(&path),

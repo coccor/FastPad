@@ -153,8 +153,8 @@ unsafe extern "system" fn main_window_proc(
             if file_population_active(hwnd) {
                 return 0;
             }
-            if review_dirty_documents(hwnd) {
-                remove_session_snapshots(hwnd);
+            if let Some(discarded) = review_dirty_documents(hwnd) {
+                remove_session_snapshots(hwnd, &discarded);
                 clear_documents_for_shutdown(hwnd);
                 unsafe {
                     DestroyWindow(hwnd);
@@ -1580,7 +1580,13 @@ fn close_active_document(hwnd: HWND) {
         let snapshots = app
             .recovery_root
             .as_deref()
-            .map(|root| crate::recovery::owned_snapshot_files(root, &closed))
+            .map(|root| {
+                crate::recovery::snapshots_removed_on_close(
+                    root,
+                    &closed,
+                    decision == CloseDecision::Discard,
+                )
+            })
             .unwrap_or_default();
         Some((closed, app.tabs.active_handle().clone(), snapshots))
     });
@@ -1711,8 +1717,15 @@ fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::pa
     }
     match result {
         Ok(()) => {
-            editor.set_save_point();
             remove_saved_document_snapshots(hwnd);
+            editor.set_save_point();
+            // A recovered tab undone to the empty save point gets no save-point notification.
+            let cleaned = identity.is_live_for(hwnd)
+                && unsafe { app_ptr(hwnd) }
+                    .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.set_active_dirty(false));
+            if cleaned && !is_save_as {
+                invalidate_title_strip(hwnd);
+            }
             if is_save_as {
                 unsafe {
                     PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
@@ -1774,11 +1787,11 @@ pub(crate) fn take_save_errors() -> Vec<String> {
     SAVE_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()))
 }
 
-fn review_dirty_documents(hwnd: HWND) -> bool {
-    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
-        return false;
-    };
+/// Returns the documents explicitly discarded, or `None` when the close was cancelled.
+fn review_dirty_documents(hwnd: HWND) -> Option<Vec<DocumentId>> {
+    let identity = unsafe { window_identity(hwnd) }?;
     let mut reviewed = Vec::<CloseReviewKey>::new();
+    let mut discarded = Vec::<DocumentId>::new();
     loop {
         let pending = unsafe { app_ptr(hwnd) }.and_then(|app| {
             let app = unsafe { app.as_ref() };
@@ -1787,19 +1800,21 @@ fn review_dirty_documents(hwnd: HWND) -> bool {
             Some((review, title))
         });
         let Some((review, title)) = pending else {
-            return true;
+            return Some(discarded);
         };
-        if prompt_close_decision(hwnd, &title) == CloseDecision::Cancel {
-            return false;
-        }
-        if !identity.is_live_for(hwnd) {
-            return false;
+        let decision = prompt_close_decision(hwnd, &title);
+        if decision == CloseDecision::Cancel || !identity.is_live_for(hwnd) {
+            return None;
         }
         let current = unsafe { app_ptr(hwnd) }
             .map(|app| unsafe { app.as_ref() }.tabs.dirty_review_is_current(review))
             .unwrap_or(false);
         if current {
             reviewed.push(review.key());
+            discarded.retain(|id| *id != review.id);
+            if decision == CloseDecision::Discard {
+                discarded.push(review.id);
+            }
         }
     }
 }
@@ -1823,9 +1838,13 @@ fn prompt_close_decision(hwnd: HWND, title: &str) -> CloseDecision {
 }
 
 fn start_recovery_timer(hwnd: HWND) {
-    let Some(interval) = (unsafe { app_ptr(hwnd) })
-        .map(|app| unsafe { app.as_ref() }.settings.recovery_interval_seconds)
-    else {
+    let Some(interval) = (unsafe { app_ptr(hwnd) }).map(|mut app| {
+        let app = unsafe { app.as_mut() };
+        if app.recovery_owner.is_none() {
+            app.recovery_owner = crate::recovery::create_owner_mutex(app.recovery_owner_id()).ok();
+        }
+        app.settings.recovery_interval_seconds
+    }) else {
         return;
     };
     unsafe {
@@ -1992,7 +2011,9 @@ fn recover_snapshots(hwnd: HWND) {
     let Some(root) = recovery_root(hwnd) else {
         return;
     };
-    let Ok(candidates) = crate::recovery::discover_snapshots(&root) else {
+    let Ok(candidates) =
+        crate::recovery::discover_snapshots_with(&root, crate::recovery::owner_is_alive)
+    else {
         return;
     };
     let mut recovered = 0;
@@ -2114,14 +2135,20 @@ fn remove_saved_document_snapshots(hwnd: HWND) {
     crate::recovery::remove_snapshot_files(&files.unwrap_or_default());
 }
 
-fn remove_session_snapshots(hwnd: HWND) {
+fn remove_session_snapshots(hwnd: HWND, discarded: &[DocumentId]) {
     let files = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         let root = app.recovery_root.as_deref()?;
         Some(
             app.tabs
                 .documents()
-                .flat_map(|document| crate::recovery::owned_snapshot_files(root, document))
+                .flat_map(|document| {
+                    crate::recovery::snapshots_removed_on_close(
+                        root,
+                        document,
+                        discarded.contains(&document.id),
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
     });
@@ -2767,6 +2794,88 @@ mod tests {
 
         assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
         assert!(!own.exists());
+    }
+
+    #[test]
+    fn undoing_a_recovered_tab_keeps_it_dirty_and_its_source_through_clean_close_cleanup() {
+        // Break caught: undo reaching Scintilla's empty save point marks the recovered tab clean,
+        // so closing skips the prompt and deletes the only copy of its text.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("undo");
+        let source = write_snapshot(
+            root.path(),
+            &Snapshot::new(
+                RecoveryId::from_u128(0x55),
+                None,
+                Encoding::Utf8,
+                "only copy",
+            ),
+        )
+        .unwrap();
+        app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+        super::recover_snapshots(window.hwnd);
+
+        while editor.can_undo().unwrap() {
+            editor.undo().unwrap();
+        }
+
+        assert_eq!(editor.text().unwrap(), "");
+        assert_eq!(
+            unsafe { SendMessageW(editor.hwnd(), SCI_GETMODIFY, 0, 0) },
+            0,
+            "test setup: Scintilla reached its save point"
+        );
+        let app = app_mut(window.hwnd);
+        let active = app.tabs.active().id;
+        assert!(app.tabs.active().dirty);
+        assert_eq!(
+            app.tabs.next_dirty_review(&[]).map(|review| review.id),
+            Some(active),
+            "window close must still prompt for the recovered tab"
+        );
+        super::remove_session_snapshots(window.hwnd, &[]);
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn discovery_skips_snapshots_whose_owner_process_is_still_running() {
+        // Break caught: a second instance opening, quarantining, or later deleting a live
+        // instance's snapshots.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("live-owner");
+        let process_start = 0x5EED_0000_0000_0000 | u64::from(std::process::id());
+        let live = RecoveryId::compose(process_start, 4_000_000_001, 1);
+        let torn = snapshot_path(
+            root.path(),
+            RecoveryId::compose(process_start, 4_000_000_001, 2),
+        );
+        let owner = crate::recovery::create_owner_mutex(live).unwrap();
+        let valid = write_snapshot(
+            root.path(),
+            &Snapshot::new(live, None, Encoding::Utf8, "live elsewhere"),
+        )
+        .unwrap();
+        std::fs::write(&torn, b"FPS1").unwrap();
+        app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+
+        super::recover_snapshots(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+        assert!(valid.exists() && torn.exists());
+
+        drop(owner);
+        super::recover_snapshots(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+        assert!(valid.exists());
+        assert!(
+            !torn.exists(),
+            "a dead owner's torn snapshot is quarantined"
+        );
     }
 
     fn app_mut<'a>(hwnd: HWND) -> &'a mut App {

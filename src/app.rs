@@ -56,6 +56,7 @@ pub struct App {
     prioritize_input: bool,
     menu_alt_pending: bool,
     pub(crate) recovery_root: Option<std::path::PathBuf>,
+    pub(crate) recovery_owner: Option<crate::platform::OwnedHandle>,
     pub(crate) last_snapshot_duration: Option<std::time::Duration>,
     next_document_id: u64,
     process_start: u64,
@@ -91,6 +92,7 @@ impl App {
             prioritize_input: false,
             menu_alt_pending: false,
             recovery_root: None,
+            recovery_owner: None,
             last_snapshot_duration: None,
             next_document_id: 2,
             process_start: startup.start_tick() as u64,
@@ -159,6 +161,10 @@ impl App {
     pub(crate) fn allocate_recovery_id(&self) -> RecoveryId {
         let counter = NEXT_RECOVERY_COUNTER.fetch_add(1, Ordering::Relaxed);
         RecoveryId::compose(self.process_start, std::process::id(), counter)
+    }
+
+    pub(crate) fn recovery_owner_id(&self) -> RecoveryId {
+        RecoveryId::compose(self.process_start, std::process::id(), 0)
     }
 
     pub(crate) fn owns_recovery_id(&self, id: RecoveryId) -> bool {

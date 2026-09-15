@@ -314,7 +314,8 @@ impl Tabs {
         let Some(document) = self.documents.get_mut(active) else {
             return false;
         };
-        if document.dirty == dirty {
+        // Undo can reach Scintilla's empty save point; a recovered tab stays dirty until saved.
+        if document.dirty == dirty || (!dirty && document.recovery_origin.is_some()) {
             return false;
         }
         document.dirty = dirty;
@@ -494,6 +495,23 @@ mod tests {
 
     fn document(id: u64) -> Document {
         Document::test_fixture(DocumentId(id), false)
+    }
+
+    #[test]
+    fn recovered_documents_stay_dirty_until_their_origin_is_cleared() {
+        // Break caught: undoing a recovered tab to Scintilla's save point marks it clean, so
+        // closing skips the prompt and deletes the only copy of its text.
+        let mut recovered = Document::test_fixture(DocumentId(1), true);
+        recovered.recovery_origin = Some(crate::document::RecoveryOrigin {
+            snapshot_path: std::path::PathBuf::from("a.fps"),
+            original_path: None,
+        });
+        let mut tabs = Tabs::with_document(recovered);
+
+        assert!(!tabs.set_active_dirty(false));
+        assert!(tabs.active().dirty);
+        assert!(tabs.take_active_recovery_origin().is_some());
+        assert!(tabs.set_active_dirty(false));
     }
 
     #[test]

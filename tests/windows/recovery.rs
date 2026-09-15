@@ -2,16 +2,18 @@
 mod support;
 
 use fastpad::document::RecoveryId;
-use fastpad::editor::scintilla_constants::SCI_SETSAVEPOINT;
+use fastpad::editor::scintilla_constants::{SCI_SETSAVEPOINT, SCI_UNDO};
 use fastpad::file::encoding::Encoding;
 use fastpad::recovery::{Snapshot, write_snapshot};
 use fastpad::window::commands::CommandId;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use support::process::{FastPadProcess, wait_and_dismiss_dialog};
+use support::process::{FastPadProcess, wait_and_dismiss_dialog, wait_for_process_exit};
 use support::win32::{find_child_by_class, scintilla_text, send_text};
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SendMessageW, WM_COMMAND};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    PostMessageW, SendMessageW, WM_CLOSE, WM_COMMAND,
+};
 
 const RECOVERED_TEXT: &str = "text from a crashed session";
 
@@ -24,7 +26,7 @@ fn valid_snapshots_reopen_after_launch_and_malformed_ones_are_quarantined_withou
     let malformed = data.recovery().join("ffffffffffffffffffffffffffffffff.fps");
     std::fs::write(&malformed, b"FPS1\x01torn").unwrap();
 
-    let (process, _hwnd, editor) = launch_until_recovered(&data);
+    let (process, hwnd, _editor) = launch_until_recovered(&data);
 
     wait_until("malformed snapshot quarantine", || {
         !malformed.exists() && quarantined(&malformed).exists()
@@ -36,8 +38,37 @@ fn valid_snapshots_reopen_after_launch_and_malformed_ones_are_quarantined_withou
     assert!(source.exists(), "an unsaved recovered tab keeps its source");
     assert!(!process.has_dialog().unwrap());
 
-    unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
+    discard_on_window_close(&process, hwnd);
     process.close().unwrap();
+}
+
+#[test]
+fn undoing_a_recovered_tab_to_empty_still_prompts_before_closing() {
+    // Break caught: undo reaching the empty save point lets the window close without a prompt,
+    // deleting the only copy of the recovered text.
+    let data = LocalAppData::new("undo");
+    let source = data.place_snapshot();
+    let (process, hwnd, editor) = launch_until_recovered(&data);
+
+    unsafe { SendMessageW(editor, SCI_UNDO, 0, 0) };
+    wait_until("undo to the empty save point", || {
+        scintilla_text(editor).is_ok_and(|text| text.is_empty())
+    });
+    assert!(source.exists());
+
+    discard_on_window_close(&process, hwnd);
+    process.close().unwrap();
+    assert!(!source.exists(), "an explicit Discard removes the source");
+}
+
+/// Posts WM_CLOSE and answers the dirty-document prompt with "No"; failing to find the prompt
+/// means the window was allowed to close without asking.
+fn discard_on_window_close(process: &FastPadProcess, hwnd: HWND) {
+    unsafe {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    }
+    wait_and_dismiss_dialog(process.id(), Duration::from_secs(3)).unwrap();
+    wait_for_process_exit(process.id(), Duration::from_secs(3)).unwrap();
 }
 
 #[test]
