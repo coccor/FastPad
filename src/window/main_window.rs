@@ -33,7 +33,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(not(test))]
-use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK};
+use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
 
@@ -770,6 +770,8 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         CommandId::LanguagePlainText => apply_language(hwnd, crate::document::Language::PlainText),
         CommandId::LanguageJson => apply_language(hwnd, crate::document::Language::Json),
         CommandId::LanguageMarkdown => apply_language(hwnd, crate::document::Language::Markdown),
+        CommandId::ValidateJson => validate_active_json(hwnd),
+        CommandId::FormatJson => format_active_json(hwnd),
         _ => {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.execute(command);
@@ -832,6 +834,128 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
         }
         None => {}
     }
+}
+
+/// Validates the active document's current text as JSON and reports the outcome. Read-only: never
+/// touches the editor's text, selection, or undo stack either way.
+fn validate_active_json(hwnd: HWND) {
+    let Some(editor) =
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+    else {
+        return;
+    };
+    let Ok(text) = editor.text() else {
+        return;
+    };
+    match crate::languages::validate_json(&text) {
+        Ok(()) => show_json_valid(hwnd),
+        Err(issue) => show_json_issue(hwnd, &json_issue_message(&issue)),
+    }
+}
+
+/// Formats the active document's full JSON text in place. Reads the current text and selection,
+/// formats completely in memory first, and only on success mutates the editor: one full-buffer
+/// `replace_target` bracketed by `begin_undo_action`/`end_undo_action` (Task 12's
+/// `Editor::replace_all` precedent), so a single Undo restores the exact original bytes. The
+/// selection is restored afterward, clamped to the (likely different) new length, since
+/// formatting changes the document's byte length and a previously-valid position can fall out of
+/// bounds. Invalid JSON never starts an undo action and leaves the document's bytes completely
+/// unchanged: the failure is detected before any editor mutation is attempted.
+fn format_active_json(hwnd: HWND) {
+    let Some(editor) =
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+    else {
+        return;
+    };
+    let Ok(text) = editor.text() else {
+        return;
+    };
+    let selection = editor.selection().unwrap_or(0..0);
+    match crate::languages::format_json(&text) {
+        Ok(formatted) => {
+            editor.begin_undo_action();
+            let result = editor.replace_target(0..text.len(), &formatted);
+            editor.end_undo_action();
+            if result.is_err() {
+                return;
+            }
+            let new_length = formatted.len();
+            let start = selection.start.min(new_length);
+            let end = selection.end.min(new_length);
+            let _ = editor.set_selection(start..end);
+        }
+        Err(issue) => show_json_issue(hwnd, &json_issue_message(&issue)),
+    }
+}
+
+fn json_issue_message(issue: &crate::languages::JsonIssue) -> String {
+    if issue.line == 0 && issue.column == 0 {
+        format!("FastPad could not process this JSON: {}", issue.message)
+    } else {
+        format!(
+            "This document is not valid JSON (line {}, column {}): {}",
+            issue.line, issue.column, issue.message
+        )
+    }
+}
+
+// A real MessageBoxW is a blocking, modal native dialog; see `show_save_error`'s longer comment
+// for why the test build records the message instead of showing it.
+#[cfg(not(test))]
+fn show_json_issue(hwnd: HWND, message: &str) {
+    let text = wide_null(message);
+    let caption = wide_null("FastPad");
+    unsafe {
+        MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), MB_ICONERROR | MB_OK);
+    }
+}
+
+#[cfg(test)]
+fn show_json_issue(_hwnd: HWND, message: &str) {
+    JSON_ISSUES.with(|issues| issues.borrow_mut().push(message.to_owned()));
+}
+
+#[cfg(test)]
+thread_local! {
+    static JSON_ISSUES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only accessor for the messages `show_json_issue` would otherwise have shown as a real
+/// MessageBoxW. Clears the recorded list.
+#[cfg(test)]
+pub(crate) fn take_json_issues() -> Vec<String> {
+    JSON_ISSUES.with(|issues| std::mem::take(&mut *issues.borrow_mut()))
+}
+
+#[cfg(not(test))]
+fn show_json_valid(hwnd: HWND) {
+    let text = wide_null("This document contains valid JSON.");
+    let caption = wide_null("FastPad");
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_ICONINFORMATION | MB_OK,
+        );
+    }
+}
+
+#[cfg(test)]
+fn show_json_valid(_hwnd: HWND) {
+    JSON_VALID_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    static JSON_VALID_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Test-only accessor for how many times `show_json_valid` would otherwise have shown a real
+/// MessageBoxW. Resets the count.
+#[cfg(test)]
+pub(crate) fn take_json_valid_count() -> usize {
+    JSON_VALID_COUNT.with(|count| count.replace(0))
 }
 
 /// Reads `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme` on
@@ -1679,7 +1803,7 @@ mod tests {
     use super::{
         MainWindowClass, WindowCreateContext, dark_mode_from_apps_use_light_theme, execute_command,
         handle_paint_with, mark_first_paint_complete, take_deferred_start_pending,
-        take_language_errors,
+        take_json_issues, take_json_valid_count, take_language_errors,
     };
     use crate::app::App;
     use crate::document::Language;
@@ -1755,6 +1879,116 @@ mod tests {
             .active()
             .language;
         assert_eq!(language_after, Language::PlainText);
+    }
+
+    #[test]
+    fn format_json_command_reformats_with_two_spaces_in_one_undo_step() {
+        // Break caught: Format JSON not actually rewriting the buffer, or splitting the rewrite
+        // into more than one undo action (which would force repeated Ctrl+Z to fully undo it).
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.populate_clean("{\"a\":[1,2]}").unwrap();
+
+        execute_command(window.hwnd, CommandId::FormatJson);
+
+        assert_eq!(
+            editor.text().unwrap(),
+            "{\n  \"a\": [\n    1,\n    2\n  ]\n}"
+        );
+        assert!(take_json_issues().is_empty());
+        assert!(editor.can_undo().unwrap());
+        editor.undo().unwrap();
+        assert_eq!(editor.text().unwrap(), "{\"a\":[1,2]}");
+        assert!(!editor.can_undo().unwrap());
+    }
+
+    #[test]
+    fn format_json_command_on_invalid_json_leaves_bytes_unchanged_and_reports_an_issue() {
+        // Break caught: Format JSON starting an undo action or mutating the buffer before
+        // discovering the source does not parse, and/or swallowing the failure instead of
+        // surfacing it.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.populate_clean("{ bad").unwrap();
+
+        execute_command(window.hwnd, CommandId::FormatJson);
+
+        assert_eq!(editor.text().unwrap(), "{ bad");
+        assert!(!editor.can_undo().unwrap());
+        let issues = take_json_issues();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("line 1"), "{}", issues[0]);
+    }
+
+    #[test]
+    fn format_json_command_clamps_the_restored_selection_to_the_new_shorter_length() {
+        // Break caught: restoring the pre-format selection verbatim after formatting shrank the
+        // document, leaving an out-of-range SCI_SETSEL instead of a clamped one.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let padding = " ".repeat(50);
+        let source = format!("{{{padding}\"a\":1}}");
+        editor.populate_clean(&source).unwrap();
+        editor.set_selection(55..58).unwrap();
+
+        execute_command(window.hwnd, CommandId::FormatJson);
+
+        let formatted_len = editor.text().unwrap().len();
+        assert!(formatted_len < 55, "expected formatting to shrink the text");
+        assert_eq!(editor.selection().unwrap(), formatted_len..formatted_len);
+    }
+
+    #[test]
+    fn validate_json_command_reports_success_and_never_mutates_the_document() {
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.populate_clean("{\"a\":1}").unwrap();
+
+        execute_command(window.hwnd, CommandId::ValidateJson);
+
+        assert_eq!(take_json_valid_count(), 1);
+        assert!(take_json_issues().is_empty());
+        assert_eq!(editor.text().unwrap(), "{\"a\":1}");
+        assert!(!editor.can_undo().unwrap());
+    }
+
+    #[test]
+    fn validate_json_command_reports_the_line_and_column_for_invalid_json() {
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.populate_clean("{\n  bad\n}").unwrap();
+
+        execute_command(window.hwnd, CommandId::ValidateJson);
+
+        assert_eq!(take_json_valid_count(), 0);
+        let issues = take_json_issues();
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].contains("line 2") && issues[0].contains("column 3"),
+            "{}",
+            issues[0]
+        );
+        assert_eq!(editor.text().unwrap(), "{\n  bad\n}");
+    }
+
+    /// Installs a real Scintilla editor onto `window` (mirroring
+    /// `failed_language_activation_leaves_document_language_unchanged_and_records_a_warning`'s own
+    /// setup) and returns it for direct `text`/`set_text`/`selection` calls in JSON command tests.
+    fn install_test_editor(window: &ProductionWindow) -> crate::editor::Editor {
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        unsafe {
+            super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create)
+        }
+        .unwrap();
+        unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .editor
+            .clone()
+            .unwrap()
     }
 
     #[test]
