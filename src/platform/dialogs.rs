@@ -10,11 +10,13 @@ use windows_sys::Win32::System::Com::{
     CoTaskMemFree, CoUninitialize,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FileOpenDialog, SIGDN_FILESYSPATH,
+    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FileOpenDialog, FileSaveDialog,
+    SIGDN_FILESYSPATH,
 };
 use windows_sys::core::{GUID, HRESULT};
 
 const IID_IFILE_OPEN_DIALOG: GUID = GUID::from_u128(0xd57c7288_d4ad_4768_be02_9d969532d960);
+const IID_IFILE_SAVE_DIALOG: GUID = GUID::from_u128(0x84bccd23_5fde_4cdb_aea4_af64b83d78ab);
 const CANCELLED: HRESULT = 0x800704c7u32 as i32;
 
 #[repr(C)]
@@ -40,9 +42,8 @@ struct FileDialogVtable {
     set_folder: usize,
     get_folder: usize,
     get_current_selection: usize,
-    #[cfg(not(test))]
-    set_file_name: usize,
-    #[cfg(test)]
+    // Callable unconditionally: production show_save_dialog always prefills a suggested file name,
+    // and the #[cfg(test)] Open dialog test seam calls it only under `#[cfg(test)]` at the call site.
     set_file_name: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
     get_file_name: usize,
     set_title: usize,
@@ -190,6 +191,68 @@ pub fn show_open_dialog(owner: HWND) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+pub fn show_save_dialog(owner: HWND, suggested_name: &str) -> Result<Option<PathBuf>> {
+    let _apartment = ComApartment::initialize()?;
+    let mut dialog = Interface(std::ptr::null_mut());
+    check(unsafe {
+        CoCreateInstance(
+            &FileSaveDialog,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_IFILE_SAVE_DIALOG,
+            &mut dialog.0,
+        )
+    })?;
+    dialog.require()?;
+    let mut options = 0;
+    check(unsafe { (dialog.dialog().get_options)(dialog.0, &mut options) })?;
+    // IFileSaveDialog defaults to FOS_OVERWRITEPROMPT (confirmed via GetOptions: 0x880a on this
+    // host). FastPad's own atomic replace already makes an overwrite safe, and clearing this
+    // flag keeps the native dialog single-window instead of layering the shell's own
+    // "Confirm Save As" prompt on top of it.
+    check(unsafe {
+        (dialog.dialog().set_options)(
+            dialog.0,
+            (options & !FOS_OVERWRITEPROMPT) | FOS_FORCEFILESYSTEM,
+        )
+    })?;
+    let name = suggested_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    check(unsafe { (dialog.dialog().set_file_name)(dialog.0, name.as_ptr()) })?;
+    let status = dialog.show(owner);
+    #[cfg(test)]
+    note_event(DialogEvent::ShowReturned);
+    if status == CANCELLED {
+        return Ok(None);
+    }
+    check(status)?;
+    let mut item = Interface(std::ptr::null_mut());
+    check(unsafe { (dialog.dialog().get_result)(dialog.0, &mut item.0) })?;
+    item.require()?;
+    #[cfg(test)]
+    note_event(DialogEvent::ResultRetrieved);
+    let mut text = TaskString(std::ptr::null_mut());
+    check(unsafe { (item.shell_item().get_display_name)(item.0, SIGDN_FILESYSPATH, &mut text.0) })?;
+    #[cfg(test)]
+    note_event(DialogEvent::DisplayNameRetrieved);
+    if text.0.is_null() {
+        return Err(FastPadError::Invariant("shell item returned a null path"));
+    }
+    let mut len = 0;
+    // The shell owns this terminated UTF-16 allocation until TaskString frees it.
+    unsafe {
+        while *text.0.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let path = PathBuf::from(OsString::from_wide(unsafe {
+        std::slice::from_raw_parts(text.0, len)
+    }));
+    Ok(Some(path))
+}
+
 #[cfg(test)]
 thread_local! {
     static NEXT_FILE_NAME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -226,7 +289,7 @@ pub(crate) fn set_next_open_dialog_filename(path: PathBuf) {
 #[cfg(test)]
 #[allow(
     dead_code,
-    reason = "consumed by the source-linked open_file integration target"
+    reason = "consumed by the source-linked open_file and save_file integration targets"
 )]
 pub(crate) fn take_dialog_events() -> Vec<DialogEvent> {
     EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))

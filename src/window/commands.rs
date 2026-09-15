@@ -58,6 +58,13 @@ pub(crate) fn choose_open_path(
     crate::platform::dialogs::show_open_dialog(owner)
 }
 
+pub(crate) fn choose_save_path(
+    owner: windows_sys::Win32::Foundation::HWND,
+    suggested_name: &str,
+) -> crate::Result<Option<std::path::PathBuf>> {
+    crate::platform::dialogs::show_save_dialog(owner, suggested_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::CommandId;

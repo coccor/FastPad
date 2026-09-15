@@ -339,6 +339,31 @@ impl Tabs {
     pub(crate) fn active_handle(&self) -> &crate::editor::EditorDocument {
         &self.active().handle
     }
+
+    /// Renames the active document's path, e.g. after a successful Save As write. Rejects the
+    /// rename if `path` canonicalizes to the same file another open tab already owns, preserving
+    /// Task 9's one-native-document-per-canonical-path invariant. A `path` that does not yet exist
+    /// on disk (the common brand-new Save As destination) cannot collide with any already-open
+    /// document, so it is accepted without a canonicalization check.
+    pub(crate) fn set_active_path(&mut self, path: PathBuf) -> Result<(), DuplicateDocumentPath> {
+        let active = self.active_index();
+        if let Ok(candidate) = canonical_key(&path) {
+            let collides = self.documents.iter().enumerate().any(|(index, existing)| {
+                index != active
+                    && existing
+                        .path
+                        .as_deref()
+                        .and_then(|existing_path| canonical_key(existing_path).ok())
+                        .is_some_and(|existing_candidate| existing_candidate == candidate)
+            });
+            if collides {
+                return Err(DuplicateDocumentPath(candidate));
+            }
+        }
+        self.documents[active].path = Some(path);
+        self.view.update(&self.documents);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,6 +447,11 @@ impl Drop for Tabs {
 mod tests {
     use super::Tabs;
     use crate::document::{Document, DocumentId};
+    use std::fs;
+
+    fn document(id: u64) -> Document {
+        Document::test_fixture(DocumentId(id), false)
+    }
 
     #[test]
     fn native_document_tab_is_selected() {
@@ -446,5 +476,78 @@ mod tests {
         assert_eq!(tabs.active_index(), 1);
         assert!(!selection.select(2, tabs.len()));
         assert_eq!(tabs.active_index(), 1);
+    }
+
+    #[test]
+    fn renaming_the_active_document_updates_its_path_and_the_tab_view() {
+        // Break caught: Save As writing the path field directly instead of going through a
+        // validated method can desync the tab view from the document model.
+        let root = std::env::temp_dir().join(format!(
+            "fastpad-task11-rename-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("saved-as.txt");
+        fs::write(&target, b"saved").unwrap();
+        let mut tabs = Tabs::with_document(document(1));
+        let view = tabs.view();
+        let before = view.snapshot().revision;
+
+        tabs.set_active_path(target.clone()).unwrap();
+
+        assert_eq!(tabs.active().path.as_deref(), Some(target.as_path()));
+        assert!(view.snapshot().revision > before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn renaming_to_a_path_that_does_not_yet_exist_succeeds() {
+        // Break caught: reusing canonical_key's existence requirement verbatim can reject every
+        // brand-new Save As destination, since a not-yet-written file cannot be canonicalized.
+        let root = std::env::temp_dir().join(format!(
+            "fastpad-task11-rename-new-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("not-written-yet.txt");
+        let mut tabs = Tabs::with_document(document(1));
+
+        assert!(tabs.set_active_path(target.clone()).is_ok());
+        assert_eq!(tabs.active().path.as_deref(), Some(target.as_path()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn renaming_the_active_document_onto_another_open_tabs_canonical_path_is_rejected() {
+        // Break caught: Save As can create two tabs that own the same canonical path, breaking
+        // Task 9's one-native-document-per-path invariant.
+        let root = std::env::temp_dir().join(format!(
+            "fastpad-task11-rename-collision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let other_path = root.join("other.txt");
+        fs::write(&other_path, b"other").unwrap();
+        let mut other = document(2);
+        other.path = Some(other_path.clone());
+        let mut tabs = Tabs::from_documents([document(1), other]).unwrap();
+        tabs.activate(DocumentId(1)).unwrap();
+
+        let alternate = root.join(".").join("other.txt");
+        assert!(tabs.set_active_path(alternate).is_err());
+        assert_eq!(tabs.active().path, None);
+        fs::remove_dir_all(root).unwrap();
     }
 }

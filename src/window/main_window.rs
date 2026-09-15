@@ -31,6 +31,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
+#[cfg(not(test))]
+use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK};
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
 
@@ -560,6 +562,8 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             let _ = create_new_document(hwnd);
         }
         CommandId::CloseTab => close_active_document(hwnd),
+        CommandId::Save => save_active_document(hwnd),
+        CommandId::SaveAs => save_active_document_as(hwnd),
         _ => {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.execute(command);
@@ -939,6 +943,158 @@ fn close_active_document(hwnd: HWND) {
     if identity.is_live_for(hwnd) {
         invalidate_title_strip(hwnd);
     }
+}
+
+fn save_active_document(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let has_path =
+        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active().path.is_some());
+    match has_path {
+        Some(true) => complete_save(hwnd, &identity, None),
+        Some(false) => save_active_document_as(hwnd),
+        None => {}
+    }
+}
+
+fn save_active_document_as(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let Some(suggested) = (unsafe { app_ptr(hwnd) }).map(|app| {
+        let app = unsafe { app.as_ref() };
+        app.tabs
+            .active()
+            .path
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled.txt".to_owned())
+    }) else {
+        return;
+    };
+    // Modal Show reenters the window procedure. Only an owned identity crosses it.
+    let selection = crate::window::commands::choose_save_path(hwnd, &suggested);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    let Ok(Some(path)) = selection else {
+        // Cancellation is not an error; a real error is silently dropped, matching Open's
+        // existing precedent above.
+        return;
+    };
+    complete_save(hwnd, &identity, Some(path));
+}
+
+/// Test-only entry point that drives Save As with an explicit path, bypassing the native dialog.
+/// The real dialog interaction is covered by `select_save_file`'s tests; this exists because the
+/// shell's own "Confirm Save As" collision handling for an existing target could not be driven
+/// reliably through synthetic window messages on this host, so the collision-rejection tail below
+/// (identical production code `save_active_document_as` reaches after a real dialog selection) is
+/// exercised directly instead, mirroring `open_path`'s existing non-dialog test entry point.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "consumed by the source-linked save_file integration target"
+)]
+pub(crate) fn save_path_as(hwnd: HWND, path: &std::path::Path) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    complete_save(hwnd, &identity, Some(path.to_path_buf()));
+}
+
+/// Shared tail of plain Save and Save As. `new_path` is `Some` only for Save As: the active
+/// document's path is renamed (and checked against other open tabs' canonical paths) before the
+/// write. Plain Save (`new_path: None`) writes to the document's existing path unchanged.
+fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::path::PathBuf>) {
+    let is_save_as = new_path.is_some();
+    if let Some(path) = new_path {
+        let outcome = unsafe { app_ptr(hwnd) }
+            .map(|mut app| unsafe { app.as_mut() }.tabs.set_active_path(path));
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(_)) => {
+                show_save_error(
+                    hwnd,
+                    "This file is already open in another tab. Choose a different name.",
+                );
+                return;
+            }
+            None => return,
+        }
+    }
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    let Some((editor, path, encoding)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.editor.clone()?;
+        let document = app.tabs.active();
+        Some((editor, document.path.clone()?, document.encoding))
+    }) else {
+        return;
+    };
+    let Ok(text) = editor.text() else {
+        return;
+    };
+    let bytes = crate::file::encoding::encode(&text, encoding);
+    let result = crate::file::saver::save_atomic(&path, &bytes);
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    match result {
+        Ok(()) => {
+            editor.set_save_point();
+            if is_save_as {
+                unsafe {
+                    PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
+                }
+                invalidate_title_strip(hwnd);
+            }
+        }
+        Err(_) => {
+            show_save_error(
+                hwnd,
+                "FastPad could not save this file. The previous version on disk was not modified.",
+            );
+        }
+    }
+}
+
+// A real MessageBoxW is a blocking, modal native dialog. Driving it deterministically from an
+// automated integration test proved unreliable on this host (see the long comment in
+// tests/windows/save_file.rs), so the test build records the message instead of showing it;
+// production behavior (the real MessageBoxW) is unchanged.
+#[cfg(not(test))]
+fn show_save_error(hwnd: HWND, message: &str) {
+    let text = wide_null(message);
+    let caption = wide_null("FastPad");
+    unsafe {
+        MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), MB_ICONERROR | MB_OK);
+    }
+}
+
+#[cfg(test)]
+fn show_save_error(_hwnd: HWND, message: &str) {
+    SAVE_ERRORS.with(|errors| errors.borrow_mut().push(message.to_owned()));
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAVE_ERRORS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only accessor for the messages `show_save_error` would otherwise have shown as a real
+/// MessageBoxW. Clears the recorded list.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "consumed by the source-linked save_file integration target"
+)]
+pub(crate) fn take_save_errors() -> Vec<String> {
+    SAVE_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()))
 }
 
 fn review_dirty_documents(hwnd: HWND) -> bool {
