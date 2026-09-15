@@ -857,10 +857,13 @@ fn validate_active_json(hwnd: HWND) {
 /// formats completely in memory first, and only on success mutates the editor: one full-buffer
 /// `replace_target` bracketed by `begin_undo_action`/`end_undo_action` (Task 12's
 /// `Editor::replace_all` precedent), so a single Undo restores the exact original bytes. The
-/// selection is restored afterward, clamped to the (likely different) new length, since
-/// formatting changes the document's byte length and a previously-valid position can fall out of
-/// bounds. Invalid JSON never starts an undo action and leaves the document's bytes completely
-/// unchanged: the failure is detected before any editor mutation is attempted.
+/// selection is restored afterward, clamped to the (likely different) new length and then snapped
+/// down to the nearest UTF-8 character boundary (`floor_char_boundary`): the pre-format byte
+/// offsets have no guaranteed relationship to character boundaries in the reformatted text (JSON
+/// string values keep their literal, possibly multi-byte, UTF-8 content), so clamping alone is not
+/// enough to avoid handing Scintilla a mid-character position. Invalid JSON never starts an undo
+/// action and leaves the document's bytes completely unchanged: the failure is detected before any
+/// editor mutation is attempted.
 fn format_active_json(hwnd: HWND) {
     let Some(editor) =
         (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
@@ -880,12 +883,26 @@ fn format_active_json(hwnd: HWND) {
                 return;
             }
             let new_length = formatted.len();
-            let start = selection.start.min(new_length);
-            let end = selection.end.min(new_length);
+            let start = floor_char_boundary(&formatted, selection.start.min(new_length));
+            let end = floor_char_boundary(&formatted, selection.end.min(new_length));
             let _ = editor.set_selection(start..end);
         }
         Err(issue) => show_json_issue(hwnd, &json_issue_message(&issue)),
     }
+}
+
+/// The largest UTF-8 character boundary in `text` at or before `position`. `position` may be
+/// `text.len()` (a valid boundary, the end of the string) but must not exceed it. Used to snap a
+/// byte offset carried over from a *different* string (the pre-format text) into a valid position
+/// in `text` (the post-format text): after formatting, an old offset has no guaranteed
+/// relationship to character boundaries in the reformatted bytes — `serde_json` passes multi-byte
+/// UTF-8 through unescaped, so it can coincidentally land mid-character. `0` is always a valid
+/// boundary, so this loop always terminates.
+fn floor_char_boundary(text: &str, mut position: usize) -> usize {
+    while !text.is_char_boundary(position) {
+        position -= 1;
+    }
+    position
 }
 
 fn json_issue_message(issue: &crate::languages::JsonIssue) -> String {
@@ -1939,6 +1956,49 @@ mod tests {
         let formatted_len = editor.text().unwrap().len();
         assert!(formatted_len < 55, "expected formatting to shrink the text");
         assert_eq!(editor.selection().unwrap(), formatted_len..formatted_len);
+    }
+
+    #[test]
+    fn format_json_command_snaps_the_restored_selection_to_a_utf8_char_boundary() {
+        // Break caught: reusing a pre-format byte offset verbatim (once only clamped to the new
+        // length) against the post-format text can land mid-character, since it has no guaranteed
+        // relationship to character boundaries in the reformatted bytes. Here the caret sits at an
+        // ordinary, valid boundary in the *compact* source (right after "héllo"'s closing quote);
+        // at that exact raw byte offset, the *pretty-printed* text — which keeps "é"'s literal
+        // two-byte UTF-8 encoding but reflows the surrounding whitespace — instead lands squarely
+        // between "é"'s two bytes.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let source = "{\"a\":\"h\u{e9}llo\",\"b\":1}";
+        let formatted = crate::languages::format_json(source).unwrap();
+
+        let boundary_in_source = source.find("\",\"b\"").unwrap(); // right before the closing '"'
+        assert!(source.is_char_boundary(boundary_in_source));
+
+        let e_char_start = formatted.find('\u{e9}').unwrap();
+        assert_eq!(
+            boundary_in_source,
+            e_char_start + 1,
+            "test setup: expected the reused raw byte offset to land inside é's encoding"
+        );
+        assert!(!formatted.is_char_boundary(boundary_in_source));
+
+        editor.populate_clean(source).unwrap();
+        editor
+            .set_selection(boundary_in_source..boundary_in_source)
+            .unwrap();
+
+        execute_command(window.hwnd, CommandId::FormatJson);
+
+        assert_eq!(editor.text().unwrap(), formatted);
+        let restored = editor.selection().unwrap();
+        assert!(
+            formatted.is_char_boundary(restored.start) && formatted.is_char_boundary(restored.end),
+            "restored selection {restored:?} is not on a UTF-8 character boundary"
+        );
+        // Snapped backward to the boundary immediately before "é", not forward past it.
+        assert_eq!(restored, e_char_start..e_char_start);
     }
 
     #[test]
