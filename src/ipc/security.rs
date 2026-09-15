@@ -1,11 +1,16 @@
 use crate::platform::{OwnedHandle, last_error};
 use crate::{FastPadError, Result};
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GENERIC_ALL, GetLastError};
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, GENERIC_ALL, GetLastError, HANDLE,
+};
 use windows_sys::Win32::Security::{
     ACL_REVISION, GetLengthSid, GetTokenInformation, IsValidSid, SE_DACL_PRESENT, SE_SELF_RELATIVE,
     SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 // winnt.h values; windows-sys exposes them only behind Win32_System_SystemServices.
 const SECURITY_DESCRIPTOR_REVISION: u8 = 1;
@@ -38,9 +43,48 @@ impl CurrentUserAcl {
     }
 }
 
+/// The user and session a pipe server must share with this process before a frame is written.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) user_sid: Vec<u8>,
+    pub(crate) session: u32,
+}
+
+impl ProcessIdentity {
+    pub(crate) fn current() -> Result<Self> {
+        Ok(Self {
+            user_sid: current_user_sid()?,
+            session: super::session_of(unsafe { GetCurrentProcessId() })?,
+        })
+    }
+
+    pub(crate) fn of_process(process_id: u32) -> Result<Self> {
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+        if raw.is_null() {
+            return Err(last_error());
+        }
+        let process = unsafe { OwnedHandle::from_raw_owned(raw) }?;
+        Ok(Self {
+            user_sid: process_user_sid(process.as_raw())?,
+            session: super::session_of(process_id)?,
+        })
+    }
+
+    /// A squatting server from another user or session must never receive a path.
+    pub(crate) fn trusts_server(&self, server: &Self) -> bool {
+        !self.user_sid.is_empty()
+            && self.user_sid == server.user_sid
+            && self.session == server.session
+    }
+}
+
 fn current_user_sid() -> Result<Vec<u8>> {
+    process_user_sid(unsafe { GetCurrentProcess() })
+}
+
+fn process_user_sid(process: HANDLE) -> Result<Vec<u8>> {
     let mut raw = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) } == 0 {
         return Err(last_error());
     }
     let token = unsafe { OwnedHandle::from_raw_owned(raw) }?;
@@ -106,8 +150,36 @@ fn self_relative_descriptor(sid: &[u8], access_mask: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CurrentUserAcl, current_user_sid, self_relative_descriptor};
+    use super::{CurrentUserAcl, ProcessIdentity, current_user_sid, self_relative_descriptor};
     use windows_sys::Win32::Security::IsValidSecurityDescriptor;
+
+    fn identity(sid: &[u8], session: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            user_sid: sid.to_vec(),
+            session,
+        }
+    }
+
+    #[test]
+    fn server_is_trusted_only_with_the_same_user_and_session() {
+        // Break caught: a squatter owned by another user, or the same user's other session,
+        // receiving absolute paths from this session's launches.
+        let me = identity(&LOCAL_SYSTEM_SID, 2);
+        assert!(me.trusts_server(&identity(&LOCAL_SYSTEM_SID, 2)));
+        let mut other_user = LOCAL_SYSTEM_SID;
+        other_user[8] = 19;
+        assert!(!me.trusts_server(&identity(&other_user, 2)));
+        assert!(!me.trusts_server(&identity(&LOCAL_SYSTEM_SID, 3)));
+        assert!(!identity(&[], 2).trusts_server(&identity(&[], 2)));
+    }
+
+    #[test]
+    fn this_process_is_its_own_trusted_server_and_unknown_processes_fail_closed() {
+        let me = ProcessIdentity::current().unwrap();
+        let server = ProcessIdentity::of_process(std::process::id()).unwrap();
+        assert!(me.trusts_server(&server));
+        assert!(ProcessIdentity::of_process(0).is_err());
+    }
 
     const LOCAL_SYSTEM_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
 

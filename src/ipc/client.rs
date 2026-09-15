@@ -2,6 +2,7 @@
 
 use super::InstanceNames;
 use super::protocol::{IpcRequest, encode_frame};
+use super::security::ProcessIdentity;
 use crate::launch::LaunchRequest;
 use crate::platform::{OwnedHandle, last_error};
 use crate::{FastPadError, Result};
@@ -64,14 +65,22 @@ pub fn ipc_request_for(request: &LaunchRequest) -> Result<IpcRequest> {
     }
 }
 
-/// Connects within `budget`, lets the server take the foreground, and writes the whole frame.
+/// Connects within `budget`, verifies the server shares this user and session, lets it take the
+/// foreground, and writes the whole frame. Nothing is written to an unverified server.
 pub fn send_frame(names: &InstanceNames, frame: &[u8], budget: Duration) -> Result<()> {
     let pipe = connect(&names.pipe, Instant::now() + budget)?;
     let mut server_process = 0;
-    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw(), &mut server_process) } != 0 {
-        unsafe {
-            AllowSetForegroundWindow(server_process);
-        }
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw(), &mut server_process) } == 0 {
+        return Err(last_error());
+    }
+    let server = ProcessIdentity::of_process(server_process)?;
+    if !ProcessIdentity::current()?.trusts_server(&server) {
+        return Err(FastPadError::Ipc(
+            "pipe server belongs to another user or session",
+        ));
+    }
+    unsafe {
+        AllowSetForegroundWindow(server_process);
     }
     let mut remaining = frame;
     while !remaining.is_empty() {

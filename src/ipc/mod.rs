@@ -20,11 +20,9 @@ pub struct InstanceNames {
 
 impl InstanceNames {
     pub fn for_current_session() -> Result<Self> {
-        let mut session = 0;
-        if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } == 0 {
-            return Err(last_error());
-        }
-        Ok(Self::for_session(session))
+        Ok(Self::for_session(session_of(unsafe {
+            GetCurrentProcessId()
+        })?))
     }
 
     pub fn for_session(session: u32) -> Self {
@@ -33,6 +31,14 @@ impl InstanceNames {
             pipe: wide_null(&format!(r"\\.\pipe\FastPad-{session}")),
         }
     }
+}
+
+fn session_of(process_id: u32) -> Result<u32> {
+    let mut session = 0;
+    if unsafe { ProcessIdToSessionId(process_id, &mut session) } == 0 {
+        return Err(last_error());
+    }
+    Ok(session)
 }
 
 /// Binds the listening pipe for this session; used only by deferred window work.

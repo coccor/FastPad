@@ -49,6 +49,13 @@ pub struct IpcServer {
 
 impl IpcServer {
     pub fn bind(names: &InstanceNames, security: &CurrentUserAcl) -> Result<Self> {
+        let mut server = Self::create(names, security)?;
+        server.begin_connect()?;
+        Ok(server)
+    }
+
+    /// Creates the listening instance without calling `ConnectNamedPipe` yet.
+    fn create(names: &InstanceNames, security: &CurrentUserAcl) -> Result<Self> {
         let event = unsafe {
             OwnedHandle::from_raw_owned(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()))
         }?;
@@ -70,7 +77,7 @@ impl IpcServer {
             .into_boxed_slice()
             .try_into()
             .map_err(|_| FastPadError::Invariant("pipe buffer has the wrong length"))?;
-        let mut server = Self {
+        Ok(Self {
             pipe,
             event,
             read: Box::pin(OVERLAPPED::default()),
@@ -79,9 +86,7 @@ impl IpcServer {
             operation: Operation::Connect,
             in_flight: false,
             immediate: None,
-        };
-        server.begin_connect()?;
-        Ok(server)
+        })
     }
 
     /// Manual-reset event signaled whenever `poll` has work; owned by `self`.
@@ -116,13 +121,17 @@ impl IpcServer {
                 (Completion::Failed(_), _) => self.reconnect()?,
             }
         }
-        // Kernel completions signal the event themselves; only a synthesized one needs a nudge.
-        if self.immediate.is_some() {
-            unsafe {
-                SetEvent(self.event.as_raw());
-            }
-        }
         Ok(requests)
+    }
+
+    /// Kernel completions signal the event themselves; a synthesized one must do it here, or the
+    /// message loop never polls it.
+    fn synthesize(&mut self, completion: Completion) -> Result<()> {
+        self.immediate = Some(completion);
+        if unsafe { SetEvent(self.event.as_raw()) } == 0 {
+            return Err(last_error());
+        }
+        Ok(())
     }
 
     fn take_completion(&mut self) -> Completion {
@@ -168,7 +177,7 @@ impl IpcServer {
         match unsafe { GetLastError() } {
             ERROR_IO_PENDING => self.in_flight = true,
             // The client connected (and possibly already closed) before this call.
-            ERROR_PIPE_CONNECTED | ERROR_NO_DATA => self.immediate = Some(Completion::Done(0)),
+            ERROR_PIPE_CONNECTED | ERROR_NO_DATA => self.synthesize(Completion::Done(0))?,
             error => return Err(FastPadError::Win32(error)),
         }
         Ok(())
@@ -192,7 +201,7 @@ impl IpcServer {
         }
         match unsafe { GetLastError() } {
             ERROR_IO_PENDING => self.in_flight = true,
-            error => self.immediate = Some(Completion::Failed(error)),
+            error => self.synthesize(Completion::Failed(error))?,
         }
         Ok(())
     }
@@ -339,6 +348,37 @@ pub(crate) mod tests {
         assert_eq!(
             exchange(&mut server, &names, encode_frame(&IpcRequest::New).unwrap()),
             vec![IpcRequest::New]
+        );
+    }
+
+    #[test]
+    fn client_that_connects_before_connect_named_pipe_is_signaled_and_serviced() {
+        // Break caught: ERROR_PIPE_CONNECTED synthesizes a completion without signaling the
+        // event, so the message loop never polls, the request is lost, and the only instance
+        // stays connected for good.
+        let names = unique_names();
+        let mut server = IpcServer::create(&names, &CurrentUserAcl::current().unwrap()).unwrap();
+        send_frame(
+            &names,
+            &encode_frame(&IpcRequest::New).unwrap(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        server.begin_connect().unwrap();
+
+        assert_eq!(
+            unsafe { WaitForSingleObject(server.event(), 0) },
+            WAIT_OBJECT_0
+        );
+        assert_eq!(server.poll().unwrap(), vec![IpcRequest::New]);
+        assert_eq!(
+            exchange(
+                &mut server,
+                &names,
+                encode_frame(&IpcRequest::Activate).unwrap()
+            ),
+            vec![IpcRequest::Activate]
         );
     }
 
