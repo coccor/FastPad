@@ -1,6 +1,7 @@
 use crate::app::{App, WindowIdentity};
 use crate::editor::Editor;
 use crate::error::StartupStage;
+use crate::ipc::client::InstanceClaim;
 use crate::launch::LaunchOptions;
 use crate::perf::{StartupMetrics, protocol::DiagnosticSession};
 use crate::platform::{OwnedModule, last_error, wide_null};
@@ -13,24 +14,33 @@ use crate::{FastPadError, Result};
 #[cfg(test)]
 use std::cell::RefCell;
 use std::path::PathBuf;
-use windows_sys::Win32::Foundation::{HMODULE, HWND};
+use windows_sys::Win32::Foundation::{HMODULE, HWND, WAIT_FAILED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleHandleW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
     LoadLibraryExW,
 };
+use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-#[cfg(test)]
-use windows_sys::Win32::UI::WindowsAndMessaging::WM_QUIT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, SW_SHOW, ShowWindow,
-    TranslateMessage, WM_PAINT,
+    DispatchMessageW, GetMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
+    PM_REMOVE, PeekMessageW, QS_ALLINPUT, SW_SHOW, ShowWindow, TranslateMessage, WM_PAINT, WM_QUIT,
 };
 
 pub fn run(options: LaunchOptions) -> Result<i32> {
     let mut startup = StartupMetrics::begin()?;
+    // Before DPI and Scintilla so a forwarding secondary loads nothing it will not use.
+    let instance_mutex = if options.new_window {
+        None
+    } else {
+        match crate::ipc::client::claim_or_forward(&options.request) {
+            InstanceClaim::Primary(mutex) => Some(mutex),
+            InstanceClaim::Forwarded => return Ok(0),
+            InstanceClaim::Independent => None,
+        }
+    };
     let diagnostic = DiagnosticSession::attach(options.diagnostic)?;
     if let Some(diagnostic) = &diagnostic {
         startup.enable_diagnostic(std::rc::Rc::clone(diagnostic));
@@ -42,7 +52,8 @@ pub fn run(options: LaunchOptions) -> Result<i32> {
     let window_class = MainWindowClass::register(instance)
         .map_err(|error| FastPadError::startup(StartupStage::WindowClassRegistration, error))?;
 
-    let app = App::new(options, startup);
+    let mut app = App::new(options, startup);
+    app.instance_mutex = instance_mutex;
     let identity = app.window_identity();
     let mut create_context = WindowCreateContext::new(Box::new(app));
     let hwnd = window_class.create(&mut create_context)?;
@@ -137,16 +148,37 @@ fn message_loop(hwnd: HWND, identity: &WindowIdentity) -> Result<i32> {
     let mut message = MSG::default();
     loop {
         drain_prioritized_input(hwnd, identity)?;
-        let status = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };
-        if status == -1 {
-            return Err(last_error());
+        if !next_message(hwnd, identity, &mut message)? {
+            continue;
         }
-        if status == 0 {
+        if message.message == WM_QUIT {
             return Ok(message.wParam as i32);
         }
 
         dispatch_message(hwnd, identity, &message);
     }
+}
+
+/// Fills `message` and returns true, or returns false after a wake that only serviced the pipe.
+fn next_message(hwnd: HWND, identity: &WindowIdentity, message: &mut MSG) -> Result<bool> {
+    // The event handle is copied fresh for each wait and nothing is dispatched while it is used.
+    let Some(event) = crate::window::ipc_wait_handle(hwnd, identity) else {
+        if unsafe { GetMessageW(message, std::ptr::null_mut(), 0, 0) } == -1 {
+            return Err(last_error());
+        }
+        return Ok(true);
+    };
+    let wait = unsafe {
+        MsgWaitForMultipleObjectsEx(1, &event, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+    };
+    if wait == WAIT_FAILED {
+        return Err(last_error());
+    }
+    if wait == WAIT_OBJECT_0 {
+        crate::window::service_ipc(hwnd, identity);
+        return Ok(false);
+    }
+    Ok(unsafe { PeekMessageW(message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0)
 }
 
 fn finish_message_loop<F>(

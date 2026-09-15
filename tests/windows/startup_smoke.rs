@@ -18,7 +18,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
 fn launch_creates_a_focused_editable_scintilla() {
     // Break caught: bootstrap returns without creating a main window, so startup never exposes
     // a focused Scintilla editor that can accept real input.
-    let mut process = FastPadProcess::spawn(["--diagnostic"]).unwrap();
+    let mut process = FastPadProcess::spawn(["--new-window", "--diagnostic"]).unwrap();
     let hwnd = process
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();
@@ -45,8 +45,11 @@ fn corrupt_settings_keep_input_live_apply_valid_keys_and_never_block() {
     )
     .unwrap();
 
-    let mut process =
-        FastPadProcess::spawn_with_local_app_data(["--diagnostic"], &local_app_data).unwrap();
+    let mut process = FastPadProcess::spawn_with_local_app_data(
+        ["--new-window", "--diagnostic"],
+        &local_app_data,
+    )
+    .unwrap();
     let hwnd = process
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();
@@ -75,7 +78,7 @@ fn dropping_fastpad_process_reaps_the_running_child() {
     // Break caught: a failed smoke assertion can orphan the spawned GUI process unless Drop
     // performs bounded cleanup.
     let process_id = {
-        let mut process = FastPadProcess::spawn(["--diagnostic"]).unwrap();
+        let mut process = FastPadProcess::spawn(["--new-window", "--diagnostic"]).unwrap();
         process
             .wait_for_main_window(Duration::from_secs(2))
             .unwrap();

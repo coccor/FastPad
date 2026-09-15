@@ -8,6 +8,8 @@ pub const WM_FASTPAD_APPLY_LANGUAGE: u32 = WM_APP + 3;
 pub const WM_FASTPAD_RECOVERY: u32 = WM_APP + 4;
 pub const WM_FASTPAD_START_IPC: u32 = WM_APP + 5;
 pub const WM_FASTPAD_BUILD_CHROME: u32 = WM_APP + 6;
+// Not part of the deferred chain: it only drains requests already queued on App.
+pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

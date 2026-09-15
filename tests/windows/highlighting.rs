@@ -30,7 +30,7 @@ fn empty_launch_never_loads_lexilla() {
     // Break caught: loading Lexilla eagerly during startup instead of deferring it to first
     // JSON/Markdown activation defeats Task 13's whole purpose for the common plain-text case.
     ensure_lexilla_present_next_to_fastpad_exe();
-    let mut process = FastPadProcess::spawn(Vec::<&str>::new()).unwrap();
+    let mut process = FastPadProcess::spawn(["--new-window"]).unwrap();
     process
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();
@@ -49,7 +49,11 @@ fn empty_launch_never_loads_lexilla() {
 fn opening_a_json_file_loads_lexilla_and_the_editor_stays_editable() {
     ensure_lexilla_present_next_to_fastpad_exe();
     let fixture = JsonFixture::new();
-    let mut process = FastPadProcess::spawn([fixture.path.as_os_str()]).unwrap();
+    let mut process = FastPadProcess::spawn([
+        std::ffi::OsStr::new("--new-window"),
+        fixture.path.as_os_str(),
+    ])
+    .unwrap();
     let hwnd = process
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();
@@ -94,7 +98,11 @@ fn opening_a_json_file_loads_lexilla_and_the_editor_stays_editable() {
 fn missing_lexilla_leaves_the_document_editable_as_plain_text() {
     ensure_lexilla_absent_next_to_fastpad_exe();
     let fixture = JsonFixture::new();
-    let mut process = FastPadProcess::spawn([fixture.path.as_os_str()]).unwrap();
+    let mut process = FastPadProcess::spawn([
+        std::ffi::OsStr::new("--new-window"),
+        fixture.path.as_os_str(),
+    ])
+    .unwrap();
     let hwnd = process
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();

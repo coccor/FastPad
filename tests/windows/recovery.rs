@@ -101,7 +101,7 @@ fn no_snapshot_exists_at_launch_and_idle_edits_are_snapshotted_until_clean_exit(
     )
     .unwrap();
     let mut process =
-        FastPadProcess::spawn_with_local_app_data([] as [&str; 0], data.root()).unwrap();
+        FastPadProcess::spawn_with_local_app_data(["--new-window"], data.root()).unwrap();
     let hwnd = process
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();
@@ -135,7 +135,7 @@ fn no_snapshot_exists_at_launch_and_idle_edits_are_snapshotted_until_clean_exit(
 
 fn launch_until_recovered(data: &LocalAppData) -> (FastPadProcess, HWND, HWND) {
     let mut process =
-        FastPadProcess::spawn_with_local_app_data([] as [&str; 0], data.root()).unwrap();
+        FastPadProcess::spawn_with_local_app_data(["--new-window"], data.root()).unwrap();
     let hwnd = process
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();

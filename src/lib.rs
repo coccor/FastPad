@@ -5,6 +5,7 @@ pub mod document;
 pub mod editor;
 pub mod error;
 pub mod file;
+pub mod ipc;
 pub mod languages;
 pub mod launch;
 pub mod perf;

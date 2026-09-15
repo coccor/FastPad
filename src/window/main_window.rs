@@ -291,6 +291,9 @@ unsafe extern "system" fn main_window_proc(
             result
         }
         _ => {
+            if message == crate::window::WM_FASTPAD_IPC_REQUEST {
+                return handle_ipc_requests(hwnd);
+            }
             if message == crate::window::WM_FASTPAD_OPEN_REQUEST && !input_pending() {
                 return handle_open_request(hwnd);
             }
@@ -362,6 +365,10 @@ fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
     // Only `WM_FASTPAD_RECOVERY` processed with no input pending produces this action.
     if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_START_IPC) {
         recover_snapshots(hwnd);
+    }
+    // Only `WM_FASTPAD_START_IPC` processed with no input pending produces this action.
+    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_BUILD_CHROME) {
+        start_ipc_server_with(hwnd, crate::ipc::bind_session_server);
     }
     match action {
         DeferredAction::RepostSelf(message) => {
@@ -2048,6 +2055,141 @@ fn recover_snapshots(hwnd: HWND) {
     }
 }
 
+const IPC_UNAVAILABLE_NOTICE: &str =
+    "FastPad could not start its single-instance listener; later launches open separate windows.";
+
+/// Binds the pipe server only for the process that owns the session instance mutex.
+fn start_ipc_server_with(hwnd: HWND, bind: impl FnOnce() -> Result<crate::ipc::IpcServer>) {
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
+    // Binding makes no window calls, so this App borrow cannot be re-entered.
+    let app = unsafe { app.as_mut() };
+    if app.instance_mutex.is_none() || app.ipc.is_some() {
+        return;
+    }
+    match bind() {
+        Ok(server) => app.ipc = Some(server),
+        Err(_) => stop_ipc(app),
+    }
+}
+
+fn stop_ipc(app: &mut App) {
+    app.ipc = None;
+    // Releasing the mutex sends later launches to independent processes instead of a dead pipe.
+    app.instance_mutex = None;
+    app.notifications.push(IPC_UNAVAILABLE_NOTICE);
+}
+
+/// Copies the pipe event out of App for one wait; callers must not dispatch while using it.
+pub(crate) fn ipc_wait_handle(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    if !identity.is_live_for(hwnd) {
+        return None;
+    }
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }
+        .ipc
+        .as_ref()
+        .map(crate::ipc::IpcServer::event)
+}
+
+/// Services a signaled pipe event: queues decoded requests and posts one drain message.
+pub(crate) fn service_ipc(hwnd: HWND, identity: &WindowIdentity) {
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
+    let queued = {
+        let app = unsafe { app.as_mut() };
+        let Some(server) = app.ipc.as_mut() else {
+            return;
+        };
+        match server.poll() {
+            Ok(requests) => {
+                let queued = !requests.is_empty();
+                app.ipc_requests.extend(requests);
+                Some(queued)
+            }
+            Err(_) => {
+                stop_ipc(app);
+                None
+            }
+        }
+    };
+    match queued {
+        Some(true) => unsafe {
+            PostMessageW(hwnd, crate::window::WM_FASTPAD_IPC_REQUEST, 0, 0);
+        },
+        Some(false) => {}
+        None => refresh_notifications(hwnd),
+    }
+}
+
+fn handle_ipc_requests(hwnd: HWND) -> LRESULT {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return 0;
+    };
+    let requests = unsafe { app_ptr(hwnd) }
+        .map(|mut app| std::mem::take(&mut unsafe { app.as_mut() }.ipc_requests))
+        .unwrap_or_default();
+    for request in requests {
+        if !identity.is_live_for(hwnd) {
+            return 0;
+        }
+        match request {
+            crate::ipc::IpcRequest::Open(path) => {
+                if let Err(error) = App::open_path(hwnd, &path) {
+                    push_notice(
+                        hwnd,
+                        format!("FastPad could not open {}: {error}", path.display()),
+                    );
+                }
+            }
+            crate::ipc::IpcRequest::New => execute_command(hwnd, CommandId::New),
+            crate::ipc::IpcRequest::Activate => {}
+        }
+        if identity.is_live_for(hwnd) {
+            bring_to_foreground(hwnd);
+        }
+    }
+    0
+}
+
+fn bring_to_foreground(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
+    }
+}
+
+fn push_notice(hwnd: HWND, message: String) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.notifications.push(message);
+    }
+    refresh_notifications(hwnd);
+}
+
+fn refresh_notifications(hwnd: HWND) {
+    let chrome_built =
+        unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.status.is_some());
+    if chrome_built {
+        layout_editor_and_find_bar(hwnd);
+    }
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+}
+
 fn open_recovered_snapshot(
     hwnd: HWND,
     identity: &WindowIdentity,
@@ -3067,6 +3209,137 @@ mod tests {
         let replacement = replacement.borrow();
         let replacement = replacement.as_ref().unwrap();
         assert!(!unsafe { take_deferred_start_pending(replacement.hwnd) });
+    }
+
+    fn unnamed_mutex() -> crate::platform::OwnedHandle {
+        let raw = unsafe {
+            windows_sys::Win32::System::Threading::CreateMutexW(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        unsafe { crate::platform::OwnedHandle::from_raw_owned(raw) }.unwrap()
+    }
+
+    #[test]
+    fn ipc_bind_failure_releases_the_instance_mutex_and_notifies_exactly_once() {
+        // Break caught: keeping the mutex after a failed bind makes every later launch wait on a
+        // pipe that will never exist; retrying or re-notifying spams the status line.
+        let window = ProductionWindow::new(make_app());
+        unsafe { super::app_ptr(window.hwnd).unwrap().as_mut() }.instance_mutex =
+            Some(unnamed_mutex());
+
+        super::start_ipc_server_with(window.hwnd, || {
+            Err(crate::FastPadError::Ipc("simulated bind failure"))
+        });
+        super::start_ipc_server_with(window.hwnd, || unreachable!("no mutex means no server"));
+
+        let app = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() };
+        assert!(app.ipc.is_none());
+        assert!(app.instance_mutex.is_none());
+        assert_eq!(app.notifications.len(), 1);
+    }
+
+    #[test]
+    fn process_without_instance_mutex_never_binds_a_server() {
+        // Break caught: a --new-window or fallback process squats the primary's pipe name.
+        let window = ProductionWindow::new(make_app());
+        super::start_ipc_server_with(window.hwnd, || unreachable!("no mutex means no server"));
+        let app = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() };
+        assert!(app.ipc.is_none());
+        assert_eq!(app.notifications.len(), 0);
+    }
+
+    fn deliver_frame(window: &ProductionWindow, names: &crate::ipc::InstanceNames, frame: Vec<u8>) {
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+        };
+        let pipe = names.clone();
+        let client = std::thread::spawn(move || {
+            crate::ipc::client::send_frame(&pipe, &frame, Duration::from_secs(2))
+        });
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut quiet_since = None;
+        while Instant::now() < deadline {
+            let event = super::ipc_wait_handle(window.hwnd, &identity).unwrap();
+            if unsafe { WaitForSingleObject(event, 20) } == WAIT_OBJECT_0 {
+                super::service_ipc(window.hwnd, &identity);
+                quiet_since = None;
+            } else if client.is_finished() {
+                let since = *quiet_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_millis(150) {
+                    break;
+                }
+            }
+            let mut message = MSG::default();
+            while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0
+            {
+                unsafe {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+        }
+        client.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn ipc_requests_reach_the_window_as_tabs_and_malformed_frames_change_nothing() {
+        // Break caught: decoded requests never leave the pipe, duplicate opens add tabs, Activate
+        // mutates tabs, or a malformed frame reaches application state.
+        use crate::ipc::{IpcRequest, encode_frame};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        unsafe {
+            SendMessageW(
+                editor.hwnd(),
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR,
+                b'x' as usize,
+                0,
+            );
+        }
+        unsafe { super::app_ptr(window.hwnd).unwrap().as_mut() }.instance_mutex =
+            Some(unnamed_mutex());
+        let names = crate::ipc::server::tests::unique_names();
+        super::start_ipc_server_with(window.hwnd, || {
+            crate::ipc::IpcServer::bind(&names, &crate::ipc::CurrentUserAcl::current()?)
+        });
+        let scratch = RecoveryScratch::new("ipc-open");
+        let file = scratch.path().join("forwarded.txt");
+        std::fs::write(&file, b"forwarded text").unwrap();
+        let tabs = || {
+            unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+                .tabs
+                .len()
+        };
+
+        let open = encode_frame(&IpcRequest::Open(file.clone())).unwrap();
+        deliver_frame(&window, &names, open.clone());
+        assert_eq!(tabs(), 2);
+        assert_eq!(editor.text().unwrap(), "forwarded text");
+        deliver_frame(&window, &names, open);
+        assert_eq!(tabs(), 2);
+        deliver_frame(
+            &window,
+            &names,
+            encode_frame(&IpcRequest::Activate).unwrap(),
+        );
+        assert_eq!(tabs(), 2);
+        deliver_frame(&window, &names, b"FPI1\x09\0\0\0\0".to_vec());
+        assert_eq!(tabs(), 2);
+        deliver_frame(&window, &names, encode_frame(&IpcRequest::New).unwrap());
+        assert_eq!(tabs(), 3);
+        assert!(
+            unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+                .ipc_requests
+                .is_empty()
+        );
     }
 
     fn make_app() -> Box<App> {
