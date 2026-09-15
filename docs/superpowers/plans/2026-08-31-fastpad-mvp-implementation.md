@@ -1631,6 +1631,65 @@ git commit -m "feat: polish title shell and theme"
 
 ---
 
+### Task 20: Ignore unbound control-character keystrokes
+
+Added 2026-09-16 at the owner's request: key combinations with no command must do nothing instead of inserting control characters. Root cause: an unbound Ctrl combination leaves Scintilla's `WM_KEYDOWN` unconsumed, `TranslateMessage` emits a C0 control-character `WM_CHAR` (Ctrl+A = 0x01 … Ctrl+Z = 0x1A, Ctrl+[ = 0x1B, Ctrl+2 = 0x00, Ctrl+Enter = 0x0A), and `ScintillaWin` inserts it because `IsVisualCharacter(c) || !lastKeyDownConsumed` (ScintillaWin.cxx:1983-1986), rendering blocks such as `SOH`/`DC1`. Owner-approved rule: ignore C0 (0x00-0x1F) and DEL (0x7F) keystroke characters, except Tab, CR, and LF when Ctrl is not held.
+
+**Files:**
+- Create: `src/editor/input_filter.rs`
+- Modify: `src/editor/mod.rs`
+- Modify: `src/editor/scintilla.rs`
+- Test: `src/editor/input_filter.rs`
+- Test: `tests/windows/editing.rs`
+
+**Interfaces:**
+- Consumes: the always-installed editor endpoint subclass (`editor_endpoint_subclass_proc`), Win32 key state
+- Produces: `pub fn should_ignore_char(code: u16, ctrl_down: bool) -> bool`
+
+- [ ] **Step 1: Write failing filter tests**
+
+```rust
+#[test]
+fn unbound_control_characters_are_ignored_but_plain_whitespace_is_not() {
+    assert!(should_ignore_char(0x11, true));   // Ctrl+Q -> DC1
+    assert!(should_ignore_char(0x01, true));   // Ctrl+A -> SOH
+    assert!(should_ignore_char(0x00, true));   // Ctrl+2 -> NUL
+    assert!(should_ignore_char(0x1B, true));   // Ctrl+[ -> ESC
+    assert!(should_ignore_char(0x7F, false));  // DEL
+    assert!(should_ignore_char(0x0A, true));   // Ctrl+Enter -> LF
+    assert!(should_ignore_char(0x09, true));   // Ctrl+I -> TAB
+    assert!(!should_ignore_char(0x09, false));
+    assert!(!should_ignore_char(0x0D, false));
+    assert!(!should_ignore_char(0x0A, false));
+    assert!(!should_ignore_char(u16::from(b'q'), true));
+    assert!(!should_ignore_char(0x00E9, true)); // AltGr/Ctrl+Alt printable output stays
+}
+```
+
+Integration (`tests/windows/editing.rs`): with a real editor, typing text containing `0x11`, `0x01`, and `0x7F` through `WM_CHAR` while Ctrl is held (via `SendInput` key state, matching the file's existing `send_key` helper) leaves the document unchanged, while plain `a\tb\r` still inserts `a`, a tab, `b`, and a line end.
+
+- [ ] **Step 2: Run the red tests**
+
+Run: `cargo test --lib -- editor::input_filter --test-threads=1`
+Expected: FAIL because the filter is absent.
+
+- [ ] **Step 3: Filter in the editor subclass**
+
+In `editor_endpoint_subclass_proc`, return 0 without calling `DefSubclassProc` for `WM_CHAR` when `should_ignore_char(wparam as u16, ctrl_down)` is true, with `ctrl_down` from `GetKeyState(VK_CONTROL) < 0`. All other messages (including `WM_NCDESTROY` handling) are unchanged. No accelerator, menu, find-bar, or Scintilla keymap changes.
+
+- [ ] **Step 4: Verify**
+
+Run on Windows: `cargo test --lib -- editor::input_filter --test-threads=1; cargo test --test editing -- --test-threads=1; cargo test --test startup_smoke -- --test-threads=1`, plus strict Clippy and fmt.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/editor tests/windows/editing.rs
+git commit -m "fix: ignore unbound control-character keystrokes"
+```
+
+---
+
 ## Pinned Source References
 
 - [`windows-sys` 0.61.2](https://docs.rs/crate/windows-sys/0.61.2)
