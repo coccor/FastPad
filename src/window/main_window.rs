@@ -860,6 +860,17 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
 /// editor view settings in place, and queues every rejected line as a non-modal notification.
 fn load_settings(hwnd: HWND) {
     let (settings, warnings) = crate::config::load();
+    apply_loaded_settings(hwnd, settings, warnings);
+}
+
+/// Applies an already-loaded settings/warnings pair, split out of `load_settings` so tests can drive
+/// the reporting path directly instead of mutating the process-wide `LOCALAPPDATA` environment
+/// variable to fake a corrupt `fastpad.ini` on disk.
+fn apply_loaded_settings(
+    hwnd: HWND,
+    settings: crate::config::Settings,
+    warnings: Vec<crate::config::SettingWarning>,
+) {
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
         let app = unsafe { app.as_mut() };
         app.settings = settings;
@@ -1984,10 +1995,11 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use windows_sys::Win32::Foundation::{HWND, LRESULT};
+    use windows_sys::Win32::Foundation::{HWND, LRESULT, RECT};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, IsWindow, WM_PAINT,
+        DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IsWindow, WM_PAINT,
     };
 
     #[test]
@@ -2038,6 +2050,86 @@ mod tests {
             .active()
             .language;
         assert_eq!(language_after, Language::PlainText);
+    }
+
+    #[test]
+    fn corrupt_settings_are_reported_non_modally_and_reserve_status_height() {
+        // Break caught: nothing else asserts that invalid fastpad.ini lines actually reach the
+        // user. If load_settings stopped queuing warnings, or the painted status line stopped
+        // showing them, or layout stopped reserving room for it, every other test would still pass.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        unsafe {
+            super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create)
+        }
+        .unwrap();
+        let editor_hwnd = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .editor
+            .as_ref()
+            .unwrap()
+            .hwnd();
+
+        // No status line exists before WM_FASTPAD_BUILD_CHROME, regardless of pending warnings.
+        assert_eq!(super::current_status_text(window.hwnd), None);
+
+        let warnings = vec![
+            crate::config::SettingWarning {
+                line: 3,
+                message: "invalid value for tab_width: \"nope\"".to_owned(),
+            },
+            crate::config::SettingWarning {
+                line: 5,
+                message: "unknown setting key: bogus".to_owned(),
+            },
+        ];
+        super::apply_loaded_settings(window.hwnd, crate::config::default_settings(), warnings);
+
+        assert_eq!(
+            unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+                .notifications
+                .len(),
+            2
+        );
+        assert_eq!(
+            super::current_status_text(window.hwnd),
+            None,
+            "chrome has not been built yet, so there is still nowhere to paint the warning"
+        );
+
+        super::build_chrome(window.hwnd);
+
+        let status = super::current_status_text(window.hwnd);
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.contains("fastpad.ini line 3")),
+            "expected the first warning's line reference in {status:?}"
+        );
+        let mut client = RECT::default();
+        let mut shown = RECT::default();
+        unsafe {
+            GetClientRect(window.hwnd, &mut client);
+            GetClientRect(editor_hwnd, &mut shown);
+        }
+        assert!(
+            shown.bottom - shown.top < client.bottom - client.top,
+            "the editor should be shorter than the client area while the status line is showing"
+        );
+
+        super::dismiss_notifications(window.hwnd);
+
+        assert_eq!(super::current_status_text(window.hwnd), None);
+        let mut dismissed = RECT::default();
+        unsafe {
+            GetClientRect(editor_hwnd, &mut dismissed);
+        }
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) };
+        assert_eq!(
+            (dismissed.bottom - dismissed.top) - (shown.bottom - shown.top),
+            crate::window::status::status_height(dpi),
+            "dismissing notifications should return exactly the reserved status height"
+        );
     }
 
     #[test]
