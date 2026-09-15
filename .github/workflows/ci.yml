@@ -1,8 +1,9 @@
 name: ci
 
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -28,6 +29,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache pinned native source archives
+        uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
       - name: Fetch pinned Scintilla and Lexilla sources
         shell: pwsh
         run: ./tools/fetch-native.ps1
@@ -37,8 +43,9 @@ jobs:
       - name: Build native DLLs from pinned sources
         shell: pwsh
         run: ./tools/build-native.ps1
+      # Same explicit target as the test step so Clippy and tests share one target directory.
       - name: Clippy (warnings denied)
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
       - name: Unit and Windows integration tests (serial)
         run: cargo test --locked --target x86_64-pc-windows-msvc -- --test-threads=1
 
@@ -55,6 +62,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache pinned native source archives
+        uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
       - name: Build portable ZIP
         shell: pwsh
         run: ./tools/package.ps1
@@ -76,6 +88,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache pinned native source archives
+        uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
       - name: Build native DLLs from pinned sources
         shell: pwsh
         run: ./tools/build-native.ps1
