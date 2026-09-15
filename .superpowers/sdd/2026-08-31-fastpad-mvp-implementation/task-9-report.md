@@ -167,3 +167,107 @@ disabled for `fastpad.exe`.
 - Confirmed test-only fixtures and counters are excluded from non-test builds.
 - Remaining scope limitation is intentional: this task models a successful Save close decision but
   does not implement the later file-save operation or save dialog.
+
+## Fix round 1 — 2026-09-15
+
+This section supersedes the original implementation's snapshot/queued-selection description and
+the earlier shutdown-reference evidence. Fix-round base was
+`fe459dac92791a86d111e1aefa9a7f2eb5617375`. The takeover preserved the inherited dirty changes,
+audited them, independently reran the document suite (12/12) and retained native provider case
+(1/1), and checkpointed them as `076ae64` (`wip: checkpoint task 9 live providers and validated
+close reviews`). No reset, stash, or discard was used.
+
+### Reviewer findings resolved
+
+- Retained MSAA providers now read a narrow Tabs-owned live view for names, counts, roles,
+  geometry, navigation, and selection validation. `accSelect` sends a synchronous
+  DocumentId/revision request to the main window, which validates against current Tabs and switches
+  Scintilla through the same activation route. Production providers no longer write selection
+  followed by a queued click. A retained provider follows child counts 6 -> 7 -> 6, observes the
+  current dirty name, and rejects a removed tab without changing editor text. Initial installation
+  preserves the existing view, and Tabs teardown retires the view instead of leaving stale
+  metadata behind for a retained provider.
+- Modal tab close captures DocumentId/generation, re-fetches current state after prompting and
+  native replacement creation, and validates again before removal. A changed active document or
+  generation aborts the stale close. Replacement requirements are checked against current Tabs;
+  there is no `expect` on a stale last-tab count. `SCN_MODIFIED` insert/delete notifications advance
+  generation even when a document was already dirty. Window close re-enumerates live dirty
+  documents after every prompt, recording decisions only for still-current ID/generation pairs;
+  documents newly dirtied, or edited after an earlier decision, require another review.
+- Public `Tabs::from_documents` is fallible and validates all canonical paths. It cannot bypass
+  duplicate ownership rejection enforced by `push`; single-document/empty construction and
+  final-tab replacement cannot introduce a competing canonical path.
+- A native production-WM_CLOSE regression now observes actual successful direct
+  `SCI_RELEASEDOCUMENT` calls, not just fake-handle Drop attempts. With two distinct native
+  documents, it asserts exactly two owned-reference releases targeting the installed editor HWND
+  while `IsWindow(editor)` is true, then asserts both editor and parent are destroyed. Test-only
+  fake endpoint counters likewise count only calls that pass the endpoint liveness gate.
+
+### Additional red/green evidence from the takeover
+
+- Editing an already-dirty document during modal tab-close review was behaviorally red: a stale
+  Discard replaced `unsaved!` with empty text. It passes after content notifications advance the
+  generation, preserving changed text and aborting that stale close.
+- Retaining the empty live view before real native editor installation was red (0 tabs instead of
+  1), and passes after initial installation updates the existing Tabs rather than replacing it.
+- Retaining a live view after its Tabs owner is dropped was red (stale document metadata), and
+  passes after teardown explicitly retires that view.
+- The endpoint-destruction counter regression was red (reported 1 release despite a skipped
+  native call) and is green with counting after the successful-call gate.
+- The native shutdown assertion was mutation-checked: temporarily moving the drain after
+  `DestroyWindow` made the regression fail with 0 actual releases instead of 2. The original safe
+  ordering was restored immediately and the regression passed again.
+- Native runtime regressions also verify that a tab created while an earlier close prompt is
+  open is not removed by that stale decision, and that a clean document dirtied during a prior
+  window-close prompt receives its own prompt whose Cancel preserves the window.
+
+### Fresh verification
+
+```text
+cargo test document::tests --lib
+13 passed; 0 failed
+
+cargo test --test tabs -- --test-threads=1
+12 passed; 0 failed (8 application scenarios + 4 support tests)
+
+cargo test --all-targets --all-features -- --test-threads=1
+69 library + 13 benchmark-harness + 5 editor-control + 6 startup-smoke +
+12 tabs + 9 titlebar passed; 0 failed
+
+cargo clippy --all-targets --all-features -- -D warnings
+exit 0
+cargo fmt --all -- --check
+exit 0
+git diff --check
+exit 0
+```
+
+### Precisely scoped Application Verifier evidence
+
+Application Verifier 10.0.26100 Handles/Leak settings were temporarily enabled only for
+`fastpad.exe` and the exact native library-test executable `fastpad-741762ac5416c7e3.exe`.
+The first restricted-sandbox attempt did not produce a fresh shutdown session; its FastPad export
+was an old 2026-09-11 session, so that attempt is not claimed as new verifier coverage.
+
+Through normal approved escalation, the exact native shutdown test then passed 1/1 with
+`FASTPAD_REQUIRE_APPVERIF=1`, explicitly asserting that `verifier.dll` was loaded. Its exported
+`target/task9-fix1-shutdown-appverif.xml` contains a fresh session started
+2026-09-15 10:32:58 (PID 13876) with no error entries. This is the direct shutdown-order assertion
+running with Application Verifier, not a fake-reference test presented as native coverage.
+
+The approved serialized native tab rerun passed 12/12. An earlier verifier run exposed a harness
+race (the modal dialog HWND was enumerated before its Cancel control existed); dialog waits now
+require ready controls, and replacement-dialog waits avoid answering the outgoing prompt. The
+successful rerun's latest FastPad session was exported to
+`target/task9-fix1-tabs-appverif.xml`, started 2026-09-15 10:34:25 (PID 14128), with no error
+entries. That XML proves only the latest FastPad session, not a complete per-process log archive
+of the whole tab suite. The suite's exit results provide the broader runtime evidence.
+
+All verifier tests were queried disabled for both scoped executables afterward. Handles/Leak and
+an empty XML session do not prove exact Scintilla document-reference counts: those references are
+not kernel handles. Exact owned releases and valid-HWND ordering are supported separately by the
+native direct-call observer and the shutdown mutation regression. No manual GUI walkthrough or
+visual inspection is claimed; the original Save/persistence scope limitation remains unchanged.
+
+Final fix commit: `fix: keep native tab state live across accessibility and close review`; its hash
+is supplied in the handoff.

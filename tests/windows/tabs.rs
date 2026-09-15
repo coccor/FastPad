@@ -19,7 +19,8 @@ use windows_sys::Win32::UI::Accessibility::{AccessibleObjectFromWindow, SELFLAG_
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_CLICK, EnumWindows, GetClientRect, GetDlgItem, GetWindowThreadProcessId, IDCANCEL, IDNO,
-    IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CLOSE, WM_COMMAND, WM_LBUTTONUP,
+    IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CHAR, WM_CLOSE, WM_COMMAND,
+    WM_LBUTTONUP,
 };
 use windows_sys::core::{BOOL, BSTR, GUID, HRESULT};
 
@@ -125,6 +126,71 @@ fn save_point_notifications_control_dirty_close_review() -> TestResult<()> {
 }
 
 #[test]
+fn editing_an_already_dirty_document_invalidates_modal_close_decision() -> TestResult<()> {
+    // Break caught: save-point transitions alone do not detect further edits during a prompt.
+    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+    let editor = find_child_by_class(hwnd, "Scintilla")?;
+    send_text(editor, "unsaved")?;
+    unsafe { PostMessageW(hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0) };
+    let dialog = wait_for_dialog(process.id(), true, Duration::from_secs(2))?;
+    unsafe { SendMessageW(editor, WM_CHAR, b'!' as usize, 0) };
+    wait_for_editor_text(editor, "unsaved!", Duration::from_secs(2))?;
+    answer_dialog(dialog, IDNO)?;
+    wait_for_dialog(process.id(), false, Duration::from_secs(2))?;
+    assert_eq!(scintilla_text(editor)?, "unsaved!");
+    unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
+    process.close()
+}
+
+#[test]
+fn modal_close_does_not_close_a_reentrantly_created_active_tab() -> TestResult<()> {
+    // Break caught: a prompt decision must not use the active index or count captured earlier.
+    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _com = ComApartment::initialize()?;
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+    let editor = find_child_by_class(hwnd, "Scintilla")?;
+    send_text(editor, "original")?;
+    let accessible = Accessible::from_window(hwnd)?;
+    unsafe { PostMessageW(hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0) };
+    let dialog = wait_for_dialog(process.id(), true, Duration::from_secs(2))?;
+    unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };
+    answer_dialog(dialog, IDNO)?;
+    wait_for_dialog(process.id(), false, Duration::from_secs(2))?;
+    assert_eq!(accessible.child_count()?, 7);
+    assert_eq!(accessible.select(1), windows_sys::Win32::Foundation::S_OK);
+    assert_eq!(scintilla_text(editor)?, "original");
+    unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
+    process.close()
+}
+
+#[test]
+fn window_close_reenumerates_documents_dirtied_during_a_prompt() -> TestResult<()> {
+    // Break caught: a once-only dirty snapshot silently discards a previously clean document.
+    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+    let editor = find_child_by_class(hwnd, "Scintilla")?;
+    send_text(editor, "first dirty")?;
+    unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };
+    unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+    let dialog = wait_for_dialog(process.id(), true, Duration::from_secs(2))?;
+    unsafe { SendMessageW(editor, WM_CHAR, b'x' as usize, 0) };
+    answer_dialog(dialog, IDNO)?;
+    let next = wait_for_replacement_dialog(process.id(), dialog, Duration::from_secs(2))?;
+    answer_dialog(next, IDCANCEL)?;
+    wait_for_dialog(process.id(), false, Duration::from_secs(2))?;
+    assert_ne!(unsafe { IsWindow(hwnd) }, 0);
+    assert_eq!(scintilla_text(editor)?, "x");
+    unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
+    click_tab(hwnd, 0, 2)?;
+    unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
+    process.close()
+}
+
+#[test]
 fn window_close_reviews_dirty_tabs_in_order_and_cancel_aborts_shutdown() -> TestResult<()> {
     let _serial = NATIVE_TEST_LOCK.lock().unwrap();
     let mut process = FastPadProcess::spawn(["--new-window"])
@@ -223,11 +289,31 @@ fn wait_for_dialog(process_id: u32, present: bool, timeout: Duration) -> TestRes
     let deadline = Instant::now() + timeout;
     loop {
         let dialog = find_dialog(process_id);
-        if dialog.is_some() == present {
+        let ready = dialog.is_some_and(|dialog| unsafe { !GetDlgItem(dialog, IDCANCEL).is_null() });
+        if (present && ready) || (!present && dialog.is_none()) {
             return Ok(dialog.unwrap_or(std::ptr::null_mut()));
         }
         if Instant::now() >= deadline {
             return Err(format!("close-review dialog present={present} was not observed").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_replacement_dialog(
+    process_id: u32,
+    previous: HWND,
+    timeout: Duration,
+) -> TestResult<HWND> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(dialog) = find_dialog(process_id).filter(|dialog| {
+            *dialog != previous && unsafe { !GetDlgItem(*dialog, IDCANCEL).is_null() }
+        }) {
+            return Ok(dialog);
+        }
+        if Instant::now() >= deadline {
+            return Err("a fresh close-review dialog was not observed".into());
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -351,9 +437,8 @@ impl Accessible {
 
     fn name(&self, child: i32) -> TestResult<String> {
         let mut name: BSTR = std::ptr::null();
-        let status = unsafe {
-            (self.vtable().get_acc_name)(self.0, child_variant(child), &mut name)
-        };
+        let status =
+            unsafe { (self.vtable().get_acc_name)(self.0, child_variant(child), &mut name) };
         if status < 0 || name.is_null() {
             return Err(format!("get_accName({child}) failed: {status:#x}").into());
         }

@@ -1,7 +1,7 @@
 use crate::document::{CloseCancelled, CloseDecision, Document, DocumentId};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Debug)]
 pub(crate) struct TabSelection {
@@ -252,9 +252,7 @@ impl Tabs {
         else {
             return Err(CloseReviewError::Stale);
         };
-        if index != self.active_index()
-            || self.documents[index].generation != review.generation
-        {
+        if index != self.active_index() || self.documents[index].generation != review.generation {
             return Err(CloseReviewError::Stale);
         }
         let closed = if self.documents.len() == 1 {
@@ -286,9 +284,8 @@ impl Tabs {
     }
 
     pub fn dirty_review_is_current(&self, review: CloseReview) -> bool {
-        self.document(review.id).is_some_and(|document| {
-            document.dirty && document.generation == review.generation
-        })
+        self.document(review.id)
+            .is_some_and(|document| document.dirty && document.generation == review.generation)
     }
 
     pub fn set_active_dirty(&mut self, dirty: bool) -> bool {
@@ -305,6 +302,13 @@ impl Tabs {
         true
     }
 
+    pub(crate) fn note_active_text_change(&mut self) {
+        let active = self.active_index();
+        if let Some(document) = self.documents.get_mut(active) {
+            document.generation = document.generation.saturating_add(1);
+        }
+    }
+
     pub fn clear_for_shutdown(&mut self) {
         self.documents.clear();
         self.selection.active.store(0, Ordering::Release);
@@ -314,7 +318,6 @@ impl Tabs {
     pub(crate) fn active_handle(&self) -> &crate::editor::EditorDocument {
         &self.active().handle
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,6 +386,14 @@ fn validate_unique_paths(documents: &[Document]) -> Result<(), DuplicateDocument
 impl Default for Tabs {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Tabs {
+    fn drop(&mut self) {
+        // Normal shutdown drains before HWND destruction; emergency teardown must still retire
+        // metadata so retained accessibility providers cannot target a recycled window.
+        self.clear_for_shutdown();
     }
 }
 

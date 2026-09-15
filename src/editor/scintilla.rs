@@ -401,11 +401,63 @@ impl EditorEndpoint {
         if raw == 0 {
             return;
         }
+        let _release_result = self.send_direct_if_alive(SCI_RELEASEDOCUMENT, 0, raw);
         #[cfg(test)]
-        if let Some(counter) = &self.release_counter {
-            counter.fetch_add(1, Ordering::SeqCst);
+        if _release_result.is_some() {
+            if let Some(counter) = &self.release_counter {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            release_observation::record(self.hwnd, raw);
         }
-        let _ = self.send_direct_if_alive(SCI_RELEASEDOCUMENT, 0, raw);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod release_observation {
+    use std::cell::RefCell;
+    use windows_sys::Win32::Foundation::HWND;
+
+    #[derive(Debug)]
+    pub(crate) struct Release {
+        pub(crate) hwnd: HWND,
+        pub(crate) document: isize,
+        pub(crate) window_was_live: bool,
+    }
+
+    thread_local! {
+        static RELEASES: RefCell<Option<Vec<Release>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(hwnd: HWND, document: isize) {
+        RELEASES.with(|releases| {
+            if let Some(releases) = releases.borrow_mut().as_mut() {
+                releases.push(Release {
+                    hwnd,
+                    document,
+                    window_was_live: unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) != 0
+                    },
+                });
+            }
+        });
+    }
+
+    pub(crate) fn during<R>(run: impl FnOnce() -> R) -> (R, Vec<Release>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RELEASES.with(|releases| {
+                    releases.replace(None);
+                });
+            }
+        }
+        RELEASES.with(|releases| {
+            assert!(releases.replace(Some(Vec::new())).is_none());
+        });
+        let _reset = Reset;
+        let result = run();
+        let releases = RELEASES.with(|releases| releases.take().unwrap());
+        (result, releases)
     }
 }
 
@@ -526,6 +578,19 @@ mod tests {
         assert_eq!(clone.raw(), 0);
         drop(clone);
         drop(fixture);
+    }
+
+    #[test]
+    fn release_counter_does_not_claim_a_call_after_endpoint_destruction() {
+        // Break caught: counting Drop attempts before the liveness gate overstates native releases.
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let document = EditorDocument::test_fixture_with_release_counter(Arc::clone(&releases));
+        document
+            .endpoint
+            .destroyed
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(document);
+        assert_eq!(releases.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

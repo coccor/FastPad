@@ -17,8 +17,9 @@ use windows_sys::Win32::UI::Accessibility::{
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowRect, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SendMessageW,
-    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, WM_APP, WM_COMMAND, WM_LBUTTONUP, WM_SYSCOMMAND,
+    GetClientRect, GetWindowRect, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
+    STATE_SYSTEM_SELECTABLE, STATE_SYSTEM_SELECTED, SendMessageW, WM_APP, WM_COMMAND, WM_LBUTTONUP,
+    WM_SYSCOMMAND,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -592,6 +593,8 @@ unsafe extern "system" fn accessible_select(
     let Some(tab) = view.tabs.get(index) else {
         return E_INVALIDARG;
     };
+    // Unit fixtures have no window/editor. Production selection always goes through the window.
+    #[cfg(test)]
     if item.hwnd.is_null() {
         return if item.selection.select(index, view.tabs.len()) {
             S_OK
@@ -663,8 +666,7 @@ fn accessible_target<'a>(
 ) -> Option<AccessibleTarget<'a>> {
     match child.child_id()? {
         0 => Some(AccessibleTarget::SelfObject),
-        _ => accessible_child(children, child)
-            .map(|(_, child)| AccessibleTarget::Child(child)),
+        _ => accessible_child(children, child).map(|(_, child)| AccessibleTarget::Child(child)),
     }
 }
 
@@ -907,8 +909,8 @@ mod tests {
         accessible_default_action, accessible_get_default_action, accessible_get_focus,
         accessible_get_selection, accessible_get_state, accessible_select,
     };
-    use crate::window::tabs::Tabs;
     use crate::document::{Document, DocumentId};
+    use crate::window::tabs::Tabs;
     use windows_sys::Win32::Foundation::{
         E_INVALIDARG, S_FALSE, S_OK, SysFreeString, SysStringLen,
     };
@@ -1078,9 +1080,7 @@ mod tests {
     }
 
     fn fixture_tabs(count: u64) -> Tabs {
-        Tabs::from_documents(
-            (1..=count).map(|id| Document::test_fixture(DocumentId(id), false)),
-        )
-        .unwrap()
+        Tabs::from_documents((1..=count).map(|id| Document::test_fixture(DocumentId(id), false)))
+            .unwrap()
     }
 }

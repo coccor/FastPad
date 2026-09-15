@@ -138,8 +138,7 @@ mod tests {
     fn closing_an_active_middle_tab_selects_its_successor() {
         // Break caught: closing a middle document can select the previous tab or leave a stale
         // active index.
-        let mut tabs =
-            Tabs::from_documents([document(1), document(2), document(3)]).unwrap();
+        let mut tabs = Tabs::from_documents([document(1), document(2), document(3)]).unwrap();
         tabs.activate(DocumentId(2)).unwrap();
 
         let closed = tabs
@@ -248,7 +247,10 @@ mod tests {
             tabs.close_reviewed(review, CloseDecision::Discard, None),
             Err(CloseReviewError::Stale)
         );
-        assert_eq!(tabs.ids().collect::<Vec<_>>(), [DocumentId(1), DocumentId(2)]);
+        assert_eq!(
+            tabs.ids().collect::<Vec<_>>(),
+            [DocumentId(1), DocumentId(2)]
+        );
     }
 
     #[test]
@@ -274,6 +276,15 @@ mod tests {
             tabs.titles().collect::<Vec<_>>(),
             ["Untitled", "Untitled *"]
         );
+    }
+
+    #[test]
+    fn a_retained_live_view_is_empty_after_its_tab_owner_is_dropped() {
+        // Break caught: retained accessibility providers expose documents after App teardown.
+        let tabs = Tabs::with_document(document(1));
+        let view = tabs.view();
+        drop(tabs);
+        assert!(view.snapshot().tabs.is_empty());
     }
 
     #[test]

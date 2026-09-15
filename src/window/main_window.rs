@@ -10,7 +10,7 @@ use crate::window::menus::{self, MenuBar};
 use crate::window::messages::{
     DeferredAction, classify_deferred_message, completed_milestone, deferred_start_message,
 };
-use crate::window::tabs::{CloseReviewKey, Tabs};
+use crate::window::tabs::CloseReviewKey;
 #[cfg(test)]
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -588,9 +588,7 @@ fn create_new_document(hwnd: HWND) -> Result<()> {
 fn activate_tab(hwnd: HWND, index: usize) {
     let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let view = unsafe { app.as_ref() }.tabs.view().snapshot();
-        view.tabs
-            .get(index)
-            .map(|tab| (tab.id, view.revision))
+        view.tabs.get(index).map(|tab| (tab.id, view.revision))
     });
     if let Some((id, revision)) = target {
         let _ = activate_document(hwnd, id, revision);
@@ -606,8 +604,9 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
         if app.tabs.view().snapshot().revision != revision {
             return None;
         }
+        let editor = app.editor.clone()?;
         app.tabs.activate(id).ok()?;
-        Some((app.editor.clone()?, app.tabs.active_handle().clone()))
+        Some((editor, app.tabs.active_handle().clone()))
     });
     let Some((editor, handle)) = target else {
         return false;
@@ -679,7 +678,10 @@ fn close_active_document(hwnd: HWND) {
 
     let switched = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        let closed = app.tabs.close_reviewed(review, decision, replacement).ok()?;
+        let closed = app
+            .tabs
+            .close_reviewed(review, decision, replacement)
+            .ok()?;
         Some((closed, app.tabs.active_handle().clone()))
     });
     let Some((closed, active)) = switched else {
@@ -755,6 +757,17 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     if unsafe { editor_hwnd(hwnd) } != Some(notification.hwndFrom) {
         return;
     }
+    if notification.code == crate::editor::scintilla_constants::SCN_MODIFIED {
+        let modification = unsafe { &*(lparam as *const TextModificationNotification) };
+        let text_changes = crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
+            | crate::editor::scintilla_constants::SC_MOD_DELETETEXT;
+        if modification.modification_type & text_changes as i32 != 0
+            && let Some(mut app) = unsafe { app_ptr(hwnd) }
+        {
+            unsafe { app.as_mut() }.tabs.note_active_text_change();
+        }
+        return;
+    }
     let dirty = match notification.code {
         crate::editor::scintilla_constants::SCN_SAVEPOINTLEFT => true,
         crate::editor::scintilla_constants::SCN_SAVEPOINTREACHED => false,
@@ -763,13 +776,21 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     let changed = unsafe { app_ptr(hwnd) }
         .map(|mut app| {
             let app = unsafe { app.as_mut() };
-            let changed = app.tabs.set_active_dirty(dirty);
-            changed
+            app.tabs.set_active_dirty(dirty)
         })
         .unwrap_or(false);
     if changed {
         invalidate_title_strip(hwnd);
     }
+}
+
+#[repr(C)]
+struct TextModificationNotification {
+    header: NMHDR,
+    position: isize,
+    character: i32,
+    modifiers: i32,
+    modification_type: i32,
 }
 
 fn invalidate_title_strip(hwnd: HWND) {
@@ -863,7 +884,9 @@ unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Resu
         ));
     };
     let app = unsafe { app.as_mut() };
-    app.tabs = Tabs::with_document(document);
+    app.tabs
+        .push(document)
+        .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))?;
     app.editor = Some(editor);
     Ok(())
 }
@@ -942,6 +965,60 @@ mod tests {
     }
 
     #[test]
+    fn initial_editor_installation_updates_a_retained_empty_tab_view() {
+        // Break caught: accessibility requested before editor creation retains an obsolete view.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let view = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .tabs
+            .view();
+        assert!(view.snapshot().tabs.is_empty());
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        unsafe {
+            super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create)
+        }
+        .unwrap();
+        assert_eq!(view.snapshot().tabs.len(), 1);
+    }
+
+    #[test]
+    fn native_wm_close_releases_all_owned_documents_before_editor_destruction() {
+        // Break caught: clearing tabs after DestroyWindow skips real releases at the dead endpoint.
+        if std::env::var_os("FASTPAD_REQUIRE_APPVERIF").is_some() {
+            let verifier = crate::platform::wide_null("verifier.dll");
+            assert!(
+                !unsafe { GetModuleHandleW(verifier.as_ptr()) }.is_null(),
+                "Application Verifier must actually be loaded for a claimed verifier run"
+            );
+        }
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        let editor = unsafe {
+            super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create)
+        }
+        .unwrap();
+        super::create_new_document(window.hwnd).unwrap();
+        let (_, releases) = crate::editor::scintilla::release_observation::during(|| unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                window.hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                0,
+                0,
+            )
+        });
+        assert_eq!(releases.len(), 2);
+        assert_ne!(releases[0].document, releases[1].document);
+        assert!(
+            releases
+                .iter()
+                .all(|release| release.hwnd == editor && release.window_was_live)
+        );
+        assert_eq!(unsafe { IsWindow(editor) }, 0);
+        assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+    }
+
+    #[test]
     fn original_window_identity_stays_invalid_after_replacement_creation() {
         // Break caught: an IsWindow-only liveness check can accept a recycled HWND and read the
         // replacement window's GWLP_USERDATA as the original App.
@@ -1008,6 +1085,21 @@ mod tests {
             LaunchOptions::default(),
             StartupMetrics::with_frequency(1, 0),
         ))
+    }
+
+    fn load_native_scintilla() -> crate::platform::OwnedModule {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("native/out/x64/Scintilla.dll");
+        let path = crate::platform::wide_null(path.to_str().unwrap());
+        let module = unsafe {
+            windows_sys::Win32::System::LibraryLoader::LoadLibraryExW(
+                path.as_ptr(),
+                std::ptr::null_mut(),
+                windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+                    | windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        unsafe { crate::platform::OwnedModule::from_raw_owned(module) }.unwrap()
     }
 
     struct DropProbe {
