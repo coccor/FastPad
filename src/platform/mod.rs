@@ -1,3 +1,4 @@
+pub mod dialogs;
 pub mod handles;
 pub mod win32;
 

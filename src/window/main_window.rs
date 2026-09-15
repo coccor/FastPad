@@ -544,6 +544,18 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         return;
     }
     match command {
+        CommandId::Open => {
+            let identity = unsafe { window_identity(hwnd) };
+            // Modal Show reenters the window procedure. Only an owned identity crosses it.
+            let selection = crate::window::commands::choose_open_path(hwnd);
+            if identity
+                .as_ref()
+                .is_some_and(|identity| identity.is_live_for(hwnd))
+                && let Ok(Some(path)) = selection
+            {
+                let _ = App::open_path(hwnd, &path);
+            }
+        }
         CommandId::New => {
             let _ = create_new_document(hwnd);
         }
@@ -581,7 +593,9 @@ fn handle_open_request(hwnd: HWND) -> LRESULT {
     };
     match request {
         crate::launch::LaunchRequest::Open(path) => {
-            let _ = App::open_path(hwnd, std::path::Path::new(&path));
+            if App::open_path(hwnd, std::path::Path::new(&path)).is_ok() {
+                return 0;
+            }
         }
         crate::launch::LaunchRequest::New => unsafe {
             let _ = record_milestone(hwnd, Milestone::FileLoaded);
@@ -612,6 +626,9 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
     });
     if let Some((id, revision)) = existing {
         return if activate_document(hwnd, id, revision) {
+            unsafe {
+                PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
+            }
             Ok(())
         } else {
             Err(crate::FastPadError::Invariant(
@@ -624,7 +641,7 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
     let loaded = crate::file::loader::load(path)?;
     std::ffi::CString::new(loaded.text.as_str())
         .map_err(|_| crate::FastPadError::Invariant("Scintilla text may not contain NUL bytes"))?;
-    let (editor, previous, id, recovery_id, reuse) = {
+    let (editor, previous, candidate, active_ids) = {
         let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
         ))?;
@@ -637,13 +654,21 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
         let previous = active.handle.clone();
         let candidate = !active.dirty && active.path.is_none();
         let active_ids = (active.id, active.recovery_id);
-        let reuse = candidate && editor.text()?.is_empty();
-        let (id, recovery_id) = if reuse {
-            active_ids
-        } else {
-            app.allocate_document_identity()
-        };
-        (editor, previous, id, recovery_id, reuse)
+        (editor, previous, candidate, active_ids)
+    };
+    let reuse = candidate && editor.text()?.is_empty();
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed during file open",
+        ));
+    }
+    let (id, recovery_id) = if reuse {
+        active_ids
+    } else {
+        let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))?;
+        unsafe { app.as_mut() }.allocate_document_identity()
     };
     let mut document = Document::untitled(id, recovery_id, editor.create_document()?);
     document.path = Some(loaded.path);
@@ -665,7 +690,7 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
             "main window was destroyed during file population",
         ));
     }
-    let commit = {
+    let (commit, retired) = {
         let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
         ))?;
@@ -674,14 +699,17 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
         result?;
         if reuse {
             let retired = app.tabs.replace_active_untitled(document);
-            drop(retired);
-            Ok(())
+            (Ok(()), Some(retired))
         } else {
-            app.tabs
-                .push(document)
-                .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))
+            (
+                app.tabs
+                    .push(document)
+                    .map_err(|_| crate::FastPadError::Invariant("duplicate document path")),
+                None,
+            )
         }
     };
+    drop(retired);
     if commit.is_err() {
         let _ = editor.use_document(&previous);
     }

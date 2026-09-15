@@ -52,6 +52,12 @@ impl TryFrom<u16> for CommandId {
     }
 }
 
+pub(crate) fn choose_open_path(
+    owner: windows_sys::Win32::Foundation::HWND,
+) -> crate::Result<Option<std::path::PathBuf>> {
+    crate::platform::dialogs::show_open_dialog(owner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::CommandId;

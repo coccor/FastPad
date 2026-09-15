@@ -325,6 +325,7 @@ mod tests {
                 crate::file::encoding::Encoding::Utf8Bom
             );
             assert!(!app.tabs.active().dirty);
+            assert_eq!(app.tabs.len(), 2);
             assert!(
                 app.startup
                     .micros(crate::perf::Milestone::FirstInputAccepted)
@@ -335,6 +336,58 @@ mod tests {
                         .unwrap()
             );
         });
+        assert_eq!(
+            unsafe {
+                SendMessageW(
+                    editor,
+                    crate::editor::scintilla_constants::SCI_CANUNDO,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        unsafe {
+            SendMessageW(editor, WM_CHAR, b'!' as usize, 0);
+        }
+        assert_ne!(
+            unsafe {
+                SendMessageW(
+                    editor,
+                    crate::editor::scintilla_constants::SCI_CANUNDO,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn app_construction_and_path_loading_do_not_initialize_com() {
+        // Break caught: application-owned COM initialization moves into App or file loading.
+        use windows_sys::Win32::System::Com::{APTTYPE, APTTYPEQUALIFIER, CoGetApartmentType};
+        fn apartment() -> (i32, APTTYPE, APTTYPEQUALIFIER) {
+            let mut kind = 0;
+            let mut qualifier = 0;
+            let status = unsafe { CoGetApartmentType(&mut kind, &mut qualifier) };
+            (status, kind, qualifier)
+        }
+        let before = apartment();
+        let fixture = OpenFixture::new(b"same");
+        let plain = make_app();
+        crate::file::loader::load(&fixture.path).unwrap();
+        assert_eq!(apartment(), before);
+        drop(plain);
+        let _scintilla = load_scintilla_module().unwrap();
+        let main = ProductionWindow::new(make_app());
+        unsafe {
+            initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap();
+        }
+        // Native UI can establish an OS-owned implicit apartment; that is not our explicit COM init.
+        let native_baseline = apartment();
+        App::open_path(main.hwnd, &fixture.path).unwrap();
+        assert_eq!(apartment(), native_baseline);
     }
 
     #[test]
@@ -363,6 +416,39 @@ mod tests {
             assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), before);
             assert!(app.tabs.active().dirty);
         });
+    }
+
+    #[test]
+    fn successful_launch_open_posts_language_continuation_only_once() {
+        // Break caught: both the loader and its deferred request handler advance the chain.
+        let _scintilla = load_scintilla_module().unwrap();
+        let fixture = OpenFixture::new(b"same");
+        let mut app = make_app();
+        app.launch.request =
+            crate::launch::LaunchRequest::Open(fixture.path.clone().into_os_string());
+        let main = ProductionWindow::new(app);
+        let editor =
+            unsafe { initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap() };
+        unsafe {
+            SendMessageW(editor, WM_CHAR, b'x' as usize, 0);
+            SendMessageW(main.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
+            SendMessageW(main.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
+        }
+        let mut count = 0;
+        let mut message = MSG::default();
+        while unsafe {
+            PeekMessageW(
+                &mut message,
+                main.hwnd,
+                crate::window::WM_FASTPAD_APPLY_LANGUAGE,
+                crate::window::WM_FASTPAD_APPLY_LANGUAGE,
+                PM_REMOVE,
+            )
+        } != 0
+        {
+            count += 1;
+        }
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -47,3 +47,7 @@ path = "tests/windows/titlebar.rs"
 [[test]]
 name = "tabs"
 path = "tests/windows/tabs.rs"
+
+[[test]]
+name = "open_file"
+path = "tests/windows/open_file.rs"
