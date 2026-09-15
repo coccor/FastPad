@@ -896,10 +896,6 @@ thread_local! {
 /// Test-only accessor for the messages `show_language_error` would otherwise have shown as a real
 /// MessageBoxW. Clears the recorded list.
 #[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "consumed by the source-linked highlighting integration target"
-)]
 pub(crate) fn take_language_errors() -> Vec<String> {
     LANGUAGE_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()))
 }
@@ -1681,12 +1677,16 @@ fn store_app(hwnd: HWND, value: Box<App>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        MainWindowClass, WindowCreateContext, dark_mode_from_apps_use_light_theme,
+        MainWindowClass, WindowCreateContext, dark_mode_from_apps_use_light_theme, execute_command,
         handle_paint_with, mark_first_paint_complete, take_deferred_start_pending,
+        take_language_errors,
     };
     use crate::app::App;
+    use crate::document::Language;
+    use crate::languages::LanguageManager;
     use crate::launch::LaunchOptions;
     use crate::perf::StartupMetrics;
+    use crate::window::commands::CommandId;
     use std::cell::RefCell;
     use std::sync::{
         Arc,
@@ -1705,6 +1705,56 @@ mod tests {
         assert!(!dark_mode_from_apps_use_light_theme(Some(1)));
         assert!(dark_mode_from_apps_use_light_theme(Some(0)));
         assert!(!dark_mode_from_apps_use_light_theme(None));
+    }
+
+    #[test]
+    fn failed_language_activation_leaves_document_language_unchanged_and_records_a_warning() {
+        // Break caught: a failed Lexilla load/lexer-creation must not record the requested
+        // language on Document metadata when the editor itself was left exactly as it was
+        // (LanguageManager::apply never installs a lexer before a real pointer is in hand), and
+        // must surface something the caller can show in a notification instead of failing silently.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        unsafe {
+            super::initialize_editor_with(window.hwnd, &identity, crate::editor::Editor::create)
+        }
+        .unwrap();
+
+        // Seed a LanguageManager pointed at a Lexilla.dll path that cannot possibly load, so the
+        // activation below fails deterministically without depending on the real native DLL.
+        let missing = std::env::temp_dir().join(format!(
+            "fastpad-main-window-missing-lexilla-test-{}.dll",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        unsafe {
+            super::app_ptr(window.hwnd)
+                .unwrap()
+                .as_mut()
+                .language_manager = Some(LanguageManager::with_dll_path_for_test(missing));
+        }
+        let language_before = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .tabs
+            .active()
+            .language;
+        assert_eq!(language_before, Language::PlainText);
+
+        execute_command(window.hwnd, CommandId::LanguageJson);
+
+        assert_eq!(
+            take_language_errors(),
+            vec![
+                "FastPad could not enable syntax highlighting for this file. It will remain in \
+                 plain text."
+                    .to_owned()
+            ]
+        );
+        let language_after = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
+            .tabs
+            .active()
+            .language;
+        assert_eq!(language_after, Language::PlainText);
     }
 
     #[test]

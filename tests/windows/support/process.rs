@@ -79,11 +79,12 @@ impl FastPadProcess {
         }
     }
 
-    /// Requests a normal shutdown and waits for the process to exit. If a real, blocking
-    /// `MessageBoxW` is showing over the main window — a "Save changes?" prompt (e.g. left behind
-    /// by a test keystroke that unblocked a deferred file open before the real content replaced
-    /// it) or a plain OK warning (e.g. a failed language activation) — this dismisses it so the
-    /// close can keep progressing instead of hanging forever.
+    /// Requests a normal shutdown and waits for the process to exit. Does not dismiss any dialog
+    /// that might be blocking that shutdown (e.g. a "Save changes?" prompt): an unexpected dialog
+    /// at close time is meant to surface as a loud timeout failure for every caller of this shared
+    /// helper. A caller that deliberately provokes a real, blocking `MessageBoxW` (e.g.
+    /// `tests/windows/highlighting.rs`'s missing-Lexilla scenario) must dismiss it itself first,
+    /// via `wait_and_dismiss_dialog`, before calling `close`.
     pub fn close(mut self) -> TestResult<()> {
         if let Some(status) = self.process.try_wait()? {
             return if status.success() {
@@ -98,24 +99,11 @@ impl FastPadProcess {
             }
         }
 
-        let process_id = self.process.id();
-        let deadline = Deadline::after(Duration::from_secs(4));
-        loop {
-            if let Some(status) = self.process.try_wait()? {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!("fastpad exited with nonzero exit code {:?}", status.code()).into())
-                };
-            }
-            if let Some(dialog) = find_unsaved_changes_dialog(process_id)? {
-                dismiss_dialog(dialog);
-            }
-            if deadline.expired() {
-                return Err("timed out waiting for FastPad to exit after WM_CLOSE".into());
-            }
-            deadline.sleep_step();
-        }
+        wait_for_exit(
+            &mut self.process,
+            &Deadline::after(Duration::from_secs(2)),
+            true,
+        )
     }
 }
 

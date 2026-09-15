@@ -7,12 +7,6 @@ mod messages;
 pub mod tabs;
 pub mod titlebar;
 
-#[cfg(test)]
-#[allow(
-    unused_imports,
-    reason = "consumed by the source-linked highlighting integration target"
-)]
-pub(crate) use main_window::take_language_errors;
 pub(crate) use main_window::{
     INPUT_MESSAGE_FIRST, INPUT_MESSAGE_LAST, MainWindowClass, WindowCreateContext,
     clear_input_priority, initialize_editor_with, input_priority_requested,

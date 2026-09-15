@@ -15,7 +15,7 @@ use support::win32::{Deadline, find_child_by_class, scintilla_text};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HWND;
 #[cfg(windows)]
-use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SendMessageW, WM_CHAR};
+use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SendMessageW, WM_CHAR, WM_CLOSE};
 
 #[cfg(windows)]
 const LEXILLA_MODULE_NAME: &str = "Lexilla.dll";
@@ -75,12 +75,16 @@ fn opening_a_json_file_loads_lexilla_and_the_editor_stays_editable() {
         "expected the opened JSON content and the later keystroke to both be present",
     );
 
-    // Clear the dirty flag the verification keystroke left behind so WM_CLOSE does not block on a
-    // real "Save changes?" prompt (matches startup_smoke.rs's own SCI_SETSAVEPOINT precedent).
+    // Clear the dirty flag the verification keystroke left behind (matches startup_smoke.rs's own
+    // SCI_SETSAVEPOINT precedent) — but the earlier `type_char(editor, b'x')` deferred-open
+    // unblock still leaves a separate, still-dirty leftover "Untitled" tab behind (Task 3's
+    // documented behavior: the file open replaces the active slot with a new document rather than
+    // reusing the now-dirty one). Closing shows a real "Save changes?" prompt for that tab; dismiss
+    // it explicitly here rather than in the shared `FastPadProcess::close()` helper.
     unsafe {
         SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0);
     }
-    process.close().unwrap();
+    close_dismissing_the_leftover_tab_prompt(process, hwnd);
 }
 
 /// A missing `Lexilla.dll` must not crash, hang, or half-apply a lexer: opening a `.json` file
@@ -108,9 +112,9 @@ fn missing_lexilla_leaves_the_document_editable_as_plain_text() {
     );
 
     // The failed activation shows a real, blocking "could not enable syntax highlighting"
-    // MessageBoxW; dismiss it now (rather than leaving it for `close()`) so it cannot later
-    // overlap with the unrelated "unsaved changes" prompt `close()` handles for the leftover
-    // dirty tab from the earlier `type_char(editor, b'x')` deferred-open unblock.
+    // MessageBoxW; dismiss it now so it cannot later overlap with the unrelated "unsaved changes"
+    // prompt for the leftover dirty tab from the earlier `type_char(editor, b'x')` deferred-open
+    // unblock (dismissed separately, at close time, by `close_dismissing_the_leftover_tab_prompt`).
     support::process::wait_and_dismiss_dialog(process.id(), Duration::from_secs(3)).unwrap();
     assert!(!process_has_module_loaded(process.id(), LEXILLA_MODULE_NAME).unwrap());
 
@@ -129,6 +133,21 @@ fn missing_lexilla_leaves_the_document_editable_as_plain_text() {
     unsafe {
         SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0);
     }
+    close_dismissing_the_leftover_tab_prompt(process, hwnd);
+}
+
+/// Posts `WM_CLOSE`, dismisses the real "Save changes?" prompt this test's own leftover dirty
+/// "Untitled" tab (see the deferred-open-unblock keystroke at the top of each test) is expected to
+/// show, then hands off to `FastPadProcess::close()` for the final wait — `close()` itself does
+/// not dismiss dialogs (see its doc comment): an unexpected dialog at close time is meant to
+/// surface as a loud timeout failure for the other native test targets that share it, so this
+/// test dismisses its own, predictable one explicitly instead of changing that shared behavior.
+#[cfg(windows)]
+fn close_dismissing_the_leftover_tab_prompt(process: FastPadProcess, hwnd: HWND) {
+    unsafe {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    }
+    let _ = support::process::wait_and_dismiss_dialog(process.id(), Duration::from_secs(2));
     process.close().unwrap();
 }
 
