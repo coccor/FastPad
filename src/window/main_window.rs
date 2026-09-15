@@ -294,6 +294,12 @@ unsafe extern "system" fn main_window_proc(
             if message == crate::window::WM_FASTPAD_IPC_REQUEST {
                 return handle_ipc_requests(hwnd);
             }
+            if message == crate::window::WM_FASTPAD_DIAGNOSTIC_JSON_COUNT
+                && unsafe { app_ptr(hwnd) }
+                    .is_some_and(|app| unsafe { app.as_ref() }.launch.diagnostic)
+            {
+                return crate::languages::json_invocation_count() as LRESULT;
+            }
             if message == crate::window::WM_FASTPAD_OPEN_REQUEST && !input_pending() {
                 return handle_open_request(hwnd);
             }

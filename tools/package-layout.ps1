@@ -9,9 +9,12 @@ $PackageFiles = @(
     "README.md",
     "LICENSES.md",
     "licenses\Scintilla.txt",
-    "licenses\Lexilla.txt"
+    "licenses\Lexilla.txt",
+    "licenses\rust-crates.txt"
 )
 $PackageBinaries = @("FastPad.exe", "Scintilla.dll", "Lexilla.dll")
+# The Visual C++ runtime redistributable is not part of a clean Windows install.
+$DynamicCrtImportPattern = '^(vcruntime.*|msvcp.*|ucrtbase.*|api-ms-win-crt-.*)\.dll$'
 
 function Get-PeMachine {
     param([Parameter(Mandatory = $true)] [string]$Path)
@@ -40,5 +43,25 @@ function Assert-Amd64Image {
     $machine = Get-PeMachine -Path $Path
     if ($machine -ne 0x8664) {
         throw "'$Path' has PE machine type 0x$($machine.ToString('X4')), expected AMD64 (0x8664)."
+    }
+}
+
+function Assert-NoDynamicCrtImports {
+    param(
+        [Parameter(Mandatory = $true)] [string]$Dumpbin,
+        [Parameter(Mandatory = $true)] [string]$Path
+    )
+
+    $output = & $Dumpbin /nologo /imports $Path
+    if ($LASTEXITCODE -ne 0) {
+        throw "dumpbin /imports failed for '$Path'."
+    }
+    $imports = @($output | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^[^\s]+\.dll$' })
+    if (-not ($imports | Where-Object { $_ -ieq "kernel32.dll" })) {
+        throw "dumpbin /imports for '$Path' listed no KERNEL32.dll import; import parsing failed."
+    }
+    $crt = @($imports | Where-Object { $_ -imatch $DynamicCrtImportPattern })
+    if ($crt.Count -gt 0) {
+        throw "'$Path' imports the dynamic C runtime: $($crt -join ', ')."
     }
 }

@@ -9,7 +9,7 @@ use crate::editor::Editor;
 use lexilla::LexillaLibrary;
 use std::path::{Path, PathBuf};
 
-pub use json_commands::{JsonIssue, format_json, validate_json};
+pub use json_commands::{JsonIssue, format_json, json_invocation_count, validate_json};
 
 /// One Scintilla lexer style's look: `style` is the lexer-specific `SCE_*` style number.
 #[derive(Clone, Copy, Debug)]

@@ -10,6 +10,8 @@ pub const WM_FASTPAD_START_IPC: u32 = WM_APP + 5;
 pub const WM_FASTPAD_BUILD_CHROME: u32 = WM_APP + 6;
 // Not part of the deferred chain: it only drains requests already queued on App.
 pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
+// Not part of the deferred chain: answers only under --diagnostic, for acceptance tests.
+pub const WM_FASTPAD_DIAGNOSTIC_JSON_COUNT: u32 = WM_APP + 0x40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

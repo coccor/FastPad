@@ -8,6 +8,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "msvc.ps1")
 . (Join-Path $PSScriptRoot "package-layout.ps1")
 if ([string]::IsNullOrWhiteSpace($Package)) {
     $Package = Join-Path $RepositoryRoot "dist\$PackageName.zip"
@@ -122,9 +123,12 @@ try {
     }
     Write-Output "Package contains exactly: $($expected -join ', ')"
 
+    $dumpbin = Find-MsvcTool -Name "dumpbin.exe"
     foreach ($binary in $PackageBinaries) {
         Assert-Amd64Image -Path (Join-Path $PackageRoot $binary)
+        Assert-NoDynamicCrtImports -Dumpbin $dumpbin -Path (Join-Path $PackageRoot $binary)
     }
+    Write-Output "No packaged binary imports the dynamic C runtime."
 
     if ($RequireSignature) {
         foreach ($binary in $PackageBinaries) {

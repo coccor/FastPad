@@ -26,9 +26,14 @@ if (-not $?) {
     throw "Native build from pinned sources failed."
 }
 
-$previousRustFlags = $env:RUSTFLAGS
-# Panic locations would otherwise embed this checkout and the Cargo registry path.
-$env:RUSTFLAGS = "--remap-path-prefix=$RepositoryRoot=fastpad --remap-path-prefix=$CargoHome=cargo"
+$previousEncodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
+# 0x1F-separated so paths with spaces survive. A static CRT avoids requiring the VC++ redistributable;
+# the remaps keep this checkout and the Cargo registry path out of panic locations.
+$env:CARGO_ENCODED_RUSTFLAGS = @(
+    "-Ctarget-feature=+crt-static",
+    "--remap-path-prefix=$RepositoryRoot=fastpad",
+    "--remap-path-prefix=$CargoHome=cargo"
+) -join [char]0x1F
 Push-Location $RepositoryRoot
 try {
     & cargo build --locked --profile $BuildProfile --features release-package --bin fastpad --target $Target --target-dir $TargetDirectory
@@ -38,7 +43,13 @@ try {
 }
 finally {
     Pop-Location
-    $env:RUSTFLAGS = $previousRustFlags
+    $env:CARGO_ENCODED_RUSTFLAGS = $previousEncodedRustFlags
+}
+
+$RustCrateLicenses = Join-Path $DistRoot "generated\rust-crates.txt"
+& (Join-Path $PSScriptRoot "rust-crate-licenses.ps1") -OutputPath $RustCrateLicenses
+if (-not $?) {
+    throw "Rust crate license generation failed."
 }
 
 $Sources = [ordered]@{
@@ -49,6 +60,7 @@ $Sources = [ordered]@{
     "LICENSES.md"            = Join-Path $RepositoryRoot "LICENSES.md"
     "licenses\Scintilla.txt" = Join-Path $RepositoryRoot "licenses\Scintilla.txt"
     "licenses\Lexilla.txt"   = Join-Path $RepositoryRoot "licenses\Lexilla.txt"
+    "licenses\rust-crates.txt" = $RustCrateLicenses
 }
 if ((@($Sources.Keys | Sort-Object) -join "|") -ne (@($PackageFiles | Sort-Object) -join "|")) {
     throw "Package sources do not match the package layout."
@@ -77,8 +89,10 @@ foreach ($entry in $Sources.GetEnumerator()) {
     Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $StageRoot $entry.Key) -Force
 }
 
+$Dumpbin = Find-MsvcTool -Name "dumpbin.exe"
 foreach ($binary in $PackageBinaries) {
     Assert-Amd64Image -Path (Join-Path $StageRoot $binary)
+    Assert-NoDynamicCrtImports -Dumpbin $Dumpbin -Path (Join-Path $StageRoot $binary)
 }
 
 if ($env:FASTPAD_SIGNING_CERTIFICATE) {

@@ -63,7 +63,9 @@ impl FastPadProcess {
         Self::spawn_command(command)
     }
 
-    /// Like `spawn_with_local_app_data`, plus extra environment variables for the child.
+    /// Like `spawn_with_local_app_data`, plus extra environment variables for the child. Returns
+    /// immediately, without `WaitForInputIdle`, so callers can reach the window before its deferred
+    /// startup chain runs.
     pub fn spawn_with_environment<I, S>(
         args: I,
         local_app_data: &std::path::Path,
@@ -78,7 +80,9 @@ impl FastPadProcess {
         for (name, value) in environment {
             command.env(name, value);
         }
-        Self::spawn_command(command)
+        Ok(Self {
+            process: command.spawn()?,
+        })
     }
 
     pub fn has_dialog(&self) -> TestResult<bool> {

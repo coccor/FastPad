@@ -11,7 +11,7 @@ work such as settings, file loading, syntax highlighting, and crash recovery has
 
 - `FastPad.exe`
 - `Scintilla.dll` and `Lexilla.dll` (built from the pinned Scintilla 5.6.6 and Lexilla 5.5.3 sources)
-- `README.md`, `LICENSES.md`, and `licenses\` (third-party license texts)
+- `README.md`, `LICENSES.md`, and `licenses\` (Scintilla, Lexilla, and linked Rust crate license texts)
 
 Extract the ZIP to any folder and run `FastPad.exe`. Keep the two DLLs beside the executable;
 FastPad loads them only from its own folder. Nothing is installed and no registry keys are written.

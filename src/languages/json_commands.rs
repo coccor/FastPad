@@ -35,9 +35,22 @@ impl From<serde_json::Error> for JsonIssue {
     }
 }
 
+static JSON_INVOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times `validate_json` or `format_json` has run in this process; acceptance tests read
+/// it through `--diagnostic` to prove startup never parses JSON.
+pub fn json_invocation_count() -> u64 {
+    JSON_INVOCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn note_json_invocation() {
+    JSON_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Parses `source` as JSON without producing any output. `Ok(())` means it is valid; `Err` carries
 /// the one-based line/column of the first parse failure.
 pub fn validate_json(source: &str) -> core::result::Result<(), JsonIssue> {
+    note_json_invocation();
     serde_json::from_str::<serde_json::Value>(source)
         .map(|_| ())
         .map_err(JsonIssue::from)
@@ -48,6 +61,7 @@ pub fn validate_json(source: &str) -> core::result::Result<(), JsonIssue> {
 /// ended in `\n` (which also covers `\r\n`, since that ends in `\n` too) — formatting a file that
 /// had no final newline must not introduce one.
 pub fn format_json(source: &str) -> core::result::Result<String, JsonIssue> {
+    note_json_invocation();
     let value: serde_json::Value = serde_json::from_str(source).map_err(JsonIssue::from)?;
     let mut bytes = Vec::new();
     serde_json::to_writer_pretty(&mut bytes, &value).map_err(JsonIssue::from)?;
@@ -60,7 +74,20 @@ pub fn format_json(source: &str) -> core::result::Result<String, JsonIssue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_json, validate_json};
+    use super::{format_json, json_invocation_count, validate_json};
+
+    #[test]
+    fn validate_and_format_each_count_one_json_invocation() {
+        // Break caught: a JSON entry point that parses without being counted lets a startup parse
+        // slip past the acceptance test's diagnostic invocation counter.
+        // Other tests may run concurrently, so only a lower bound is exact.
+        let before = json_invocation_count();
+        let _ = validate_json("{}");
+        assert!(json_invocation_count() > before);
+        let after_validate = json_invocation_count();
+        let _ = format_json("{ bad");
+        assert!(json_invocation_count() > after_validate);
+    }
 
     #[test]
     fn format_uses_two_spaces_and_preserves_final_newline() {
