@@ -23,6 +23,14 @@ path remaps through `CARGO_ENCODED_RUSTFLAGS`). Only `release` has been re-measu
 | Profile | `fastpad.exe` bytes | Warm TTI p50 | Warm TTI p95 | First paint p50 | First paint p95 | Idle private WS p50 |
 |---|---:|---:|---:|---:|---:|---:|
 | `release` (fat LTO, opt 3, static CRT) | 486,400 | 59,559 us | 80,258 us | 56,037 us | 75,885 us | 2,027,520 B |
+| Task 19 (title shell/theme), `release`, static CRT — provisional | 495,104 | 66,997 us | 76,985 us | 59,651 us | 69,020 us | 1,921,024 B |
+
+The Task 19 row was measured on 2026-09-16 on the same non-reference host, in a separate session, with
+the same method (30 measured, 5 warmup). Against the static-CRT `release` row it is +7.4 ms at TTI
+p50 and +3.6 ms at first-paint p50, but -3.3 ms at TTI p95 and -6.9 ms at first-paint p95. The p50
+shift is consistent with the two title fonts (Segoe UI, Segoe MDL2 Assets) now created and mapped at
+first paint, but a single cross-session run cannot separate that from host noise; confirm on the
+reference machine.
 
 ### Dynamic CRT (superseded; not the shipped configuration)
 

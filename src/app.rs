@@ -12,6 +12,7 @@ use crate::window::menus::{AcceleratorTable, MenuBar};
 use crate::window::notification::NotificationCenter;
 use crate::window::status::StatusModel;
 use crate::window::tabs::Tabs;
+use crate::window::titlebar::{PointerState, TitleFonts};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::rc::Rc;
@@ -45,6 +46,9 @@ pub struct App {
     pub(crate) settings: Settings,
     pub(crate) theme: Option<SystemTheme>,
     pub(crate) status: Option<StatusModel>,
+    pub(crate) title_fonts: Option<TitleFonts>,
+    pub(crate) title_pointer: PointerState,
+    pub(crate) dark_frame_applied: bool,
     pub(crate) notifications: NotificationCenter,
     pub(crate) first_input_accepted: bool,
     pub(crate) deferred_open_waiting: bool,
@@ -82,6 +86,9 @@ impl App {
             settings: crate::config::default_settings(),
             theme: None,
             status: None,
+            title_fonts: None,
+            title_pointer: PointerState::default(),
+            dark_frame_applied: false,
             notifications: NotificationCenter::new(),
             first_input_accepted: false,
             deferred_open_waiting: false,

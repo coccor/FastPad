@@ -2,6 +2,9 @@
 // Do not edit by hand.
 
 pub const SC_CP_UTF8: u32 = 65001;
+pub const SC_ELEMENT_CARET_LINE_BACK: u32 = 50;
+pub const SC_ELEMENT_SELECTION_BACK: u32 = 11;
+pub const SC_ELEMENT_SELECTION_INACTIVE_BACK: u32 = 17;
 pub const SC_MOD_DELETETEXT: u32 = 0x2;
 pub const SC_MOD_INSERTTEXT: u32 = 0x1;
 pub const SC_WRAP_NONE: u32 = 0;
@@ -79,11 +82,14 @@ pub const SCI_SEARCHINTARGET: u32 = 2197;
 pub const SCI_SETCARETFORE: u32 = 2069;
 pub const SCI_SETCODEPAGE: u32 = 2037;
 pub const SCI_SETDOCPOINTER: u32 = 2358;
+pub const SCI_SETELEMENTCOLOUR: u32 = 2753;
 pub const SCI_SETFIRSTVISIBLELINE: u32 = 2613;
 pub const SCI_SETILEXER: u32 = 4033;
 pub const SCI_SETMARGINTYPEN: u32 = 2240;
 pub const SCI_SETMARGINWIDTHN: u32 = 2242;
 pub const SCI_SETSAVEPOINT: u32 = 2014;
+pub const SCI_SETSCROLLWIDTH: u32 = 2274;
+pub const SCI_SETSCROLLWIDTHTRACKING: u32 = 2516;
 pub const SCI_SETSEARCHFLAGS: u32 = 2198;
 pub const SCI_SETSEL: u32 = 2160;
 pub const SCI_SETTABWIDTH: u32 = 2036;

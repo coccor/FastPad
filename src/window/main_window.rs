@@ -11,7 +11,9 @@ use crate::window::menus::{self, MenuBar};
 use crate::window::messages::{
     DeferredAction, classify_deferred_message, completed_milestone, deferred_start_message,
 };
+use crate::window::palette::Palette;
 use crate::window::tabs::CloseReviewKey;
+use crate::window::titlebar::{HitTarget, PointerState, TitleFontHandles};
 #[cfg(test)]
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -19,20 +21,22 @@ use std::ptr::NonNull;
 use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
-use windows_sys::Win32::UI::Controls::NMHDR;
+use windows_sys::Win32::UI::Controls::{NMHDR, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetLastInputInfo, LASTINPUTINFO, SetFocus, VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetWindowLongPtrW, IDCANCEL, IDNO, IDYES, KillTimer, MB_ICONWARNING, MB_YESNOCANCEL,
+    GetWindowLongPtrW, IDCANCEL, IDNO, IDYES, IsZoomed, KillTimer, MB_ICONWARNING, MB_YESNOCANCEL,
     MessageBoxW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW,
-    SC_KEYMENU, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+    SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
     WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NOTIFY, WM_PAINT,
-    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE,
+    WM_NCMOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(not(test))]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
@@ -100,10 +104,21 @@ impl MainWindowClass {
             )
         };
         if hwnd.is_null() {
-            Err(last_error())
-        } else {
-            Ok(hwnd)
+            return Err(last_error());
         }
+        // Re-runs WM_NCCALCSIZE so the initial frame drops the native caption band.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        Ok(hwnd)
     }
 }
 
@@ -139,6 +154,7 @@ unsafe extern "system" fn main_window_proc(
         WM_NCCREATE => unsafe { on_nc_create(hwnd, lparam) },
         WM_SIZE => {
             layout_editor_and_find_bar(hwnd);
+            invalidate_title_strip(hwnd);
             0
         }
         WM_SETFOCUS => {
@@ -178,8 +194,19 @@ unsafe extern "system" fn main_window_proc(
                 let (titles, active) = tab_snapshot(hwnd);
                 let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
                 let status = current_status_text(hwnd);
+                let (palette, fonts, pointer) = title_chrome(hwnd);
                 unsafe {
-                    crate::window::titlebar::paint(hwnd, &title_refs, active, status.as_deref())
+                    crate::window::titlebar::paint(
+                        hwnd,
+                        &crate::window::titlebar::TitlePaint {
+                            titles: &title_refs,
+                            active,
+                            status: status.as_deref(),
+                            palette,
+                            fonts,
+                            pointer,
+                        },
+                    )
                 };
                 0
             };
@@ -204,7 +231,56 @@ unsafe extern "system" fn main_window_proc(
         WM_GETMINMAXINFO => unsafe {
             crate::window::titlebar::constrain_maximized_window(hwnd, lparam)
         },
+        WM_MOUSEMOVE => {
+            crate::window::titlebar::track_pointer_leave(hwnd, false);
+            let target = client_title_target(hwnd, lparam);
+            update_title_pointer(hwnd, |pointer| pointer.hover(target));
+            0
+        }
+        WM_MOUSELEAVE => {
+            update_title_pointer(hwnd, |pointer| pointer.leave(false));
+            0
+        }
+        WM_NCMOUSEMOVE => {
+            let target = HitTarget::from_nonclient_code(wparam);
+            if target.is_some() {
+                crate::window::titlebar::track_pointer_leave(hwnd, true);
+            }
+            update_title_pointer(hwnd, |pointer| pointer.hover(target));
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        WM_NCMOUSELEAVE => {
+            update_title_pointer(hwnd, |pointer| pointer.leave(true));
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        WM_LBUTTONDOWN => {
+            let target = client_title_target(hwnd, lparam);
+            update_title_pointer(hwnd, |pointer| pointer.hover(target).press(target));
+            0
+        }
+        // DefWindowProc would run its own classic caption-button tracking loop over our strip.
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK
+            if HitTarget::from_nonclient_code(wparam).is_some() =>
+        {
+            let target = HitTarget::from_nonclient_code(wparam);
+            update_title_pointer(hwnd, |pointer| pointer.hover(target).press(target));
+            0
+        }
+        WM_NCLBUTTONUP if HitTarget::from_nonclient_code(wparam).is_some() => {
+            let target = HitTarget::from_nonclient_code(wparam);
+            let mut activated = None;
+            update_title_pointer(hwnd, |pointer| {
+                let (next, released) = pointer.release(target);
+                activated = released;
+                next
+            });
+            if let Some(target) = activated {
+                run_caption_button(hwnd, target);
+            }
+            0
+        }
         WM_LBUTTONUP => {
+            update_title_pointer(hwnd, |pointer| pointer.release(None).0);
             let point = crate::window::titlebar::Point::new(
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
@@ -259,6 +335,9 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_DPICHANGED => {
             let suggested = unsafe { &*(lparam as *const RECT) };
+            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                unsafe { app.as_mut() }.title_fonts = None;
+            }
             unsafe {
                 SetWindowPos(
                     hwnd,
@@ -993,32 +1072,95 @@ fn effective_dark(hwnd: HWND) -> bool {
 }
 
 fn apply_theme(hwnd: HWND) {
-    let Some((editor, language, high_contrast)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
-        let app = unsafe { app.as_ref() };
-        Some((
-            app.editor.clone()?,
-            app.tabs.active().language,
-            app.theme.is_some_and(|theme| theme.high_contrast),
-        ))
-    }) else {
+    let Some((editor, language, palette, frame_change)) =
+        (unsafe { app_ptr(hwnd) }).and_then(|mut app| {
+            let app = unsafe { app.as_mut() };
+            let editor = app.editor.clone()?;
+            let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
+            let frame_change = app.dark_frame_applied != palette.dark_frame;
+            app.dark_frame_applied = palette.dark_frame;
+            Some((editor, app.tabs.active().language, palette, frame_change))
+        })
+    else {
         return;
     };
-    let (foreground, background) = base_colors(effective_dark(hwnd), high_contrast);
-    let _ = editor.set_base_colors(foreground, background);
+    let _ = editor.set_base_colors(palette.editor_foreground, palette.editor_background);
+    let _ = editor.set_chrome_colors(
+        palette.selection_background,
+        palette.inactive_selection_background,
+        palette.caret_line_background,
+    );
+    if frame_change {
+        crate::window::titlebar::apply_frame_theme(hwnd, editor.hwnd(), palette.dark_frame);
+    }
     if language != crate::document::Language::PlainText {
         apply_language(hwnd, language);
     }
 }
 
-fn base_colors(dark: bool, high_contrast: bool) -> (u32, u32) {
-    use crate::languages::rgb;
-    use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor};
-    if high_contrast {
-        unsafe { (GetSysColor(COLOR_WINDOWTEXT), GetSysColor(COLOR_WINDOW)) }
-    } else if dark {
-        (rgb(212, 212, 212), rgb(30, 30, 30))
-    } else {
-        (rgb(0, 0, 0), rgb(255, 255, 255))
+/// Copies what a title-strip paint needs out of App, creating the per-DPI fonts on first use.
+/// Before chrome is built the palette is the neutral compiled one (no theme queries).
+fn title_chrome(hwnd: HWND) -> (Palette, TitleFontHandles, PointerState) {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    unsafe { app_ptr(hwnd) }
+        .map(|mut app| {
+            let app = unsafe { app.as_mut() };
+            if app
+                .title_fonts
+                .as_ref()
+                .is_none_or(|fonts| fonts.dpi() != dpi)
+            {
+                app.title_fonts = Some(crate::window::titlebar::TitleFonts::create(dpi));
+            }
+            (
+                Palette::for_cached_theme(app.theme, app.settings.theme),
+                app.title_fonts
+                    .as_ref()
+                    .map(crate::window::titlebar::TitleFonts::handles)
+                    .unwrap_or_default(),
+                app.title_pointer,
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                Palette::neutral(),
+                TitleFontHandles::default(),
+                PointerState::default(),
+            )
+        })
+}
+
+fn client_title_target(hwnd: HWND, lparam: LPARAM) -> Option<HitTarget> {
+    let point = crate::window::titlebar::Point::new(
+        (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    );
+    Some(crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd)).hit_test(point))
+}
+
+fn update_title_pointer(hwnd: HWND, update: impl FnOnce(PointerState) -> PointerState) {
+    let changed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let next = update(app.title_pointer);
+        let changed = next != app.title_pointer;
+        app.title_pointer = next;
+        changed
+    });
+    if changed {
+        crate::window::titlebar::invalidate_strip(hwnd, tab_count(hwnd));
+    }
+}
+
+fn run_caption_button(hwnd: HWND, target: HitTarget) {
+    let command = match target {
+        HitTarget::Minimize => SC_MINIMIZE,
+        HitTarget::Maximize if unsafe { IsZoomed(hwnd) } != 0 => SC_RESTORE,
+        HitTarget::Maximize => SC_MAXIMIZE,
+        HitTarget::Close => SC_CLOSE,
+        _ => return,
+    };
+    unsafe {
+        SendMessageW(hwnd, WM_SYSCOMMAND, command as usize, 0);
     }
 }
 

@@ -5,6 +5,7 @@ mod main_window;
 pub(crate) mod menus;
 mod messages;
 pub mod notification;
+pub mod palette;
 pub mod status;
 pub mod tabs;
 pub mod titlebar;

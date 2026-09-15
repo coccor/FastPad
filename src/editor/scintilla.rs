@@ -10,7 +10,9 @@ use crate::editor::scintilla_constants::{
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{
-    SC_WRAP_NONE, SC_WRAP_WORD, SCI_SETCARETFORE, SCI_SETTABWIDTH, SCI_SETWRAPMODE,
+    SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
+    SC_WRAP_NONE, SC_WRAP_WORD, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR, SCI_SETMARGINWIDTHN,
+    SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING, SCI_SETTABWIDTH, SCI_SETWRAPMODE,
     SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT,
 };
 use crate::{FastPadError, Result};
@@ -102,6 +104,7 @@ impl Editor {
         editor
             .endpoint
             .send_direct_checked(SCI_SETCODEPAGE, SC_CP_UTF8 as usize, 0)?;
+        editor.apply_chrome_defaults()?;
         Ok(editor)
     }
 
@@ -596,6 +599,63 @@ impl Editor {
         ))
     }
 
+    /// Hides Scintilla's default margins and lets the horizontal scrollbar follow the widest line
+    /// instead of the default 2000 px scroll width.
+    #[cfg(windows)]
+    pub fn apply_chrome_defaults(&self) -> Result<()> {
+        for margin in 0..=2 {
+            self.endpoint
+                .send_direct_checked(SCI_SETMARGINWIDTHN, margin, 0)?;
+        }
+        self.endpoint
+            .send_direct_checked(SCI_SETSCROLLWIDTH, 1, 0)?;
+        self.endpoint
+            .send_direct_checked(SCI_SETSCROLLWIDTHTRACKING, 1, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn apply_chrome_defaults(&self) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Sets the selection (focused and unfocused) and caret-line backgrounds as opaque Scintilla 5
+    /// element colours.
+    #[cfg(windows)]
+    pub fn set_chrome_colors(
+        &self,
+        selection: u32,
+        inactive_selection: u32,
+        caret_line: u32,
+    ) -> Result<()> {
+        for (element, colour) in [
+            (SC_ELEMENT_SELECTION_BACK, selection),
+            (SC_ELEMENT_SELECTION_INACTIVE_BACK, inactive_selection),
+            (SC_ELEMENT_CARET_LINE_BACK, caret_line),
+        ] {
+            self.endpoint.send_direct_checked(
+                SCI_SETELEMENTCOLOUR,
+                element as usize,
+                ((colour & 0x00FF_FFFF) | 0xFF00_0000) as isize,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_chrome_colors(
+        &self,
+        _selection: u32,
+        _inactive_selection: u32,
+        _caret_line: u32,
+    ) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
     /// Sets one lexer style's foreground, background, bold flag, and font face. `bold` is always
     /// sent explicitly (both true and false) so a previous language's bold flag cannot leak
     /// through onto this style number.
@@ -968,9 +1028,11 @@ unsafe extern "C" fn inert_direct_call(
 mod tests {
     use super::{Editor, EditorDocument};
     use crate::editor::scintilla_constants::{
+        SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
         SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY, SCI_CUT,
         SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_PASTE,
-        SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETILEXER,
+        SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETELEMENTCOLOUR,
+        SCI_SETILEXER, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING,
         SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE, SCI_STYLECLEARALL, SCI_STYLESETBACK,
         SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
     };
@@ -1290,6 +1352,60 @@ mod tests {
     }
 
     #[test]
+    fn chrome_defaults_hide_margins_and_track_scroll_width() {
+        // Break caught: Scintilla's default 16 px symbol margin and 2000 px scroll width show an
+        // unthemed grey gutter and a permanent horizontal scrollbar.
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.apply_chrome_defaults().unwrap();
+
+        assert_eq!(
+            harness.calls(),
+            vec![
+                (SCI_SETMARGINWIDTHN, 0, 0),
+                (SCI_SETMARGINWIDTHN, 1, 0),
+                (SCI_SETMARGINWIDTHN, 2, 0),
+                (SCI_SETSCROLLWIDTH, 1, 0),
+                (SCI_SETSCROLLWIDTHTRACKING, 1, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn chrome_colors_are_sent_as_opaque_element_colours() {
+        // Break caught: Scintilla 5 element colours carry alpha in the top byte; a bare COLORREF has
+        // alpha 0 and would leave the selection and caret line invisible.
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor
+            .set_chrome_colors(0x0078_4F26, 0x0041_3D3A, 0x0028_2828)
+            .unwrap();
+
+        assert_eq!(
+            harness.calls(),
+            vec![
+                (
+                    SCI_SETELEMENTCOLOUR,
+                    SC_ELEMENT_SELECTION_BACK as usize,
+                    0xFF78_4F26_u32 as isize
+                ),
+                (
+                    SCI_SETELEMENTCOLOUR,
+                    SC_ELEMENT_SELECTION_INACTIVE_BACK as usize,
+                    0xFF41_3D3A_u32 as isize
+                ),
+                (
+                    SCI_SETELEMENTCOLOUR,
+                    SC_ELEMENT_CARET_LINE_BACK as usize,
+                    0xFF28_2828_u32 as isize
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn replace_all_with_an_empty_query_does_nothing() {
         let harness = TestDirectHarness::new();
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
@@ -1314,6 +1430,7 @@ mod tests {
         lexer_calls: Vec<isize>,
         style_calls: Vec<(u32, usize, isize)>,
         font_calls: Vec<(usize, Vec<u8>)>,
+        calls: Vec<(u32, usize, isize)>,
     }
 
     struct TestDirectHarness {
@@ -1378,6 +1495,10 @@ mod tests {
         fn font_calls(&self) -> Vec<(usize, Vec<u8>)> {
             self.state.lock().unwrap().font_calls.clone()
         }
+
+        fn calls(&self) -> Vec<(u32, usize, isize)> {
+            self.state.lock().unwrap().calls.clone()
+        }
     }
 
     unsafe extern "C" fn test_direct(
@@ -1389,6 +1510,7 @@ mod tests {
         let shared = unsafe { &*(direct_ptr as *const Mutex<TestDirectState>) };
         let mut state = shared.lock().unwrap();
         state.messages.push(message);
+        state.calls.push((message, wparam, lparam));
         match message {
             SCI_SETTARGETRANGE => {
                 state.target_range = Some((wparam, lparam));

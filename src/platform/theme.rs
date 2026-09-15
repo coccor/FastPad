@@ -9,6 +9,9 @@
 //! `SystemTheme` is new: a combined dark/high-contrast snapshot used by the deferred chrome build
 //! (`WM_FASTPAD_BUILD_CHROME`) and its live-update hooks (`WM_SETTINGCHANGE`, `WM_THEMECHANGED`,
 //! `WM_DWMCOLORIZATIONCOLORCHANGED`) — the only places new theme queries are added by this task.
+//!
+//! This is FastPad's only high-contrast detector: painting reads the cached `App::theme` through
+//! `window::palette` instead of querying `SPI_GETHIGHCONTRAST` itself.
 
 use crate::config::ThemePreference;
 

@@ -4,7 +4,7 @@ mod support;
 
 use fastpad::platform::wide_null;
 use fastpad::window::commands::CommandId;
-use fastpad::window::titlebar::{Size, TitleBarLayout};
+use fastpad::window::titlebar::{Point, Size, TitleBarLayout};
 use std::error::Error;
 use std::ffi::c_void;
 use std::time::Duration;
@@ -27,10 +27,11 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F10, VK_MENU, VK_SPACE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetClientRect, GetMenu, GetMenuItemCount, GetWindowRect, HTLEFT, HTMAXBUTTON,
-    IsWindow, MINMAXINFO, OBJID_CLIENT, PostMessageW, STATE_SYSTEM_SELECTED, SendMessageW,
-    WM_CANCELMODE, WM_COMMAND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_NCHITTEST, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    FindWindowExW, GetClientRect, GetMenu, GetMenuItemCount, GetWindowRect, HTCLOSE, HTLEFT,
+    HTMAXBUTTON, HTMINBUTTON, HTTOP, IsIconic, IsWindow, IsZoomed, MINMAXINFO, OBJID_CLIENT,
+    PostMessageW, STATE_SYSTEM_SELECTED, SW_RESTORE, SendMessageW, ShowWindow, WM_CANCELMODE,
+    WM_COMMAND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -299,6 +300,160 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
     );
 
     process.close()
+}
+
+#[test]
+fn title_strip_owns_the_top_edge_and_its_caption_buttons_still_work() -> TestResult<()> {
+    let _dpi = DpiContext::per_monitor_v2()?;
+    let mut process = FastPadProcess::spawn(["--new-window"])?;
+    let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
+    assert_eq!(
+        unsafe { IsZoomed(hwnd) },
+        0,
+        "test expects a restored window"
+    );
+
+    let (window, origin, layout) = frame_geometry(hwnd)?;
+    assert_eq!(
+        origin.y, window.top,
+        "the client area must start at the window's top edge, with no native caption band above \
+         the strip: window=({}, {}, {}, {}), client_origin=({}, {})",
+        window.left, window.top, window.right, window.bottom, origin.x, origin.y
+    );
+
+    // The band where Windows used to paint its own caption buttons now resizes or hits ours.
+    let old_band_y = 1;
+    assert_eq!(
+        hit_test(
+            hwnd,
+            origin,
+            Point::new(layout.tab(0).center().x, old_band_y)
+        ),
+        HTTOP as isize
+    );
+    assert_eq!(
+        hit_test(
+            hwnd,
+            origin,
+            Point::new(layout.maximize.center().x, old_band_y)
+        ),
+        HTMAXBUTTON as isize
+    );
+    assert_eq!(
+        hit_test(
+            hwnd,
+            origin,
+            Point::new(layout.close.center().x, old_band_y)
+        ),
+        HTCLOSE as isize
+    );
+    assert_eq!(
+        hit_test(hwnd, origin, layout.minimize.center()),
+        HTMINBUTTON as isize
+    );
+
+    click_caption_button(hwnd, HTMAXBUTTON, false);
+    wait_until("maximize", Duration::from_secs(2), || unsafe {
+        IsZoomed(hwnd) != 0
+    })?;
+    let (_, origin, _) = frame_geometry(hwnd)?;
+    let mut client = RECT::default();
+    assert_ne!(unsafe { GetClientRect(hwnd, &mut client) }, 0);
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut monitor_info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    assert_ne!(unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }, 0);
+    let work = monitor_info.rcWork;
+    assert_eq!(
+        (
+            origin.x,
+            origin.y,
+            origin.x + client.right,
+            origin.y + client.bottom
+        ),
+        (work.left, work.top, work.right, work.bottom),
+        "maximized content must fill the work area without being clipped off-screen"
+    );
+
+    click_caption_button(hwnd, HTMAXBUTTON, false);
+    wait_until("restore", Duration::from_secs(2), || unsafe {
+        IsZoomed(hwnd) == 0
+    })?;
+
+    click_caption_button(hwnd, HTMINBUTTON, false);
+    wait_until("minimize", Duration::from_secs(2), || unsafe {
+        IsIconic(hwnd) != 0
+    })?;
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+    wait_until(
+        "restore from minimized",
+        Duration::from_secs(2),
+        || unsafe { IsIconic(hwnd) == 0 },
+    )?;
+
+    let process_id = process.id();
+    click_caption_button(hwnd, HTCLOSE, true);
+    support::process::wait_for_process_exit(process_id, Duration::from_secs(3))?;
+    drop(process);
+    Ok(())
+}
+
+fn frame_geometry(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+) -> TestResult<(RECT, windows_sys::Win32::Foundation::POINT, TitleBarLayout)> {
+    let mut window = RECT::default();
+    let mut client = RECT::default();
+    let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    if unsafe { GetWindowRect(hwnd, &mut window) } == 0
+        || unsafe { GetClientRect(hwnd, &mut client) } == 0
+        || unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut origin) } == 0
+    {
+        return Err("could not read the FastPad window geometry".into());
+    }
+    let layout = TitleBarLayout::calculate(
+        Size::new(client.right - client.left, client.bottom - client.top),
+        unsafe { GetDpiForWindow(hwnd) },
+        1,
+    );
+    Ok((window, origin, layout))
+}
+
+fn hit_test(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    origin: windows_sys::Win32::Foundation::POINT,
+    client_point: Point,
+) -> isize {
+    let x = origin.x + client_point.x;
+    let y = origin.y + client_point.y;
+    let packed = (x as u16 as u32 | ((y as u16 as u32) << 16)) as isize;
+    unsafe { SendMessageW(hwnd, WM_NCHITTEST, 0, packed) }
+}
+
+fn click_caption_button(hwnd: windows_sys::Win32::Foundation::HWND, code: u32, post: bool) {
+    for message in [WM_NCLBUTTONDOWN, WM_NCLBUTTONUP] {
+        unsafe {
+            if post {
+                PostMessageW(hwnd, message, code as usize, 0);
+            } else {
+                SendMessageW(hwnd, message, code as usize, 0);
+            }
+        }
+    }
+}
+
+fn wait_until(what: &str, timeout: Duration, condition: impl Fn() -> bool) -> TestResult<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while !condition() {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {what}").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 struct DpiContext(DPI_AWARENESS_CONTEXT);
