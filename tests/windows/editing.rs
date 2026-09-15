@@ -11,7 +11,7 @@ use support::win32::scintilla_text;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
-    VIRTUAL_KEY, VK_ESCAPE, VK_RETURN, VK_SHIFT,
+    VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GetGUIThreadInfo, SendMessageW, WM_CHAR, WM_COMMAND, WM_KEYDOWN,
@@ -200,6 +200,29 @@ fn enter_in_replace_field_replaces_the_current_match_and_advances() {
     wait_text(editor, "dog cat");
     // Advanced to (and selected) the remaining match.
     assert_eq!(selection(editor), (4, 7));
+}
+
+#[test]
+fn unbound_control_characters_are_ignored_but_plain_tab_and_return_still_insert() {
+    // Break caught: an unbound Ctrl combination's unconsumed WM_KEYDOWN lets TranslateMessage's C0
+    // control-character WM_CHAR reach Scintilla, which renders it as a visible control-character
+    // block (e.g. Ctrl+Q's DC1) instead of doing nothing, while real Tab/CR keystrokes (no Ctrl)
+    // must keep inserting normally.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let editor = main.editor;
+
+    send_input(VK_CONTROL, 0);
+    unsafe {
+        SendMessageW(editor, WM_CHAR, 0x11, 0); // Ctrl+Q -> DC1
+        SendMessageW(editor, WM_CHAR, 0x01, 0); // Ctrl+A -> SOH
+        SendMessageW(editor, WM_CHAR, 0x7F, 0); // DEL
+    }
+    send_input(VK_CONTROL, KEYEVENTF_KEYUP);
+    assert_eq!(scintilla_text(editor).unwrap(), "");
+
+    type_text(editor, "a\tb\r");
+    assert_eq!(scintilla_text(editor).unwrap(), "a\tb\r");
 }
 
 struct TestMain {

@@ -29,10 +29,12 @@ use std::mem::transmute;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
 #[cfg(windows)]
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+#[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, SendMessageW, WM_NCDESTROY, WS_CHILD,
+    CreateWindowExW, DestroyWindow, GetClientRect, SendMessageW, WM_CHAR, WM_NCDESTROY, WS_CHILD,
     WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -1025,6 +1027,12 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
     ref_data: usize,
 ) -> isize {
     let endpoint = unsafe { &*(ref_data as *const EditorEndpoint) };
+    if message == WM_CHAR {
+        let ctrl_down = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
+        if crate::editor::input_filter::should_ignore_char(wparam as u16, ctrl_down) {
+            return 0;
+        }
+    }
     if message == WM_NCDESTROY {
         endpoint.destroyed.store(true, Ordering::Release);
         unsafe {
