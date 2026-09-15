@@ -1584,6 +1584,53 @@ git commit -m "build: add FastPad release and acceptance gates"
 
 ---
 
+### Task 19: Title shell and theme polish
+
+Added 2026-09-16 at the owner's request after manual review of the running build. Owner-approved design: FastPad owns the whole top edge and custom-draws theme-matched caption buttons; tabs, editor margin, selection, and scrollbars follow the theme.
+
+**Files:**
+- Modify: `src/window/titlebar.rs`
+- Create: `src/window/palette.rs`
+- Modify: `src/window/main_window.rs`
+- Modify: `src/editor/scintilla.rs`
+- Modify: `tools/generate-scintilla-constants.ps1` (regenerate `src/editor/scintilla_constants.rs`; never hand-edit)
+- Modify: `src/platform/theme.rs`
+- Test: `src/window/titlebar.rs`, `src/window/palette.rs`
+- Test: `tests/windows/titlebar.rs`
+
+**Interfaces:**
+- Consumes: `App::theme` (`SystemTheme`), `Settings::theme`, `effective_dark`, `WM_FASTPAD_BUILD_CHROME` and the theme-change messages, `TitleBarLayout`, `Editor` style APIs
+- Produces: `Palette`, per-DPI cached title fonts, hover/pressed caption state, themed editor chrome
+
+- [ ] **Step 1: Write failing layout, hit-test, and palette tests**
+
+Unit tests: caption buttons occupy the right edge with no native-caption gap (layout top is 0 and the window keeps no DWM caption band); `hit_test` maps the maximize rect to `HitTarget::Maximize` (reported as `HTMAXBUTTON` for snap layouts) and the top resize band of a restored window to a resize target; `Palette::for_theme(dark, high_contrast)` returns distinct dark/light palettes, high contrast uses system colors, and the active tab background equals the editor background. Integration: the title-bar target asserts exactly one set of caption buttons (no native caption buttons visible above the strip: the client area starts at the window's top border) and that minimize/maximize/close still work.
+
+- [ ] **Step 2: Remove the native caption band and draw caption buttons**
+
+`WM_NCCALCSIZE` keeps the proposed top edge (no reserved frame strip) while preserving left/right/bottom resize borders and correct maximized insets; call `SetWindowPos(..., SWP_FRAMECHANGED)` once after creation. Top-edge resizing of a restored window comes from hit testing a DPI-scaled band. Paint minimize/maximize/restore/close with Segoe MDL2 Assets glyphs (`E921`, `E922`/`E923`, `E8BB`), hover and pressed states via `WM_MOUSEMOVE`/`WM_MOUSELEAVE` (`TrackMouseEvent`) and non-client mouse messages, close hover red with white glyph. Keep DWM-first hit testing and `HTMAXBUTTON` so Windows 11 snap layouts remain available.
+
+- [ ] **Step 3: Apply the palette to tabs and chrome**
+
+`src/window/palette.rs` owns dark, light, and high-contrast colors. The first paint uses the neutral compiled palette; the theme palette applies only after `WM_FASTPAD_BUILD_CHROME` and on theme changes. Tab text uses Segoe UI at the window DPI; fonts are created lazily, cached, and recreated on `WM_DPICHANGED`. Active tab background equals the editor background; inactive tabs, `+`, `⋯`, and tab close glyphs are muted until hovered. Double-buffer the strip paint to avoid flicker.
+
+- [ ] **Step 4: Theme the editor chrome**
+
+Disable Scintilla's default symbol margin (width 0), set `SCI_SETSCROLLWIDTH(1)` with `SCI_SETSCROLLWIDTHTRACKING(1)` so the horizontal scrollbar appears only when needed, and apply theme selection and caret-line colors. In dark mode apply `DWMWA_USE_IMMERSIVE_DARK_MODE` to the frame and the `DarkMode_Explorer` window theme to the editor scrollbars; failures leave the light appearance without error.
+
+- [ ] **Step 5: Verify**
+
+Run on Windows: `cargo test --lib -- window::titlebar window::palette --test-threads=1; cargo test --test titlebar -- --test-threads=1`, strict Clippy, and one 30-run `fastpad-bench` comparison against the pre-task `release` numbers recorded in `benchmarks/release-profile.md`. Capture before/after screenshots for owner review.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/window src/editor src/platform/theme.rs tools/generate-scintilla-constants.ps1 tests/windows/titlebar.rs benchmarks/release-profile.md
+git commit -m "feat: polish title shell and theme"
+```
+
+---
+
 ## Pinned Source References
 
 - [`windows-sys` 0.61.2](https://docs.rs/crate/windows-sys/0.61.2)
