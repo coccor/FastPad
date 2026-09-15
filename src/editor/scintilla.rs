@@ -8,6 +8,11 @@ use crate::editor::scintilla_constants::{
     SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION, SCI_STYLECLEARALL, SCI_STYLESETBACK,
     SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
 };
+#[cfg(windows)]
+use crate::editor::scintilla_constants::{
+    SC_WRAP_NONE, SC_WRAP_WORD, SCI_SETCARETFORE, SCI_SETTABWIDTH, SCI_SETWRAPMODE,
+    SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT,
+};
 use crate::{FastPadError, Result};
 use std::ffi::CString;
 use std::ops::Range;
@@ -518,6 +523,74 @@ impl Editor {
 
     #[cfg(not(windows))]
     pub fn clear_all_styles(&self) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Applies user view settings to every style up to `STYLE_DEFAULT` without touching text,
+    /// selection, or colors.
+    #[cfg(windows)]
+    pub fn apply_view_settings(
+        &self,
+        face: &str,
+        size_points: u16,
+        tab_width: u8,
+        word_wrap: bool,
+    ) -> Result<()> {
+        let face = CString::new(face).map_err(|_| {
+            FastPadError::Invariant("Scintilla font face may not contain NUL bytes")
+        })?;
+        for style in 0..=STYLE_DEFAULT as usize {
+            self.endpoint
+                .send_direct_checked(SCI_STYLESETFONT, style, face.as_ptr() as isize)?;
+            self.endpoint.send_direct_checked(
+                SCI_STYLESETSIZEFRACTIONAL,
+                style,
+                size_points as isize * 100,
+            )?;
+        }
+        self.endpoint
+            .send_direct_checked(SCI_SETTABWIDTH, usize::from(tab_width), 0)?;
+        let wrap = if word_wrap {
+            SC_WRAP_WORD
+        } else {
+            SC_WRAP_NONE
+        };
+        self.endpoint
+            .send_direct_checked(SCI_SETWRAPMODE, wrap as usize, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn apply_view_settings(
+        &self,
+        _face: &str,
+        _size_points: u16,
+        _tab_width: u8,
+        _word_wrap: bool,
+    ) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Sets plain-text foreground/background on every style up to `STYLE_DEFAULT`, plus the caret.
+    #[cfg(windows)]
+    pub fn set_base_colors(&self, foreground: u32, background: u32) -> Result<()> {
+        for style in 0..=STYLE_DEFAULT as usize {
+            self.endpoint
+                .send_direct_checked(SCI_STYLESETFORE, style, foreground as isize)?;
+            self.endpoint
+                .send_direct_checked(SCI_STYLESETBACK, style, background as isize)?;
+        }
+        self.endpoint
+            .send_direct_checked(SCI_SETCARETFORE, foreground as usize, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_base_colors(&self, _foreground: u32, _background: u32) -> Result<()> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))

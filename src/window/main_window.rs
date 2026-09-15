@@ -27,10 +27,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IDCANCEL, IDNO, IDYES, MB_ICONWARNING, MB_YESNOCANCEL, MessageBoxW,
     MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_KEYMENU,
     SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, UnregisterClassW, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT,
-    WM_KEYDOWN, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NOTIFY,
-    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP,
+    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(not(test))]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
@@ -169,7 +169,10 @@ unsafe extern "system" fn main_window_proc(
             let paint_title_strip = |hwnd, _, _, _| {
                 let (titles, active) = tab_snapshot(hwnd);
                 let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
-                unsafe { crate::window::titlebar::paint(hwnd, &title_refs, active) };
+                let status = current_status_text(hwnd);
+                unsafe {
+                    crate::window::titlebar::paint(hwnd, &title_refs, active, status.as_deref())
+                };
                 0
             };
             let complete_first_paint = |hwnd| unsafe {
@@ -198,6 +201,10 @@ unsafe extern "system" fn main_window_proc(
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
             );
+            if status_contains(hwnd, point.y) {
+                dismiss_notifications(hwnd);
+                return 0;
+            }
             let layout = crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd));
             match layout.hit_test(point) {
                 crate::window::titlebar::HitTarget::Overflow => {
@@ -258,7 +265,8 @@ unsafe extern "system" fn main_window_proc(
             }
             0
         }
-        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+        WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DWMCOLORIZATIONCOLORCHANGED => {
+            refresh_theme(hwnd);
             unsafe {
                 InvalidateRect(hwnd, std::ptr::null(), 1);
             }
@@ -321,6 +329,15 @@ unsafe fn on_nc_create(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 }
 
 fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
+    // Each of these actions is produced only by its own deferred message with no input pending:
+    // `PostNext(WM_FASTPAD_OPEN_REQUEST)` by `WM_FASTPAD_LOAD_SETTINGS`, `RecordFullyReady` by
+    // `WM_FASTPAD_BUILD_CHROME`. Running them before the milestone keeps the milestone honest.
+    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_OPEN_REQUEST) {
+        load_settings(hwnd);
+    }
+    if action == DeferredAction::RecordFullyReady {
+        build_chrome(hwnd);
+    }
     if let Some(milestone) = completed_milestone(action) {
         unsafe {
             let _ = record_milestone(hwnd, milestone);
@@ -551,13 +568,14 @@ fn layout_editor_and_find_bar(hwnd: HWND) {
         })
         .unwrap_or(0);
     let content_top = title_height + find_bar_height;
+    let status_height = status_bar_height(hwnd);
     unsafe {
         MoveWindow(
             editor_hwnd,
             0,
             content_top,
             width,
-            (rect.bottom - rect.top - content_top).max(0),
+            (rect.bottom - rect.top - content_top - status_height).max(0),
             1,
         );
     }
@@ -808,7 +826,7 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
     else {
         return;
     };
-    let dark = system_uses_dark_mode();
+    let dark = effective_dark(hwnd);
     let result = unsafe { app_ptr(hwnd) }.map(|mut app| {
         let app = unsafe { app.as_mut() };
         if app.language_manager.is_none() {
@@ -824,6 +842,8 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.tabs.set_active_language(language);
             }
+            // Lexer style tables reset every style's font face; restore the configured one.
+            apply_editor_settings(hwnd);
         }
         Some(Err(_)) => {
             show_language_error(
@@ -833,6 +853,170 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
             );
         }
         None => {}
+    }
+}
+
+/// Runs only inside `WM_FASTPAD_LOAD_SETTINGS`: resolves and parses `fastpad.ini`, applies the
+/// editor view settings in place, and queues every rejected line as a non-modal notification.
+fn load_settings(hwnd: HWND) {
+    let (settings, warnings) = crate::config::load();
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        app.settings = settings;
+        for warning in &warnings {
+            app.notifications.push(settings_warning_message(warning));
+        }
+    }
+    apply_editor_settings(hwnd);
+}
+
+fn settings_warning_message(warning: &crate::config::SettingWarning) -> String {
+    if warning.line == 0 {
+        format!("fastpad.ini: {}", warning.message)
+    } else {
+        format!("fastpad.ini line {}: {}", warning.line, warning.message)
+    }
+}
+
+fn apply_editor_settings(hwnd: HWND) {
+    let Some((editor, settings)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        Some((app.editor.clone()?, app.settings.clone()))
+    }) else {
+        return;
+    };
+    let _ = editor.apply_view_settings(
+        &settings.font_face,
+        settings.font_size,
+        settings.tab_width,
+        settings.word_wrap,
+    );
+}
+
+/// Runs only inside `WM_FASTPAD_BUILD_CHROME`: the first system theme query, the status model,
+/// and a repaint that makes any queued notifications visible.
+fn build_chrome(hwnd: HWND) {
+    let theme = crate::platform::theme::SystemTheme::detect();
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        app.theme = Some(theme);
+        app.status = Some(crate::window::status::StatusModel::new(theme));
+    }
+    apply_theme(hwnd);
+    layout_editor_and_find_bar(hwnd);
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+}
+
+/// Re-queries the system theme after chrome exists and restyles the editor only on a real change.
+fn refresh_theme(hwnd: HWND) {
+    let changed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let app = unsafe { app.as_mut() };
+        if app.theme.is_none() {
+            return false;
+        }
+        let theme = crate::platform::theme::SystemTheme::detect();
+        if app.theme == Some(theme) {
+            return false;
+        }
+        app.theme = Some(theme);
+        if let Some(status) = app.status.as_mut() {
+            status.theme = theme;
+        }
+        true
+    });
+    if changed {
+        apply_theme(hwnd);
+    }
+}
+
+/// Before chrome exists there is no cached theme, so the `System` preference falls back to the
+/// one-shot registry read `apply_language` has always used.
+fn effective_dark(hwnd: HWND) -> bool {
+    let (theme, preference) = unsafe { app_ptr(hwnd) }
+        .map(|app| {
+            let app = unsafe { app.as_ref() };
+            (app.theme, app.settings.theme)
+        })
+        .unwrap_or((None, crate::config::ThemePreference::System));
+    match (theme, preference) {
+        (Some(theme), preference) => theme.effective_dark(preference),
+        (None, crate::config::ThemePreference::System) => {
+            crate::platform::theme::system_uses_dark_mode()
+        }
+        (None, crate::config::ThemePreference::Light) => false,
+        (None, crate::config::ThemePreference::Dark) => true,
+    }
+}
+
+fn apply_theme(hwnd: HWND) {
+    let Some((editor, language, high_contrast)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        Some((
+            app.editor.clone()?,
+            app.tabs.active().language,
+            app.theme.is_some_and(|theme| theme.high_contrast),
+        ))
+    }) else {
+        return;
+    };
+    let (foreground, background) = base_colors(effective_dark(hwnd), high_contrast);
+    let _ = editor.set_base_colors(foreground, background);
+    if language != crate::document::Language::PlainText {
+        apply_language(hwnd, language);
+    }
+}
+
+fn base_colors(dark: bool, high_contrast: bool) -> (u32, u32) {
+    use crate::languages::rgb;
+    use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor};
+    if high_contrast {
+        unsafe { (GetSysColor(COLOR_WINDOWTEXT), GetSysColor(COLOR_WINDOW)) }
+    } else if dark {
+        (rgb(212, 212, 212), rgb(30, 30, 30))
+    } else {
+        (rgb(0, 0, 0), rgb(255, 255, 255))
+    }
+}
+
+/// The status line exists only after `WM_FASTPAD_BUILD_CHROME` and only while notifications
+/// are pending.
+fn current_status_text(hwnd: HWND) -> Option<String> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    let app = unsafe { app.as_ref() };
+    app.status.as_ref()?;
+    crate::window::status::status_text(&app.notifications)
+}
+
+fn status_bar_height(hwnd: HWND) -> i32 {
+    if current_status_text(hwnd).is_none() {
+        return 0;
+    }
+    crate::window::status::status_height(unsafe {
+        windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd)
+    })
+}
+
+fn status_contains(hwnd: HWND, y: i32) -> bool {
+    let height = status_bar_height(hwnd);
+    if height == 0 {
+        return false;
+    }
+    let mut rect = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut rect);
+    }
+    y >= rect.bottom - height
+}
+
+fn dismiss_notifications(hwnd: HWND) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.notifications.dismiss_all();
+    }
+    layout_editor_and_find_bar(hwnd);
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 1);
     }
 }
 
@@ -973,39 +1157,6 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_json_valid_count() -> usize {
     JSON_VALID_COUNT.with(|count| count.replace(0))
-}
-
-/// Reads `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme` on
-/// every call (no caching, no `WM_SETTINGCHANGE` reactivity, no live re-styling of already-open
-/// documents — a real theme subsystem is future scope beyond this task). Defaults to light when
-/// the value cannot be read.
-fn system_uses_dark_mode() -> bool {
-    dark_mode_from_apps_use_light_theme(read_apps_use_light_theme())
-}
-
-/// Pure: `1` (or missing/unreadable) means the light theme is in use; `0` means dark.
-fn dark_mode_from_apps_use_light_theme(apps_use_light_theme: Option<u32>) -> bool {
-    apps_use_light_theme == Some(0)
-}
-
-fn read_apps_use_light_theme() -> Option<u32> {
-    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
-    let subkey = wide_null(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
-    let value_name = wide_null("AppsUseLightTheme");
-    let mut data: u32 = 0;
-    let mut size = std::mem::size_of::<u32>() as u32;
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            value_name.as_ptr(),
-            RRF_RT_REG_DWORD,
-            std::ptr::null_mut(),
-            (&raw mut data).cast::<c_void>(),
-            &mut size,
-        )
-    };
-    (status == 0).then_some(data)
 }
 
 // A real MessageBoxW is a blocking, modal native dialog; see `show_save_error`'s longer comment
@@ -1818,9 +1969,9 @@ fn store_app(hwnd: HWND, value: Box<App>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        MainWindowClass, WindowCreateContext, dark_mode_from_apps_use_light_theme, execute_command,
-        handle_paint_with, mark_first_paint_complete, take_deferred_start_pending,
-        take_json_issues, take_json_valid_count, take_language_errors,
+        MainWindowClass, WindowCreateContext, execute_command, handle_paint_with,
+        mark_first_paint_complete, take_deferred_start_pending, take_json_issues,
+        take_json_valid_count, take_language_errors,
     };
     use crate::app::App;
     use crate::document::Language;
@@ -1838,15 +1989,6 @@ mod tests {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, IsWindow, WM_PAINT,
     };
-
-    #[test]
-    fn dark_mode_is_read_from_the_apps_use_light_theme_registry_value() {
-        // Break caught: inverting the 0/1 sense of AppsUseLightTheme would style every JSON/
-        // Markdown document with the wrong theme's colors.
-        assert!(!dark_mode_from_apps_use_light_theme(Some(1)));
-        assert!(dark_mode_from_apps_use_light_theme(Some(0)));
-        assert!(!dark_mode_from_apps_use_light_theme(None));
-    }
 
     #[test]
     fn failed_language_activation_leaves_document_language_unchanged_and_records_a_warning() {

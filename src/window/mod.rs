@@ -4,6 +4,8 @@ pub mod find_bar;
 mod main_window;
 pub(crate) mod menus;
 mod messages;
+pub mod notification;
+pub mod status;
 pub mod tabs;
 pub mod titlebar;
 

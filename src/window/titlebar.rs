@@ -210,7 +210,7 @@ pub(crate) fn layout_for_window(hwnd: HWND, tab_count: usize) -> TitleBarLayout 
     )
 }
 
-pub(crate) unsafe fn paint(hwnd: HWND, titles: &[&str], active: usize) {
+pub(crate) unsafe fn paint(hwnd: HWND, titles: &[&str], active: usize, status: Option<&str>) {
     let mut paint = PAINTSTRUCT::default();
     let dc = unsafe { BeginPaint(hwnd, &mut paint) };
     if dc.is_null() {
@@ -312,6 +312,40 @@ pub(crate) unsafe fn paint(hwnd: HWND, titles: &[&str], active: usize) {
             layout.close,
             DT_SINGLELINE | DT_VCENTER | DT_CENTER,
         );
+    }
+
+    if let Some(status) = status {
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(hwnd, &mut client);
+        }
+        let height = crate::window::status::status_height(unsafe { GetDpiForWindow(hwnd) });
+        let bar = RECT {
+            left: 0,
+            top: client.bottom - height,
+            right: client.right,
+            bottom: client.bottom,
+        };
+        unsafe {
+            FillRect(dc, &bar, GetSysColorBrush(strip_color));
+            SetTextColor(
+                dc,
+                GetSysColor(if high_contrast {
+                    COLOR_WINDOWTEXT
+                } else {
+                    COLOR_BTNTEXT
+                }),
+            );
+            draw_text(
+                dc,
+                status,
+                Rect::new(8, bar.top, (bar.right - 8).max(8), bar.bottom),
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+        }
+    }
+
+    unsafe {
         EndPaint(hwnd, &paint);
     }
 }

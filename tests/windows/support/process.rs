@@ -46,6 +46,28 @@ impl FastPadProcess {
     {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastpad"));
         command.args(args);
+        Self::spawn_command(command)
+    }
+
+    /// Spawns FastPad with `LOCALAPPDATA` redirected so settings never touch the real profile.
+    pub fn spawn_with_local_app_data<I, S>(
+        args: I,
+        local_app_data: &std::path::Path,
+    ) -> TestResult<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastpad"));
+        command.args(args).env("LOCALAPPDATA", local_app_data);
+        Self::spawn_command(command)
+    }
+
+    pub fn has_dialog(&self) -> TestResult<bool> {
+        Ok(find_unsaved_changes_dialog(self.process.id())?.is_some())
+    }
+
+    fn spawn_command(mut command: Command) -> TestResult<Self> {
         let process = command.spawn()?;
 
         unsafe {

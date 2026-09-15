@@ -1,12 +1,16 @@
+use crate::config::Settings;
 use crate::document::{DocumentId, RecoveryId};
 use crate::editor::Editor;
 use crate::languages::LanguageManager;
 use crate::launch::LaunchOptions;
 use crate::perf::{Milestone, StartupMetrics};
+use crate::platform::theme::SystemTheme;
 use crate::window::accessibility::AccessibilityState;
 use crate::window::commands::CommandId;
 use crate::window::find_bar::FindBar;
 use crate::window::menus::{AcceleratorTable, MenuBar};
+use crate::window::notification::NotificationCenter;
+use crate::window::status::StatusModel;
 use crate::window::tabs::Tabs;
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -37,6 +41,10 @@ pub struct App {
     pub(crate) menu_bar: Option<MenuBar>,
     pub(crate) find_bar: Option<FindBar>,
     pub(crate) language_manager: Option<LanguageManager>,
+    pub(crate) settings: Settings,
+    pub(crate) theme: Option<SystemTheme>,
+    pub(crate) status: Option<StatusModel>,
+    pub(crate) notifications: NotificationCenter,
     pub(crate) first_input_accepted: bool,
     pub(crate) deferred_open_waiting: bool,
     pub(crate) launch_open_completed: bool,
@@ -63,6 +71,10 @@ impl App {
             menu_bar: None,
             find_bar: None,
             language_manager: None,
+            settings: crate::config::default_settings(),
+            theme: None,
+            status: None,
+            notifications: NotificationCenter::new(),
             first_input_accepted: false,
             deferred_open_waiting: false,
             launch_open_completed: false,
