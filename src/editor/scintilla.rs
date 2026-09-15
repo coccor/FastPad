@@ -1,8 +1,8 @@
 use crate::editor::scintilla_constants::{
-    SC_CP_UTF8, SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CREATEDOCUMENT, SCI_ENDUNDOACTION,
-    SCI_GETDIRECTFUNCTION, SCI_GETDIRECTPOINTER, SCI_GETDOCPOINTER, SCI_GETTEXT, SCI_GETTEXTLENGTH,
-    SCI_RELEASEDOCUMENT, SCI_SEARCHINTARGET, SCI_SETCODEPAGE, SCI_SETDOCPOINTER, SCI_SETSAVEPOINT,
-    SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE, SCI_SETTEXT,
+    SC_CP_UTF8, SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CREATEDOCUMENT, SCI_EMPTYUNDOBUFFER,
+    SCI_ENDUNDOACTION, SCI_GETDIRECTFUNCTION, SCI_GETDIRECTPOINTER, SCI_GETDOCPOINTER, SCI_GETTEXT,
+    SCI_GETTEXTLENGTH, SCI_RELEASEDOCUMENT, SCI_SEARCHINTARGET, SCI_SETCODEPAGE, SCI_SETDOCPOINTER,
+    SCI_SETSAVEPOINT, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION,
 };
 use crate::{FastPadError, Result};
 use std::ffi::CString;
@@ -252,6 +252,21 @@ impl Editor {
 
     pub fn set_save_point(&self) {
         let _ = self.endpoint.send_direct_if_alive(SCI_SETSAVEPOINT, 0, 0);
+    }
+
+    pub(crate) fn populate_clean(&self, text: &str) -> Result<()> {
+        self.endpoint
+            .send_direct_checked(SCI_SETUNDOCOLLECTION, 0, 0)?;
+        let result = self.set_text(text);
+        let clear = self.endpoint.send_direct_checked(SCI_EMPTYUNDOBUFFER, 0, 0);
+        let enable = self
+            .endpoint
+            .send_direct_checked(SCI_SETUNDOCOLLECTION, 1, 0);
+        result?;
+        clear?;
+        enable?;
+        self.endpoint.send_direct_checked(SCI_SETSAVEPOINT, 0, 0)?;
+        Ok(())
     }
 
     pub fn begin_undo_action(&self) {

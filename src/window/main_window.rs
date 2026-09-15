@@ -160,6 +160,9 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_CLOSE => {
+            if file_population_active(hwnd) {
+                return 0;
+            }
             if review_dirty_documents(hwnd) {
                 clear_documents_for_shutdown(hwnd);
                 unsafe {
@@ -284,6 +287,9 @@ unsafe extern "system" fn main_window_proc(
             result
         }
         _ => {
+            if message == crate::window::WM_FASTPAD_OPEN_REQUEST && !input_pending() {
+                return handle_open_request(hwnd);
+            }
             if let Some(action) = classify_deferred_message(message, input_pending()) {
                 return handle_deferred(hwnd, action);
             }
@@ -453,6 +459,7 @@ where
         install_editor(hwnd, editor, document)?;
         record_milestone(hwnd, Milestone::EditorCreated)?;
     }
+    install_open_input_hook(hwnd, editor_hwnd, identity.clone())?;
     Ok(editor_hwnd)
 }
 
@@ -533,6 +540,9 @@ fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize) {
 }
 
 fn execute_command(hwnd: HWND, command: CommandId) {
+    if file_population_active(hwnd) {
+        return;
+    }
     match command {
         CommandId::New => {
             let _ = create_new_document(hwnd);
@@ -544,6 +554,211 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             }
         }
     }
+}
+
+fn file_population_active(hwnd: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.populating_file)
+}
+
+fn handle_open_request(hwnd: HWND) -> LRESULT {
+    let request = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        if app.launch_open_completed {
+            return None;
+        }
+        if matches!(app.launch.request, crate::launch::LaunchRequest::Open(_))
+            && !app.first_input_accepted
+        {
+            app.deferred_open_waiting = true;
+            return None;
+        }
+        app.launch_open_completed = true;
+        app.deferred_open_waiting = false;
+        Some(app.launch.request.clone())
+    });
+    let Some(request) = request else {
+        return 0;
+    };
+    match request {
+        crate::launch::LaunchRequest::Open(path) => {
+            let _ = App::open_path(hwnd, std::path::Path::new(&path));
+        }
+        crate::launch::LaunchRequest::New => unsafe {
+            let _ = record_milestone(hwnd, Milestone::FileLoaded);
+        },
+    }
+    if unsafe { window_identity(hwnd) }.is_some_and(|identity| identity.is_live_for(hwnd)) {
+        unsafe {
+            PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
+        }
+    }
+    0
+}
+
+pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
+    let identity = unsafe { window_identity(hwnd) }.ok_or(crate::FastPadError::Invariant(
+        "main window app state was not available",
+    ))?;
+    if file_population_active(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "file population is already active",
+        ));
+    }
+    let existing = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        app.tabs
+            .find_path(path)
+            .map(|id| (id, app.tabs.view().snapshot().revision))
+    });
+    if let Some((id, revision)) = existing {
+        return if activate_document(hwnd, id, revision) {
+            Ok(())
+        } else {
+            Err(crate::FastPadError::Invariant(
+                "existing file could not be activated",
+            ))
+        };
+    }
+
+    // All fallible disk/decode/text validation occurs before touching active state.
+    let loaded = crate::file::loader::load(path)?;
+    std::ffi::CString::new(loaded.text.as_str())
+        .map_err(|_| crate::FastPadError::Invariant("Scintilla text may not contain NUL bytes"))?;
+    let (editor, previous, id, recovery_id, reuse) = {
+        let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))?;
+        let app = unsafe { app.as_mut() };
+        let editor = app
+            .editor
+            .clone()
+            .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
+        let active = app.tabs.active();
+        let previous = active.handle.clone();
+        let candidate = !active.dirty && active.path.is_none();
+        let active_ids = (active.id, active.recovery_id);
+        let reuse = candidate && editor.text()?.is_empty();
+        let (id, recovery_id) = if reuse {
+            active_ids
+        } else {
+            app.allocate_document_identity()
+        };
+        (editor, previous, id, recovery_id, reuse)
+    };
+    let mut document = Document::untitled(id, recovery_id, editor.create_document()?);
+    document.path = Some(loaded.path);
+    document.encoding = loaded.encoding;
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed during file open",
+        ));
+    }
+    unsafe { app_ptr(hwnd).unwrap().as_mut() }.populating_file = true;
+    let result = editor
+        .use_document(&document.handle)
+        .and_then(|_| editor.populate_clean(&loaded.text));
+    if result.is_err() && identity.is_live_for(hwnd) {
+        let _ = editor.use_document(&previous);
+    }
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed during file population",
+        ));
+    }
+    let commit = {
+        let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))?;
+        let app = unsafe { app.as_mut() };
+        app.populating_file = false;
+        result?;
+        if reuse {
+            let retired = app.tabs.replace_active_untitled(document);
+            drop(retired);
+            Ok(())
+        } else {
+            app.tabs
+                .push(document)
+                .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))
+        }
+    };
+    if commit.is_err() {
+        let _ = editor.use_document(&previous);
+    }
+    commit?;
+    unsafe {
+        let _ = record_milestone(hwnd, Milestone::FileLoaded);
+        PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
+    }
+    invalidate_title_strip(hwnd);
+    Ok(())
+}
+
+struct OpenInputHook {
+    parent: HWND,
+    identity: WindowIdentity,
+}
+const OPEN_INPUT_HOOK_ID: usize = 0x4650_4f49;
+
+fn install_open_input_hook(parent: HWND, editor: HWND, identity: WindowIdentity) -> Result<()> {
+    let data = std::rc::Rc::into_raw(std::rc::Rc::new(OpenInputHook { parent, identity })) as usize;
+    if unsafe {
+        windows_sys::Win32::UI::Shell::SetWindowSubclass(
+            editor,
+            Some(open_input_proc),
+            OPEN_INPUT_HOOK_ID,
+            data,
+        )
+    } == 0
+    {
+        unsafe {
+            drop(std::rc::Rc::from_raw(data as *const OpenInputHook));
+        }
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+unsafe extern "system" fn open_input_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _: usize,
+    data: usize,
+) -> LRESULT {
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    let raw = data as *const OpenInputHook;
+    unsafe {
+        std::rc::Rc::increment_strong_count(raw);
+    }
+    let hook = unsafe { std::rc::Rc::from_raw(raw) };
+    if message == WM_NCDESTROY {
+        unsafe {
+            RemoveWindowSubclass(hwnd, Some(open_input_proc), OPEN_INPUT_HOOK_ID);
+            std::rc::Rc::decrement_strong_count(raw);
+        }
+    }
+    let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    if message == windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR
+        && (wparam >= 0x20 || wparam == 9 || wparam == 13)
+        && hook.identity.is_live_for(hook.parent)
+    {
+        let resume = unsafe { app_ptr(hook.parent) }.is_some_and(|mut app| {
+            let app = unsafe { app.as_mut() };
+            if !app.first_input_accepted {
+                app.first_input_accepted = true;
+                let _ = app.startup.record_now(Milestone::FirstInputAccepted);
+            }
+            std::mem::take(&mut app.deferred_open_waiting)
+        });
+        if resume {
+            unsafe {
+                PostMessageW(hook.parent, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
+            }
+        }
+    }
+    result
 }
 
 fn create_new_document(hwnd: HWND) -> Result<()> {
@@ -596,6 +811,9 @@ fn activate_tab(hwnd: HWND, index: usize) {
 }
 
 fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
+    if file_population_active(hwnd) {
+        return false;
+    }
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
@@ -750,6 +968,9 @@ fn clear_documents_for_shutdown(hwnd: HWND) {
 }
 
 fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
+    if file_population_active(hwnd) {
+        return;
+    }
     if lparam == 0 {
         return;
     }

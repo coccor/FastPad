@@ -155,6 +155,27 @@ impl Tabs {
         self.documents.iter().find(|document| document.id == id)
     }
 
+    pub(crate) fn find_path(&self, path: &Path) -> Option<DocumentId> {
+        let key = canonical_key(path).ok()?;
+        self.documents
+            .iter()
+            .find(|document| {
+                document
+                    .path
+                    .as_deref()
+                    .and_then(|path| canonical_key(path).ok())
+                    .is_some_and(|path| path == key)
+            })
+            .map(|document| document.id)
+    }
+
+    pub(crate) fn replace_active_untitled(&mut self, document: Document) -> Document {
+        let index = self.active_index();
+        let old = std::mem::replace(&mut self.documents[index], document);
+        self.view.update(&self.documents);
+        old
+    }
+
     #[cfg(test)]
     pub fn ids(&self) -> impl Iterator<Item = DocumentId> + '_ {
         self.documents.iter().map(|document| document.id)

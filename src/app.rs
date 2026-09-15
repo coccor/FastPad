@@ -33,6 +33,10 @@ pub struct App {
     pub(crate) accessibility: AccessibilityState,
     pub(crate) accelerators: Option<AcceleratorTable>,
     pub(crate) menu_bar: Option<MenuBar>,
+    pub(crate) first_input_accepted: bool,
+    pub(crate) deferred_open_waiting: bool,
+    pub(crate) launch_open_completed: bool,
+    pub(crate) populating_file: bool,
     identity: WindowIdentity,
     first_paint_completed: bool,
     deferred_start_pending: bool,
@@ -53,6 +57,10 @@ impl App {
             accessibility: AccessibilityState::default(),
             accelerators: AcceleratorTable::create().ok(),
             menu_bar: None,
+            first_input_accepted: false,
+            deferred_open_waiting: false,
+            launch_open_completed: false,
+            populating_file: false,
             identity: WindowIdentity {
                 state: Rc::new(Cell::new(WindowIdentityState::Unbound)),
             },
@@ -110,6 +118,11 @@ impl App {
                 );
             }
         }
+    }
+
+    // HWND-based orchestration deliberately does not borrow App across native callbacks.
+    pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> crate::Result<()> {
+        crate::window::open_path(hwnd, path)
     }
 
     pub(crate) fn allocate_document_identity(&mut self) -> (DocumentId, RecoveryId) {

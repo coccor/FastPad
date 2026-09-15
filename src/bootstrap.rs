@@ -279,6 +279,158 @@ impl Drop for ParentWindowGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWLP_USERDATA, GetWindowLongPtrW, SendMessageW, WM_CHAR,
+    };
+
+    #[test]
+    fn deferred_open_waits_for_first_input_and_preserves_loaded_metadata() {
+        // Break caught: deferred work loads before the first accepted editor input.
+        let _scintilla = load_scintilla_module().unwrap();
+        let fixture = OpenFixture::new(b"\xEF\xBB\xBF{\"ok\":true}");
+        let mut app = make_app();
+        app.launch.request =
+            crate::launch::LaunchRequest::Open(fixture.path.clone().into_os_string());
+        let main = ProductionWindow::new(app);
+        let editor =
+            unsafe { initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap() };
+        unsafe {
+            PostMessageW(main.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
+        }
+        pump_thread_messages();
+        with_app(main.hwnd, |app| {
+            assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), "");
+            assert!(
+                app.startup
+                    .micros(crate::perf::Milestone::FileLoaded)
+                    .is_none()
+            );
+        });
+        unsafe {
+            SendMessageW(editor, WM_CHAR, b'x' as usize, 0);
+        }
+        pump_thread_messages();
+        with_app(main.hwnd, |app| {
+            assert_eq!(
+                app.editor.as_ref().unwrap().text().unwrap(),
+                "{\"ok\":true}"
+            );
+            assert_eq!(
+                app.tabs.active().path.as_deref(),
+                Some(fixture.path.as_path())
+            );
+            assert_eq!(
+                app.tabs.active().encoding,
+                crate::file::encoding::Encoding::Utf8Bom
+            );
+            assert!(!app.tabs.active().dirty);
+            assert!(
+                app.startup
+                    .micros(crate::perf::Milestone::FirstInputAccepted)
+                    .unwrap()
+                    < app
+                        .startup
+                        .micros(crate::perf::Milestone::FileLoaded)
+                        .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn open_reuses_empty_tab_and_duplicate_without_reloading_dirty_text() {
+        // Break caught: duplicate opens establish competing native document ownership.
+        let _scintilla = load_scintilla_module().unwrap();
+        let fixture = OpenFixture::new(b"same");
+        let main = ProductionWindow::new(make_app());
+        let editor =
+            unsafe { initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap() };
+        App::open_path(main.hwnd, &fixture.path).unwrap();
+        with_app(main.hwnd, |app| assert_eq!(app.tabs.len(), 1));
+        unsafe {
+            SendMessageW(editor, WM_CHAR, b'!' as usize, 0);
+        }
+        let before = with_app(main.hwnd, |app| {
+            app.editor.as_ref().unwrap().text().unwrap()
+        });
+        App::open_path(
+            main.hwnd,
+            &fixture.path.parent().unwrap().join(".").join("config.json"),
+        )
+        .unwrap();
+        with_app(main.hwnd, |app| {
+            assert_eq!(app.tabs.len(), 1);
+            assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), before);
+            assert!(app.tabs.active().dirty);
+        });
+    }
+
+    #[test]
+    fn open_errors_leave_active_document_and_native_text_unchanged() {
+        // Break caught: creating/switching a tab before successful decode loses active state.
+        let _scintilla = load_scintilla_module().unwrap();
+        let fixture = OpenFixture::new(&[0x80]);
+        let main = ProductionWindow::new(make_app());
+        let editor =
+            unsafe { initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap() };
+        unsafe {
+            SendMessageW(editor, WM_CHAR, b'x' as usize, 0);
+        }
+        let before = with_app(main.hwnd, |app| {
+            (
+                app.tabs.active().id,
+                app.tabs.active().generation,
+                app.tabs.active().dirty,
+            )
+        });
+        assert!(App::open_path(main.hwnd, &fixture.path).is_err());
+        assert!(App::open_path(main.hwnd, &fixture.path.with_extension("missing")).is_err());
+        std::fs::write(&fixture.path, b"nul\0text").unwrap();
+        assert!(App::open_path(main.hwnd, &fixture.path).is_err());
+        with_app(main.hwnd, |app| {
+            assert_eq!(app.tabs.len(), 1);
+            assert_eq!(
+                (
+                    app.tabs.active().id,
+                    app.tabs.active().generation,
+                    app.tabs.active().dirty
+                ),
+                before
+            );
+            assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), "x");
+            assert!(app.tabs.active().path.is_none());
+        });
+    }
+
+    fn with_app<R>(hwnd: HWND, run: impl FnOnce(&App) -> R) -> R {
+        let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const App;
+        assert!(!raw.is_null());
+        run(unsafe { &*raw })
+    }
+
+    struct OpenFixture {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+    impl OpenFixture {
+        fn new(bytes: &[u8]) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "fastpad-open-native-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("config.json");
+            std::fs::write(&path, bytes).unwrap();
+            Self { directory, path }
+        }
+    }
+    impl Drop for OpenFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
     use super::{
         ParentWindowGuard, StartupStage, finish_message_loop, load_scintilla_module,
         pump_next_available_message,
