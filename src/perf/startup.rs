@@ -81,6 +81,10 @@ impl StartupMetrics {
         }
     }
 
+    pub fn start_tick(&self) -> i64 {
+        self.start
+    }
+
     pub fn record(&mut self, milestone: Milestone, tick: i64) {
         let slot = &mut self.ticks[milestone as usize];
         if *slot == 0 {

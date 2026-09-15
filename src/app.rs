@@ -15,6 +15,7 @@ use crate::window::tabs::Tabs;
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::HWND;
 
 #[derive(Clone, Debug)]
@@ -54,9 +55,13 @@ pub struct App {
     deferred_start_pending: bool,
     prioritize_input: bool,
     menu_alt_pending: bool,
+    pub(crate) recovery_root: Option<std::path::PathBuf>,
+    pub(crate) last_snapshot_duration: Option<std::time::Duration>,
     next_document_id: u64,
-    next_recovery_id: u128,
+    process_start: u64,
 }
+
+static NEXT_RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl App {
     pub fn new(launch: LaunchOptions, startup: StartupMetrics) -> Self {
@@ -64,7 +69,6 @@ impl App {
             hwnd: std::ptr::null_mut(),
             editor: None,
             launch,
-            startup,
             tabs: Tabs::new(),
             accessibility: AccessibilityState::default(),
             accelerators: AcceleratorTable::create().ok(),
@@ -86,8 +90,11 @@ impl App {
             deferred_start_pending: false,
             prioritize_input: false,
             menu_alt_pending: false,
+            recovery_root: None,
+            last_snapshot_duration: None,
             next_document_id: 2,
-            next_recovery_id: 2,
+            process_start: startup.start_tick() as u64,
+            startup,
         }
     }
 
@@ -145,10 +152,17 @@ impl App {
 
     pub(crate) fn allocate_document_identity(&mut self) -> (DocumentId, RecoveryId) {
         let id = DocumentId(self.next_document_id);
-        let recovery_id = RecoveryId(self.next_recovery_id);
         self.next_document_id = self.next_document_id.saturating_add(1);
-        self.next_recovery_id = self.next_recovery_id.saturating_add(1);
-        (id, recovery_id)
+        (id, self.allocate_recovery_id())
+    }
+
+    pub(crate) fn allocate_recovery_id(&self) -> RecoveryId {
+        let counter = NEXT_RECOVERY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        RecoveryId::compose(self.process_start, std::process::id(), counter)
+    }
+
+    pub(crate) fn owns_recovery_id(&self, id: RecoveryId) -> bool {
+        id.is_from_process(self.process_start, std::process::id())
     }
 
     pub(crate) fn ensure_accessibility(&mut self) -> *mut c_void {

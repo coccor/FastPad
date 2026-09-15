@@ -8,6 +8,41 @@ pub struct DocumentId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RecoveryId(pub u128);
 
+impl RecoveryId {
+    pub const fn from_u128(value: u128) -> Self {
+        Self(value)
+    }
+
+    /// High 64 bits: process-start counter. Low 64 bits: PID, then the low 32 counter bits.
+    pub const fn compose(process_start: u64, pid: u32, counter: u64) -> Self {
+        let low = ((pid as u64) << 32) | (counter & 0xffff_ffff);
+        Self(((process_start as u128) << 64) | low as u128)
+    }
+
+    pub const fn is_from_process(self, process_start: u64, pid: u32) -> bool {
+        (self.0 >> 64) as u64 == process_start && (self.0 >> 32) as u32 == pid
+    }
+}
+
+/// Where a recovered tab came from: its source snapshot file and original document path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryOrigin {
+    pub snapshot_path: PathBuf,
+    pub original_path: Option<PathBuf>,
+}
+
+impl RecoveryOrigin {
+    pub fn display_name(&self) -> String {
+        file_name_or_untitled(self.original_path.as_deref())
+    }
+}
+
+fn file_name_or_untitled(path: Option<&std::path::Path>) -> String {
+    path.and_then(std::path::Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Untitled".to_owned())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Language {
     PlainText,
@@ -35,6 +70,8 @@ pub struct Document {
     pub dirty: bool,
     pub recovery_id: RecoveryId,
     pub generation: u64,
+    pub recovery_generation: Option<u64>,
+    pub recovery_origin: Option<RecoveryOrigin>,
 }
 
 impl PartialEq for Document {
@@ -46,6 +83,8 @@ impl PartialEq for Document {
             && self.dirty == other.dirty
             && self.recovery_id == other.recovery_id
             && self.generation == other.generation
+            && self.recovery_generation == other.recovery_generation
+            && self.recovery_origin == other.recovery_origin
     }
 }
 
@@ -62,16 +101,16 @@ impl Document {
             dirty: false,
             recovery_id,
             generation: 0,
+            recovery_generation: None,
+            recovery_origin: None,
         }
     }
 
     pub fn title(&self) -> String {
-        let base = self
-            .path
-            .as_deref()
-            .and_then(std::path::Path::file_name)
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled".to_owned());
+        let base = match (&self.path, &self.recovery_origin) {
+            (None, Some(origin)) => format!("Recovered: {}", origin.display_name()),
+            (path, _) => file_name_or_untitled(path.as_deref()),
+        };
         if self.dirty {
             format!("{base} *")
         } else {
@@ -105,6 +144,35 @@ mod tests {
 
     fn dirty_document(id: u64) -> Document {
         Document::test_fixture(DocumentId(id), true)
+    }
+
+    #[test]
+    fn recovery_ids_pack_process_start_pid_and_counter() {
+        // Break caught: IDs from two processes or two documents colliding on one snapshot file.
+        let id = super::RecoveryId::compose(0x1122_3344_5566_7788, 0xAABB_CCDD, 0x1_0000_0005);
+        assert_eq!(id.0, 0x1122_3344_5566_7788_AABB_CCDD_0000_0005);
+        assert!(id.is_from_process(0x1122_3344_5566_7788, 0xAABB_CCDD));
+        assert!(!id.is_from_process(0x1122_3344_5566_7788, 0xAABB_CCDE));
+        assert!(!id.is_from_process(0x1122_3344_5566_7789, 0xAABB_CCDD));
+        assert_ne!(
+            super::RecoveryId::compose(1, 2, 3),
+            super::RecoveryId::compose(1, 2, 4)
+        );
+    }
+
+    #[test]
+    fn recovered_documents_are_titled_by_their_origin_until_saved() {
+        // Break caught: a recovered tab looking like an ordinary untitled or original-file tab.
+        let mut recovered = dirty_document(1);
+        recovered.recovery_origin = Some(super::RecoveryOrigin {
+            snapshot_path: std::path::PathBuf::from("x.fps"),
+            original_path: Some(std::path::PathBuf::from(r"C:\docs\notes.md")),
+        });
+        assert_eq!(recovered.title(), "Recovered: notes.md *");
+        recovered.recovery_origin.as_mut().unwrap().original_path = None;
+        assert_eq!(recovered.title(), "Recovered: Untitled *");
+        recovered.path = Some(std::path::PathBuf::from(r"C:\docs\saved.txt"));
+        assert_eq!(recovered.title(), "saved.txt *");
     }
 
     #[test]

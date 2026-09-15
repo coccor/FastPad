@@ -68,3 +68,7 @@ path = "tests/windows/highlighting.rs"
 [[test]]
 name = "json_commands"
 path = "tests/windows/json_commands.rs"
+
+[[test]]
+name = "recovery"
+path = "tests/windows/recovery.rs"

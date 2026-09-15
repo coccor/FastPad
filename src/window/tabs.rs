@@ -338,6 +338,23 @@ impl Tabs {
         true
     }
 
+    pub(crate) fn documents(&self) -> impl Iterator<Item = &Document> + '_ {
+        self.documents.iter()
+    }
+
+    pub(crate) fn record_recovery_generation(&mut self, id: DocumentId, generation: u64) {
+        if let Some(document) = self.documents.iter_mut().find(|document| document.id == id) {
+            document.recovery_generation = Some(generation);
+        }
+    }
+
+    pub(crate) fn take_active_recovery_origin(
+        &mut self,
+    ) -> Option<crate::document::RecoveryOrigin> {
+        let active = self.active_index();
+        self.documents.get_mut(active)?.recovery_origin.take()
+    }
+
     pub(crate) fn note_active_text_change(&mut self) {
         let active = self.active_index();
         if let Some(document) = self.documents.get_mut(active) {

@@ -18,19 +18,21 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::UI::Controls::NMHDR;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
+    GetKeyState, GetLastInputInfo, LASTINPUTINFO, SetFocus, VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetWindowLongPtrW, IDCANCEL, IDNO, IDYES, MB_ICONWARNING, MB_YESNOCANCEL, MessageBoxW,
-    MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_KEYMENU,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, UnregisterClassW, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP,
-    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    GetWindowLongPtrW, IDCANCEL, IDNO, IDYES, KillTimer, MB_ICONWARNING, MB_YESNOCANCEL,
+    MessageBoxW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW,
+    SC_KEYMENU, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
+    WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NOTIFY, WM_PAINT,
+    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(not(test))]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
@@ -152,6 +154,7 @@ unsafe extern "system" fn main_window_proc(
                 return 0;
             }
             if review_dirty_documents(hwnd) {
+                remove_session_snapshots(hwnd);
                 clear_documents_for_shutdown(hwnd);
                 unsafe {
                     DestroyWindow(hwnd);
@@ -161,8 +164,13 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_DESTROY => {
             unsafe {
+                KillTimer(hwnd, crate::recovery::RECOVERY_TIMER_ID);
                 PostQuitMessage(0);
             }
+            0
+        }
+        WM_TIMER if wparam == crate::recovery::RECOVERY_TIMER_ID => {
+            snapshot_when_idle(hwnd);
             0
         }
         WM_PAINT => {
@@ -351,6 +359,10 @@ fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
     if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_RECOVERY) {
         apply_detected_language(hwnd);
     }
+    // Only `WM_FASTPAD_RECOVERY` processed with no input pending produces this action.
+    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_START_IPC) {
+        recover_snapshots(hwnd);
+    }
     match action {
         DeferredAction::RepostSelf(message) => {
             unsafe {
@@ -461,7 +473,12 @@ where
         ));
     }
 
-    let document = Document::untitled(DocumentId(1), RecoveryId(1), editor.current_document()?);
+    let recovery_id = unsafe { app_ptr(hwnd) }
+        .map(|app| unsafe { app.as_ref() }.allocate_recovery_id())
+        .ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))?;
+    let document = Document::untitled(DocumentId(1), recovery_id, editor.current_document()?);
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
             "main window was destroyed while adopting the initial document",
@@ -861,6 +878,7 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
 fn load_settings(hwnd: HWND) {
     let (settings, warnings) = crate::config::load();
     apply_loaded_settings(hwnd, settings, warnings);
+    start_recovery_timer(hwnd);
 }
 
 /// Applies an already-loaded settings/warnings pair, split out of `load_settings` so tests can drive
@@ -1559,14 +1577,20 @@ fn close_active_document(hwnd: HWND) {
             .tabs
             .close_reviewed(review, decision, replacement)
             .ok()?;
-        Some((closed, app.tabs.active_handle().clone()))
+        let snapshots = app
+            .recovery_root
+            .as_deref()
+            .map(|root| crate::recovery::owned_snapshot_files(root, &closed))
+            .unwrap_or_default();
+        Some((closed, app.tabs.active_handle().clone(), snapshots))
     });
-    let Some((closed, active)) = switched else {
+    let Some((closed, active, snapshots)) = switched else {
         return;
     };
     let _ = editor.use_document(&active);
     drop(active);
     drop(closed);
+    crate::recovery::remove_snapshot_files(&snapshots);
     if identity.is_live_for(hwnd) {
         invalidate_title_strip(hwnd);
     }
@@ -1688,6 +1712,7 @@ fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::pa
     match result {
         Ok(()) => {
             editor.set_save_point();
+            remove_saved_document_snapshots(hwnd);
             if is_save_as {
                 unsafe {
                     PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
@@ -1795,6 +1820,312 @@ fn prompt_close_decision(hwnd: HWND, title: &str) -> CloseDecision {
         IDCANCEL => CloseDecision::Cancel,
         _ => CloseDecision::Cancel,
     }
+}
+
+fn start_recovery_timer(hwnd: HWND) {
+    let Some(interval) = (unsafe { app_ptr(hwnd) })
+        .map(|app| unsafe { app.as_ref() }.settings.recovery_interval_seconds)
+    else {
+        return;
+    };
+    unsafe {
+        SetTimer(
+            hwnd,
+            crate::recovery::RECOVERY_TIMER_ID,
+            crate::recovery::timer_period_ms(interval),
+            None,
+        );
+    }
+}
+
+/// Resolves (once) and returns the Recovery directory; tests pre-seed `App::recovery_root`.
+fn recovery_root(hwnd: HWND) -> Option<std::path::PathBuf> {
+    let mut app = unsafe { app_ptr(hwnd) }?;
+    let app = unsafe { app.as_mut() };
+    if app.recovery_root.is_none() {
+        app.recovery_root = crate::recovery::recovery_root().ok();
+    }
+    app.recovery_root.clone()
+}
+
+fn snapshot_when_idle(hwnd: HWND) {
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if unsafe { GetLastInputInfo(&mut info) } == 0
+        || !crate::recovery::input_idle(info.dwTime, unsafe { GetTickCount() })
+    {
+        return;
+    }
+    snapshot_next_document(hwnd);
+}
+
+/// Writes at most one dirty document whose generation has not been recorded yet.
+fn snapshot_next_document(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    if file_population_active(hwnd) {
+        return;
+    }
+    let Some(root) = recovery_root(hwnd) else {
+        return;
+    };
+    let job = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.editor.clone()?;
+        let document = crate::recovery::next_snapshot_document(app.tabs.documents())?;
+        let origin = document.recovery_origin.as_ref();
+        Some(SnapshotJob {
+            editor,
+            id: document.id,
+            generation: document.generation,
+            recovery_id: document.recovery_id,
+            original_path: document
+                .path
+                .clone()
+                .or_else(|| origin.and_then(|origin| origin.original_path.clone())),
+            encoding: document.encoding,
+            source_snapshot: origin.map(|origin| origin.snapshot_path.clone()),
+            inactive: (document.id != app.tabs.active().id)
+                .then(|| (document.handle.clone(), app.tabs.active_handle().clone())),
+        })
+    });
+    let Some(job) = job else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let text = match &job.inactive {
+        None => job.editor.text(),
+        Some((target, active)) => read_inactive_text(hwnd, &identity, &job.editor, target, active),
+    };
+    let Ok(text) = text else {
+        return;
+    };
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    let snapshot =
+        crate::recovery::Snapshot::new(job.recovery_id, job.original_path, job.encoding, text);
+    let written = crate::recovery::write_snapshot(&root, &snapshot);
+    drop(snapshot);
+    let elapsed = started.elapsed();
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        app.last_snapshot_duration = Some(elapsed);
+        if written.is_ok() {
+            app.tabs.record_recovery_generation(job.id, job.generation);
+        }
+    }
+    // Once a recovered tab has its own snapshot, its source would only resurrect a stale duplicate.
+    if let (Ok(written), Some(source)) = (written, job.source_snapshot)
+        && written != source
+    {
+        crate::recovery::remove_snapshot_files(&[source]);
+    }
+}
+
+struct SnapshotJob {
+    editor: Editor,
+    id: DocumentId,
+    generation: u64,
+    recovery_id: RecoveryId,
+    original_path: Option<std::path::PathBuf>,
+    encoding: crate::file::encoding::Encoding,
+    source_snapshot: Option<std::path::PathBuf>,
+    inactive: Option<(crate::editor::EditorDocument, crate::editor::EditorDocument)>,
+}
+
+/// Scintilla can only read the document shown in the view, so an inactive tab is swapped in and
+/// out with notifications suppressed, restoring the visible selection and scroll position.
+fn read_inactive_text(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    editor: &Editor,
+    target: &crate::editor::EditorDocument,
+    active: &crate::editor::EditorDocument,
+) -> Result<String> {
+    use crate::editor::scintilla_constants::{SCI_GETFIRSTVISIBLELINE, SCI_SETFIRSTVISIBLELINE};
+    let selection = editor.selection();
+    let first_line = unsafe { SendMessageW(editor.hwnd(), SCI_GETFIRSTVISIBLELINE, 0, 0) };
+    set_file_population(hwnd, true);
+    let text = editor.use_document(target).and_then(|_| editor.text());
+    let restored = if identity.is_live_for(hwnd) {
+        editor.use_document(active)
+    } else {
+        Err(crate::FastPadError::Invariant(
+            "main window was destroyed during a recovery snapshot",
+        ))
+    };
+    if restored.is_ok() {
+        if let Ok(selection) = selection {
+            let _ = editor.set_selection(selection);
+        }
+        unsafe {
+            SendMessageW(
+                editor.hwnd(),
+                SCI_SETFIRSTVISIBLELINE,
+                first_line as usize,
+                0,
+            );
+        }
+    }
+    if identity.is_live_for(hwnd) {
+        set_file_population(hwnd, false);
+    }
+    restored?;
+    text
+}
+
+fn set_file_population(hwnd: HWND, active: bool) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.populating_file = active;
+    }
+}
+
+/// Opens every valid foreign snapshot as a recovered tab and reports them with one notice.
+fn recover_snapshots(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let Some(root) = recovery_root(hwnd) else {
+        return;
+    };
+    let Ok(candidates) = crate::recovery::discover_snapshots(&root) else {
+        return;
+    };
+    let mut recovered = 0;
+    for candidate in candidates {
+        let owned = unsafe { app_ptr(hwnd) }.is_none_or(|app| {
+            unsafe { app.as_ref() }.owns_recovery_id(candidate.snapshot.recovery_id)
+        });
+        if owned {
+            continue;
+        }
+        if open_recovered_snapshot(hwnd, &identity, candidate).is_ok() {
+            recovered += 1;
+        }
+        if !identity.is_live_for(hwnd) {
+            return;
+        }
+    }
+    if recovered == 0 {
+        return;
+    }
+    let chrome_built = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let app = unsafe { app.as_mut() };
+        app.notifications
+            .push(crate::recovery::recovered_notice(recovered));
+        app.status.is_some()
+    });
+    if chrome_built {
+        layout_editor_and_find_bar(hwnd);
+    }
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+}
+
+fn open_recovered_snapshot(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    candidate: crate::recovery::SnapshotCandidate,
+) -> Result<()> {
+    if file_population_active(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "file population is already active",
+        ));
+    }
+    let crate::recovery::SnapshotCandidate { path, snapshot } = candidate;
+    let (editor, previous, id, recovery_id) = {
+        let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))?;
+        let app = unsafe { app.as_mut() };
+        let editor = app
+            .editor
+            .clone()
+            .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
+        let previous = app.tabs.active_handle().clone();
+        let (id, recovery_id) = app.allocate_document_identity();
+        (editor, previous, id, recovery_id)
+    };
+    let mut document = Document::untitled(id, recovery_id, editor.create_document()?);
+    document.encoding = snapshot.encoding;
+    document.dirty = true;
+    document.recovery_generation = Some(document.generation);
+    document.recovery_origin = Some(crate::document::RecoveryOrigin {
+        snapshot_path: path,
+        original_path: snapshot.original_path,
+    });
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed during recovery",
+        ));
+    }
+    set_file_population(hwnd, true);
+    // Undo collection stays on so the loaded text leaves the save point: the tab starts dirty.
+    let result = editor
+        .use_document(&document.handle)
+        .and_then(|_| editor.set_text(&snapshot.text));
+    drop(snapshot.text);
+    if result.is_err() && identity.is_live_for(hwnd) {
+        let _ = editor.use_document(&previous);
+    }
+    if !identity.is_live_for(hwnd) {
+        return Err(crate::FastPadError::Invariant(
+            "main window was destroyed during recovery",
+        ));
+    }
+    set_file_population(hwnd, false);
+    result?;
+    let pushed = unsafe { app_ptr(hwnd) }
+        .ok_or(crate::FastPadError::Invariant(
+            "main window app state was not available",
+        ))
+        .and_then(|mut app| {
+            unsafe { app.as_mut() }
+                .tabs
+                .push(document)
+                .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))
+        });
+    if pushed.is_err() {
+        let _ = editor.use_document(&previous);
+    }
+    pushed?;
+    invalidate_title_strip(hwnd);
+    Ok(())
+}
+
+/// A successful save supersedes both the document's own snapshot and any recovery source.
+fn remove_saved_document_snapshots(hwnd: HWND) {
+    let files = unsafe { app_ptr(hwnd) }.map(|mut app| {
+        let app = unsafe { app.as_mut() };
+        let own = app.recovery_root.as_deref().map(|root| {
+            crate::recovery::snapshot::snapshot_path(root, app.tabs.active().recovery_id)
+        });
+        let source = app
+            .tabs
+            .take_active_recovery_origin()
+            .map(|origin| origin.snapshot_path);
+        own.into_iter().chain(source).collect::<Vec<_>>()
+    });
+    crate::recovery::remove_snapshot_files(&files.unwrap_or_default());
+}
+
+fn remove_session_snapshots(hwnd: HWND) {
+    let files = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let root = app.recovery_root.as_deref()?;
+        Some(
+            app.tabs
+                .documents()
+                .flat_map(|document| crate::recovery::owned_snapshot_files(root, document))
+                .collect::<Vec<_>>(),
+        )
+    });
+    crate::recovery::remove_snapshot_files(&files.unwrap_or_default());
 }
 
 fn clear_documents_for_shutdown(hwnd: HWND) {
@@ -1985,12 +2316,17 @@ mod tests {
         take_json_valid_count, take_language_errors,
     };
     use crate::app::App;
-    use crate::document::Language;
+    use crate::document::{Language, RecoveryId};
+    use crate::editor::scintilla_constants::SCI_GETMODIFY;
+    use crate::file::encoding::Encoding;
     use crate::languages::LanguageManager;
     use crate::launch::LaunchOptions;
     use crate::perf::StartupMetrics;
+    use crate::recovery::snapshot::snapshot_path;
+    use crate::recovery::{Snapshot, write_snapshot};
     use crate::window::commands::CommandId;
     use std::cell::RefCell;
+    use std::path::PathBuf;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1999,7 +2335,8 @@ mod tests {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IsWindow, WM_PAINT,
+        DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IsWindow, SendMessageW,
+        WM_CLOSE, WM_PAINT,
     };
 
     #[test]
@@ -2268,6 +2605,204 @@ mod tests {
             issues[0]
         );
         assert_eq!(editor.text().unwrap(), "{\n  bad\n}");
+    }
+
+    #[test]
+    fn recovery_discovery_opens_foreign_snapshots_as_dirty_recovered_tabs_with_one_notice() {
+        // Break caught: recovered text opened clean, untitled-looking, without a notice, or this
+        // process's own live snapshots reopened as duplicates.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("discover");
+        let source = write_snapshot(
+            root.path(),
+            &Snapshot::new(
+                RecoveryId::from_u128(0x77),
+                Some(PathBuf::from(r"C:\docs\notes.md")),
+                Encoding::Utf16Le,
+                "recovered body",
+            ),
+        )
+        .unwrap();
+        let own_id = app_mut(window.hwnd).allocate_recovery_id();
+        let own = write_snapshot(
+            root.path(),
+            &Snapshot::new(own_id, None, Encoding::Utf8, "live"),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("torn.fps"), b"FPS1").unwrap();
+        app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+
+        super::recover_snapshots(window.hwnd);
+
+        let (tabs, title, dirty, path, encoding, origin, notices) = {
+            let app = app_mut(window.hwnd);
+            let active = app.tabs.active();
+            (
+                app.tabs.len(),
+                active.title(),
+                active.dirty,
+                active.path.clone(),
+                active.encoding,
+                active.recovery_origin.clone(),
+                app.notifications.len(),
+            )
+        };
+        assert_eq!(tabs, 2);
+        assert_eq!(title, "Recovered: notes.md *");
+        assert!(dirty);
+        assert_eq!(path, None);
+        assert_eq!(encoding, Encoding::Utf16Le);
+        assert_eq!(origin.unwrap().snapshot_path, source);
+        assert_eq!(notices, 1);
+        assert_eq!(editor.text().unwrap(), "recovered body");
+        assert_ne!(
+            unsafe { SendMessageW(editor.hwnd(), SCI_GETMODIFY, 0, 0) },
+            0,
+            "Scintilla itself must treat the recovered text as unsaved"
+        );
+        assert!(source.exists() && own.exists());
+        assert!(root.path().join("torn.fps.invalid").exists());
+    }
+
+    #[test]
+    fn snapshots_write_one_changed_dirty_document_per_tick_without_disturbing_the_view() {
+        // Break caught: several documents written per tick, unchanged generations rewritten, or an
+        // inactive tab's snapshot swapping the visible document or selection.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("tick");
+        app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+        editor.set_text("alpha").unwrap();
+        super::create_new_document(window.hwnd).unwrap();
+        editor.set_text("beta\nline").unwrap();
+        editor.set_selection(2..3).unwrap();
+        let ids = app_mut(window.hwnd)
+            .tabs
+            .documents()
+            .map(|document| document.recovery_id)
+            .collect::<Vec<_>>();
+        let first = snapshot_path(root.path(), ids[0]);
+        let second = snapshot_path(root.path(), ids[1]);
+
+        super::snapshot_next_document(window.hwnd);
+
+        assert_eq!(read_snapshot_text(&first), "alpha");
+        assert!(!second.exists());
+        assert_eq!(editor.text().unwrap(), "beta\nline");
+        assert_eq!(editor.selection().unwrap(), 2..3);
+        assert!(app_mut(window.hwnd).last_snapshot_duration.is_some());
+
+        super::snapshot_next_document(window.hwnd);
+        assert_eq!(read_snapshot_text(&second), "beta\nline");
+
+        std::fs::remove_file(&first).unwrap();
+        std::fs::remove_file(&second).unwrap();
+        super::snapshot_next_document(window.hwnd);
+        assert!(!first.exists() && !second.exists());
+    }
+
+    #[test]
+    fn saving_a_recovered_tab_never_touches_the_original_and_removes_its_snapshots() {
+        // Break caught: Save silently writing the original path, or a saved recovered document
+        // leaving snapshots that resurrect it after the next crash.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("save");
+        let original = root.path().join("original.txt");
+        std::fs::write(&original, b"original").unwrap();
+        let source = write_snapshot(
+            root.path(),
+            &Snapshot::new(
+                RecoveryId::from_u128(0x99),
+                Some(original.clone()),
+                Encoding::Utf8,
+                "recovered",
+            ),
+        )
+        .unwrap();
+        app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+        super::recover_snapshots(window.hwnd);
+        editor.set_text("recovered and edited").unwrap();
+
+        super::snapshot_next_document(window.hwnd);
+        let own = snapshot_path(root.path(), app_mut(window.hwnd).tabs.active().recovery_id);
+        assert_eq!(read_snapshot_text(&own), "recovered and edited");
+        assert!(
+            !source.exists(),
+            "the stale source would reopen as a duplicate"
+        );
+
+        let target = root.path().join("saved.txt");
+        super::save_path_as(window.hwnd, &target);
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"recovered and edited");
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        assert!(!own.exists());
+        let app = app_mut(window.hwnd);
+        assert_eq!(app.tabs.active().title(), "saved.txt");
+        assert_eq!(app.tabs.active().recovery_origin, None);
+    }
+
+    #[test]
+    fn clean_window_close_removes_this_sessions_snapshots() {
+        // Break caught: snapshots outliving a clean exit and restoring tabs on the next launch.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("close");
+        app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+        editor.set_text("typed").unwrap();
+        super::snapshot_next_document(window.hwnd);
+        let own = snapshot_path(root.path(), app_mut(window.hwnd).tabs.active().recovery_id);
+        assert!(own.exists());
+        editor.set_save_point();
+
+        unsafe {
+            SendMessageW(window.hwnd, WM_CLOSE, 0, 0);
+        }
+
+        assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+        assert!(!own.exists());
+    }
+
+    fn app_mut<'a>(hwnd: HWND) -> &'a mut App {
+        unsafe { super::app_ptr(hwnd).unwrap().as_mut() }
+    }
+
+    fn read_snapshot_text(path: &std::path::Path) -> String {
+        Snapshot::decode(&std::fs::read(path).unwrap())
+            .unwrap()
+            .text
+    }
+
+    struct RecoveryScratch(PathBuf);
+
+    impl RecoveryScratch {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "fastpad-window-recovery-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for RecoveryScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// Installs a real Scintilla editor onto `window` (mirroring
