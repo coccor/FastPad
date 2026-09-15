@@ -318,18 +318,19 @@ impl TitleBarLayout {
     }
 
     /// Like `hit_test`, but a restored window's top band resizes (the frame no longer reserves a
-    /// native top border). Caption buttons keep their targets except in the corner squares.
+    /// native top border). Caption buttons always keep their targets; the right frame border outside
+    /// the client area still reports the top-right corner through DefWindowProc.
     pub fn frame_hit_test(&self, point: Point, maximized: bool) -> HitTarget {
         let target = self.hit_test(point);
         if maximized || point.y < 0 || point.y >= self.resize_border {
             return target;
         }
-        if point.x < self.resize_border {
+        if target.is_caption_button() {
+            target
+        } else if point.x < self.resize_border {
             HitTarget::ResizeTopLeft
         } else if point.x >= self.close.right - self.resize_border {
             HitTarget::ResizeTopRight
-        } else if target.is_caption_button() {
-            target
         } else {
             HitTarget::ResizeTop
         }
@@ -933,8 +934,9 @@ mod tests {
             HitTarget::ResizeTopLeft
         );
         assert_eq!(
-            layout.frame_hit_test(super::Point::new(1199, 0), false),
-            HitTarget::ResizeTopRight
+            layout.frame_hit_test(super::Point::new(layout.close.right - 1, 0), false),
+            HitTarget::Close,
+            "the top-right corner of Close must close, not resize"
         );
         let maximize_top = super::Point::new(layout.maximize.center().x, 0);
         assert_eq!(

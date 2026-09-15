@@ -350,6 +350,12 @@ unsafe extern "system" fn main_window_proc(
                 );
                 InvalidateRect(hwnd, std::ptr::null(), 1);
             }
+            let dpi = (wparam & 0xffff) as u32;
+            if let Some(editor) =
+                unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.editor.clone())
+            {
+                let _ = editor.set_text_padding(dpi);
+            }
             0
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DWMCOLORIZATIONCOLORCHANGED => {

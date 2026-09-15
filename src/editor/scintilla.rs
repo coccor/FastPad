@@ -11,9 +11,9 @@ use crate::editor::scintilla_constants::{
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{
     SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
-    SC_WRAP_NONE, SC_WRAP_WORD, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR, SCI_SETMARGINWIDTHN,
-    SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING, SCI_SETTABWIDTH, SCI_SETWRAPMODE,
-    SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT,
+    SC_WRAP_NONE, SC_WRAP_WORD, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR, SCI_SETMARGINLEFT,
+    SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING,
+    SCI_SETTABWIDTH, SCI_SETWRAPMODE, SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT,
 };
 use crate::{FastPadError, Result};
 use std::ffi::CString;
@@ -104,7 +104,9 @@ impl Editor {
         editor
             .endpoint
             .send_direct_checked(SCI_SETCODEPAGE, SC_CP_UTF8 as usize, 0)?;
-        editor.apply_chrome_defaults()?;
+        editor.apply_chrome_defaults(unsafe {
+            windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd)
+        })?;
         Ok(editor)
     }
 
@@ -213,6 +215,9 @@ impl Editor {
         }
         self.endpoint
             .send_direct_checked(SCI_SETDOCPOINTER, 0, document.raw)?;
+        // Scroll width is per view and tracking only grows it; restart from the new document.
+        self.endpoint
+            .send_direct_checked(SCI_SETSCROLLWIDTH, 1, 0)?;
         Ok(())
     }
 
@@ -599,14 +604,15 @@ impl Editor {
         ))
     }
 
-    /// Hides Scintilla's default margins and lets the horizontal scrollbar follow the widest line
-    /// instead of the default 2000 px scroll width.
+    /// Hides Scintilla's default margins, pads the text area, and lets the horizontal scrollbar
+    /// follow the widest line instead of the default 2000 px scroll width.
     #[cfg(windows)]
-    pub fn apply_chrome_defaults(&self) -> Result<()> {
+    pub fn apply_chrome_defaults(&self, dpi: u32) -> Result<()> {
         for margin in 0..=2 {
             self.endpoint
                 .send_direct_checked(SCI_SETMARGINWIDTHN, margin, 0)?;
         }
+        self.set_text_padding(dpi)?;
         self.endpoint
             .send_direct_checked(SCI_SETSCROLLWIDTH, 1, 0)?;
         self.endpoint
@@ -615,7 +621,25 @@ impl Editor {
     }
 
     #[cfg(not(windows))]
-    pub fn apply_chrome_defaults(&self) -> Result<()> {
+    pub fn apply_chrome_defaults(&self, _dpi: u32) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Left/right text padding in physical pixels for `dpi` (8 px at 96 DPI).
+    #[cfg(windows)]
+    pub fn set_text_padding(&self, dpi: u32) -> Result<()> {
+        let padding = ((8 * i64::from(dpi.max(96)) + 48) / 96) as isize;
+        self.endpoint
+            .send_direct_checked(SCI_SETMARGINLEFT, 0, padding)?;
+        self.endpoint
+            .send_direct_checked(SCI_SETMARGINRIGHT, 0, padding)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_text_padding(&self, _dpi: u32) -> Result<()> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))
@@ -1031,10 +1055,11 @@ mod tests {
         SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
         SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY, SCI_CUT,
         SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_PASTE,
-        SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETELEMENTCOLOUR,
-        SCI_SETILEXER, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING,
-        SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE, SCI_STYLECLEARALL, SCI_STYLESETBACK,
-        SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
+        SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETDOCPOINTER,
+        SCI_SETELEMENTCOLOUR, SCI_SETILEXER, SCI_SETMARGINLEFT, SCI_SETMARGINRIGHT,
+        SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS,
+        SCI_SETSEL, SCI_SETTARGETRANGE, SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD,
+        SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -1358,7 +1383,7 @@ mod tests {
         let harness = TestDirectHarness::new();
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        editor.apply_chrome_defaults().unwrap();
+        editor.apply_chrome_defaults(144).unwrap();
 
         assert_eq!(
             harness.calls(),
@@ -1366,9 +1391,41 @@ mod tests {
                 (SCI_SETMARGINWIDTHN, 0, 0),
                 (SCI_SETMARGINWIDTHN, 1, 0),
                 (SCI_SETMARGINWIDTHN, 2, 0),
+                (SCI_SETMARGINLEFT, 0, 12),
+                (SCI_SETMARGINRIGHT, 0, 12),
                 (SCI_SETSCROLLWIDTH, 1, 0),
                 (SCI_SETSCROLLWIDTHTRACKING, 1, 0),
             ]
+        );
+    }
+
+    #[test]
+    fn text_padding_is_eight_pixels_at_96_dpi() {
+        // Break caught: zero margins leave the caret and first glyph touching the window frame.
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.set_text_padding(96).unwrap();
+
+        assert_eq!(
+            harness.calls(),
+            vec![(SCI_SETMARGINLEFT, 0, 8), (SCI_SETMARGINRIGHT, 0, 8)]
+        );
+    }
+
+    #[test]
+    fn switching_documents_resets_the_scroll_width() {
+        // Break caught: scroll-width tracking only grows, so a short tab after a wide one would
+        // keep the wide tab's horizontal scrollbar.
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+        let document = EditorDocument::test_fixture_with_raw(41, &editor);
+
+        editor.use_document(&document).unwrap();
+
+        assert_eq!(
+            harness.calls(),
+            vec![(SCI_SETDOCPOINTER, 0, 41), (SCI_SETSCROLLWIDTH, 1, 0)]
         );
     }
 
