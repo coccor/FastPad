@@ -67,6 +67,8 @@ impl AcceptanceHarness {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("FastPad")).unwrap();
+        // Every JSON/Markdown scenario needs the portable layout regardless of test order.
+        ensure_lexilla_beside_fastpad();
         Self { root }
     }
 
@@ -100,7 +102,6 @@ impl AcceptanceHarness {
     }
 
     pub fn json_launch_order(&self) {
-        ensure_lexilla_beside_fastpad();
         let file = self.fixture("launch.json", "{\"ok\": true}");
         let mut launch = MeasuredLaunch::start(&self.root, &[file.as_os_str()]).unwrap();
 
@@ -158,7 +159,6 @@ impl AcceptanceHarness {
     }
 
     pub fn assert_no_browser_module(&self) {
-        ensure_lexilla_beside_fastpad();
         let file = self.fixture(
             "notes.md",
             "# Notes\n\n*hello* [link](https://example.com)\n",
