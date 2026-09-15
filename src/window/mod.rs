@@ -1,5 +1,6 @@
 pub(crate) mod accessibility;
 pub mod commands;
+pub mod find_bar;
 mod main_window;
 pub(crate) mod menus;
 mod messages;

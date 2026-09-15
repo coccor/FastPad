@@ -4,6 +4,7 @@ use crate::launch::LaunchOptions;
 use crate::perf::{Milestone, StartupMetrics};
 use crate::window::accessibility::AccessibilityState;
 use crate::window::commands::CommandId;
+use crate::window::find_bar::FindBar;
 use crate::window::menus::{AcceleratorTable, MenuBar};
 use crate::window::tabs::Tabs;
 use std::cell::Cell;
@@ -33,6 +34,7 @@ pub struct App {
     pub(crate) accessibility: AccessibilityState,
     pub(crate) accelerators: Option<AcceleratorTable>,
     pub(crate) menu_bar: Option<MenuBar>,
+    pub(crate) find_bar: Option<FindBar>,
     pub(crate) first_input_accepted: bool,
     pub(crate) deferred_open_waiting: bool,
     pub(crate) launch_open_completed: bool,
@@ -57,6 +59,7 @@ impl App {
             accessibility: AccessibilityState::default(),
             accelerators: AcceleratorTable::create().ok(),
             menu_bar: None,
+            find_bar: None,
             first_input_accepted: false,
             deferred_open_waiting: false,
             launch_open_completed: false,

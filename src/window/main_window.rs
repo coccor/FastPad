@@ -6,6 +6,7 @@ use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
 use crate::window::accessibility::{self, AccessibleSelectRequest, WM_FASTPAD_ACCESSIBLE_SELECT};
 use crate::window::commands::CommandId;
+use crate::window::find_bar;
 use crate::window::menus::{self, MenuBar};
 use crate::window::messages::{
     DeferredAction, classify_deferred_message, completed_milestone, deferred_start_message,
@@ -135,22 +136,7 @@ unsafe extern "system" fn main_window_proc(
     match message {
         WM_NCCREATE => unsafe { on_nc_create(hwnd, lparam) },
         WM_SIZE => {
-            if let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) } {
-                let mut rect = Default::default();
-                let title_height =
-                    crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd)).height;
-                unsafe {
-                    GetClientRect(hwnd, &mut rect);
-                    MoveWindow(
-                        editor_hwnd,
-                        0,
-                        title_height,
-                        rect.right - rect.left,
-                        (rect.bottom - rect.top - title_height).max(0),
-                        1,
-                    );
-                }
-            }
+            layout_editor_and_find_bar(hwnd);
             0
         }
         WM_SETFOCUS => {
@@ -526,6 +512,198 @@ unsafe fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
     unsafe { app.as_ref() }.editor.as_ref().map(Editor::hwnd)
 }
 
+fn with_editor(hwnd: HWND, action: impl FnOnce(&Editor)) {
+    let Some(app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
+    let Some(editor) = unsafe { app.as_ref() }.editor.as_ref() else {
+        return;
+    };
+    action(editor);
+}
+
+/// Repositions the editor (and the find bar, if visible) to account for the title strip and an
+/// optional find/replace bar reserved above it. The sole layout choke point for both; extends the
+/// pre-Task-12 `WM_SIZE` editor-only positioning rather than duplicating it.
+fn layout_editor_and_find_bar(hwnd: HWND) {
+    let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
+        return;
+    };
+    let title_height = crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd)).height;
+    let mut rect = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut rect);
+    }
+    let width = rect.right - rect.left;
+    let find_bar_height = unsafe { app_ptr(hwnd) }
+        .and_then(|app| {
+            let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
+            bar.layout(width, title_height);
+            bar.is_visible().then_some(find_bar::FIND_BAR_HEIGHT)
+        })
+        .unwrap_or(0);
+    let content_top = title_height + find_bar_height;
+    unsafe {
+        MoveWindow(
+            editor_hwnd,
+            0,
+            content_top,
+            width,
+            (rect.bottom - rect.top - content_top).max(0),
+            1,
+        );
+    }
+}
+
+fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    // A single-line selection is a reasonable query prefill; a multi-line one is not (the bar has
+    // no way to display it), so it's left alone rather than truncated or rejected.
+    let prefill = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let editor = unsafe { app.as_ref() }.editor.as_ref()?;
+        let text = editor.selected_text().ok()?;
+        (!text.is_empty() && !text.contains(['\n', '\r'])).then_some(text)
+    });
+    let opened = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let app = unsafe { app.as_mut() };
+        if app.find_bar.is_none() {
+            app.find_bar = find_bar::FindBar::create(hwnd).ok();
+        }
+        let Some(bar) = app.find_bar.as_mut() else {
+            return false;
+        };
+        bar.show(mode, prefill.as_deref());
+        true
+    });
+    if !opened || !identity.is_live_for(hwnd) {
+        return;
+    }
+    layout_editor_and_find_bar(hwnd);
+    if let Some(app) = unsafe { app_ptr(hwnd) }
+        && let Some(bar) = unsafe { app.as_ref() }.find_bar.as_ref()
+    {
+        bar.focus_query();
+    }
+}
+
+pub(crate) fn close_find_bar(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let closed = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        let Some(bar) = unsafe { app.as_mut() }.find_bar.as_mut() else {
+            return false;
+        };
+        bar.hide();
+        true
+    });
+    if !closed || !identity.is_live_for(hwnd) {
+        return;
+    }
+    layout_editor_and_find_bar(hwnd);
+    if let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) } {
+        unsafe {
+            SetFocus(editor_hwnd);
+        }
+    }
+}
+
+pub(crate) fn find_next(hwnd: HWND) {
+    navigate_to_match(hwnd, false);
+}
+
+pub(crate) fn find_previous(hwnd: HWND) {
+    navigate_to_match(hwnd, true);
+}
+
+fn navigate_to_match(hwnd: HWND, backward: bool) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let Some((editor, query)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.editor.clone()?;
+        let query = app.find_bar.as_ref()?.query_text();
+        Some((editor, query))
+    }) else {
+        return;
+    };
+    if query.is_empty() {
+        return;
+    }
+    let (Ok(selection), Ok(doc_len)) = (editor.selection(), editor.length()) else {
+        return;
+    };
+    let origin = if backward {
+        selection.start
+    } else {
+        selection.end
+    };
+    let direction = if backward {
+        find_bar::SearchDirection::Backward
+    } else {
+        find_bar::SearchDirection::Forward
+    };
+    let mut state = find_bar::SearchState::new(&query, direction, origin);
+    if let Ok(Some(found)) = state.next_editor_match(&editor, 0, doc_len)
+        && identity.is_live_for(hwnd)
+    {
+        let _ = editor.set_selection(found);
+        editor.scroll_caret_into_view();
+    }
+}
+
+pub(crate) fn replace_current(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let Some((editor, query, replacement)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.editor.clone()?;
+        let bar = app.find_bar.as_ref()?;
+        Some((editor, bar.query_text(), bar.replace_text()))
+    }) else {
+        return;
+    };
+    if query.is_empty() {
+        return;
+    }
+    // Only replace when the current selection is exactly the query match; otherwise this Enter
+    // press just navigates to the next match, matching a bare Find field's behavior.
+    if let (Ok(selection), Ok(selected)) = (editor.selection(), editor.selected_text())
+        && selected == query
+    {
+        let _ = editor.replace_target(selection, &replacement);
+        if !identity.is_live_for(hwnd) {
+            return;
+        }
+    }
+    find_next(hwnd);
+}
+
+pub(crate) fn replace_all_matches(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let Some((editor, query, replacement)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.editor.clone()?;
+        let bar = app.find_bar.as_ref()?;
+        Some((editor, bar.query_text(), bar.replace_text()))
+    }) else {
+        return;
+    };
+    if query.is_empty() {
+        return;
+    }
+    let _ = editor.replace_all(&query, &replacement, 0);
+    if identity.is_live_for(hwnd) {
+        editor.scroll_caret_into_view();
+    }
+}
+
 fn tab_count(hwnd: HWND) -> usize {
     unsafe { app_ptr(hwnd) }
         .map(|app| unsafe { app.as_ref() }.tabs.len())
@@ -564,6 +742,23 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         CommandId::CloseTab => close_active_document(hwnd),
         CommandId::Save => save_active_document(hwnd),
         CommandId::SaveAs => save_active_document_as(hwnd),
+        CommandId::Undo => with_editor(hwnd, |editor| {
+            let _ = editor.undo();
+        }),
+        CommandId::Redo => with_editor(hwnd, |editor| {
+            let _ = editor.redo();
+        }),
+        CommandId::Cut => with_editor(hwnd, |editor| {
+            let _ = editor.cut();
+        }),
+        CommandId::Copy => with_editor(hwnd, |editor| {
+            let _ = editor.copy();
+        }),
+        CommandId::Paste => with_editor(hwnd, |editor| {
+            let _ = editor.paste();
+        }),
+        CommandId::Find => open_find_bar(hwnd, find_bar::FindBarMode::Find),
+        CommandId::Replace => open_find_bar(hwnd, find_bar::FindBarMode::Replace),
         _ => {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.execute(command);

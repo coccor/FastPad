@@ -55,3 +55,7 @@ path = "tests/windows/open_file.rs"
 [[test]]
 name = "save_file"
 path = "tests/windows/save_file.rs"
+
+[[test]]
+name = "editing"
+path = "tests/windows/editing.rs"

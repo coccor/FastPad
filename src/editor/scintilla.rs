@@ -1,8 +1,11 @@
 use crate::editor::scintilla_constants::{
-    SC_CP_UTF8, SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CREATEDOCUMENT, SCI_EMPTYUNDOBUFFER,
-    SCI_ENDUNDOACTION, SCI_GETDIRECTFUNCTION, SCI_GETDIRECTPOINTER, SCI_GETDOCPOINTER, SCI_GETTEXT,
-    SCI_GETTEXTLENGTH, SCI_RELEASEDOCUMENT, SCI_SEARCHINTARGET, SCI_SETCODEPAGE, SCI_SETDOCPOINTER,
-    SCI_SETSAVEPOINT, SCI_SETSEARCHFLAGS, SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION,
+    SC_CP_UTF8, SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY,
+    SCI_CREATEDOCUMENT, SCI_CUT, SCI_EMPTYUNDOBUFFER, SCI_ENDUNDOACTION, SCI_GETDIRECTFUNCTION,
+    SCI_GETDIRECTPOINTER, SCI_GETDOCPOINTER, SCI_GETLENGTH, SCI_GETSELECTIONEND,
+    SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_GETTEXT, SCI_GETTEXTLENGTH, SCI_PASTE, SCI_REDO,
+    SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SCROLLCARET, SCI_SEARCHINTARGET, SCI_SETCODEPAGE,
+    SCI_SETDOCPOINTER, SCI_SETSAVEPOINT, SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE,
+    SCI_SETTEXT, SCI_SETUNDOCOLLECTION, SCI_UNDO,
 };
 use crate::{FastPadError, Result};
 use std::ffi::CString;
@@ -212,6 +215,29 @@ impl Editor {
     }
 
     #[cfg(windows)]
+    pub fn length(&self) -> Result<usize> {
+        let length = self.endpoint.send_direct_checked(SCI_GETLENGTH, 0, 0)?;
+        if length < 0 {
+            return Err(FastPadError::Invariant(
+                "Scintilla returned a negative document length",
+            ));
+        }
+        Ok(length as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn length(&self) -> Result<usize> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Scrolls so the caret (the end of the current selection) is visible, without changing it.
+    pub fn scroll_caret_into_view(&self) {
+        let _ = self.endpoint.send_direct_if_alive(SCI_SCROLLCARET, 0, 0);
+    }
+
+    #[cfg(windows)]
     pub fn search_in_target(
         &self,
         needle: &str,
@@ -250,6 +276,219 @@ impl Editor {
         ))
     }
 
+    #[cfg(windows)]
+    pub fn replace_target(&self, range: Range<usize>, replacement: &str) -> Result<Range<usize>> {
+        self.endpoint
+            .send_direct_checked(SCI_SETTARGETRANGE, range.start, range.end as isize)?;
+        let bytes = replacement.as_bytes();
+        self.endpoint.send_direct_checked(
+            SCI_REPLACETARGET,
+            bytes.len(),
+            bytes.as_ptr() as isize,
+        )?;
+        Ok(range.start..range.start + bytes.len())
+    }
+
+    #[cfg(not(windows))]
+    pub fn replace_target(&self, _range: Range<usize>, _replacement: &str) -> Result<Range<usize>> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Replaces every occurrence of `query` with `replacement`, as one undo action. Searches
+    /// incrementally via `search_in_target`/`replace_target`; never retrieves the full document.
+    #[cfg(windows)]
+    pub fn replace_all(&self, query: &str, replacement: &str, search_flags: u32) -> Result<usize> {
+        if query.is_empty() {
+            return Ok(0);
+        }
+        self.begin_undo_action();
+        let result = (|| {
+            let mut count = 0usize;
+            let mut position = 0usize;
+            loop {
+                let length = self.length()?;
+                if position > length {
+                    break;
+                }
+                let Some(found) = self.search_in_target(query, position..length, search_flags)?
+                else {
+                    break;
+                };
+                let replaced = self.replace_target(found, replacement)?;
+                count += 1;
+                position = replaced.end;
+            }
+            Ok(count)
+        })();
+        self.end_undo_action();
+        result
+    }
+
+    #[cfg(not(windows))]
+    pub fn replace_all(
+        &self,
+        _query: &str,
+        _replacement: &str,
+        _search_flags: u32,
+    ) -> Result<usize> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn undo(&self) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_UNDO, 0, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn undo(&self) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn redo(&self) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_REDO, 0, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn redo(&self) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn can_undo(&self) -> Result<bool> {
+        Ok(self.endpoint.send_direct_checked(SCI_CANUNDO, 0, 0)? != 0)
+    }
+
+    #[cfg(not(windows))]
+    pub fn can_undo(&self) -> Result<bool> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn can_redo(&self) -> Result<bool> {
+        Ok(self.endpoint.send_direct_checked(SCI_CANREDO, 0, 0)? != 0)
+    }
+
+    #[cfg(not(windows))]
+    pub fn can_redo(&self) -> Result<bool> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn cut(&self) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_CUT, 0, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn cut(&self) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn copy(&self) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_COPY, 0, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn copy(&self) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn paste(&self) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_PASTE, 0, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn paste(&self) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn selection(&self) -> Result<Range<usize>> {
+        let start = self
+            .endpoint
+            .send_direct_checked(SCI_GETSELECTIONSTART, 0, 0)?;
+        let end = self
+            .endpoint
+            .send_direct_checked(SCI_GETSELECTIONEND, 0, 0)?;
+        if start < 0 || end < start {
+            return Err(FastPadError::Invariant(
+                "Scintilla returned an invalid selection range",
+            ));
+        }
+        Ok(start as usize..end as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn selection(&self) -> Result<Range<usize>> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    #[cfg(windows)]
+    pub fn set_selection(&self, range: Range<usize>) -> Result<()> {
+        self.endpoint
+            .send_direct_checked(SCI_SETSEL, range.start, range.end as isize)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_selection(&self, _range: Range<usize>) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// The text of the current selection, retrieved directly via `SCI_GETSELTEXT` rather than by
+    /// slicing a full-document read.
+    #[cfg(windows)]
+    pub fn selected_text(&self) -> Result<String> {
+        let length = self.endpoint.send_direct_checked(SCI_GETSELTEXT, 0, 0)?;
+        if length < 0 {
+            return Err(FastPadError::Invariant(
+                "Scintilla returned a negative selection length",
+            ));
+        }
+        let mut bytes = vec![0_u8; length as usize + 1];
+        self.endpoint
+            .send_direct_checked(SCI_GETSELTEXT, 0, bytes.as_mut_ptr() as isize)?;
+        bytes.truncate(length as usize);
+        String::from_utf8(bytes)
+            .map_err(|_| FastPadError::Invariant("Scintilla returned invalid UTF-8"))
+    }
+
+    #[cfg(not(windows))]
+    pub fn selected_text(&self) -> Result<String> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
     pub fn set_save_point(&self) {
         let _ = self.endpoint.send_direct_if_alive(SCI_SETSAVEPOINT, 0, 0);
     }
@@ -280,7 +519,7 @@ impl Editor {
     }
 
     #[cfg(test)]
-    fn test_fixture(direct_fn: SciFnDirect, direct_ptr: isize) -> Self {
+    pub(crate) fn test_fixture(direct_fn: SciFnDirect, direct_ptr: isize) -> Self {
         Self {
             endpoint: Rc::new(EditorEndpoint::new(
                 std::ptr::null_mut(),
@@ -579,8 +818,10 @@ unsafe extern "C" fn inert_direct_call(
 mod tests {
     use super::{Editor, EditorDocument};
     use crate::editor::scintilla_constants::{
-        SCI_ADDREFDOCUMENT, SCI_RELEASEDOCUMENT, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS,
-        SCI_SETTARGETRANGE,
+        SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY, SCI_CUT,
+        SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_PASTE,
+        SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS,
+        SCI_SETSEL, SCI_SETTARGETRANGE, SCI_UNDO,
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -660,6 +901,163 @@ mod tests {
         assert_eq!(found, None);
     }
 
+    #[test]
+    fn length_reads_the_document_length() {
+        let harness = TestDirectHarness::new();
+        harness.push_response(42);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert_eq!(editor.length().unwrap(), 42);
+    }
+
+    #[test]
+    fn undo_and_redo_send_the_matching_scintilla_messages() {
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.undo().unwrap();
+        editor.redo().unwrap();
+
+        assert_eq!(harness.messages(), vec![SCI_UNDO, SCI_REDO]);
+    }
+
+    #[test]
+    fn can_undo_and_can_redo_report_scintillas_boolean_state() {
+        // Break caught: treating any nonzero Scintilla response as `true` incorrectly, or
+        // collapsing distinct CANUNDO/CANREDO answers into one shared flag.
+        let harness = TestDirectHarness::new();
+        harness.push_response(1);
+        harness.push_response(0);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert!(editor.can_undo().unwrap());
+        assert!(!editor.can_redo().unwrap());
+        assert_eq!(harness.messages(), vec![SCI_CANUNDO, SCI_CANREDO]);
+    }
+
+    #[test]
+    fn cut_copy_paste_send_the_matching_scintilla_messages() {
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.cut().unwrap();
+        editor.copy().unwrap();
+        editor.paste().unwrap();
+
+        assert_eq!(harness.messages(), vec![SCI_CUT, SCI_COPY, SCI_PASTE]);
+    }
+
+    #[test]
+    fn selection_reads_start_and_end_from_scintilla() {
+        let harness = TestDirectHarness::new();
+        harness.push_response(3);
+        harness.push_response(9);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        let range = editor.selection().unwrap();
+
+        assert_eq!(range, 3..9);
+        assert_eq!(
+            harness.messages(),
+            vec![SCI_GETSELECTIONSTART, SCI_GETSELECTIONEND]
+        );
+    }
+
+    #[test]
+    fn selection_rejects_an_end_before_start() {
+        // Break caught: trusting Scintilla's raw start/end without validating ordering can hand
+        // callers a range that panics on use (e.g. slicing) instead of a clear error.
+        let harness = TestDirectHarness::new();
+        harness.push_response(9);
+        harness.push_response(3);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert!(editor.selection().is_err());
+    }
+
+    #[test]
+    fn set_selection_sends_anchor_and_caret_as_start_and_end() {
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.set_selection(4..10).unwrap();
+
+        assert_eq!(harness.messages(), vec![SCI_SETSEL]);
+        assert_eq!(harness.set_sel_calls(), vec![(4, 10)]);
+    }
+
+    #[test]
+    fn selected_text_reads_the_current_selection_without_a_full_document_fetch() {
+        let harness = TestDirectHarness::new();
+        harness.set_selected_text("needle");
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        let text = editor.selected_text().unwrap();
+
+        assert_eq!(text, "needle");
+        assert_eq!(harness.messages(), vec![SCI_GETSELTEXT, SCI_GETSELTEXT]);
+    }
+
+    #[test]
+    fn replace_target_sets_the_range_then_replaces_and_returns_the_new_end() {
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        let replaced = editor.replace_target(4..7, "longer").unwrap();
+
+        assert_eq!(replaced, 4..10);
+        assert_eq!(
+            harness.messages(),
+            vec![SCI_SETTARGETRANGE, SCI_REPLACETARGET]
+        );
+        assert_eq!(harness.target_range(), Some((4, 7)));
+        assert_eq!(harness.replace_bytes(), vec![b"longer".to_vec()]);
+    }
+
+    #[test]
+    fn replace_all_replaces_every_match_as_exactly_one_undo_action() {
+        // Break caught: wrapping each individual replacement in its own undo action instead of one
+        // action for the whole operation would require multiple Ctrl+Z presses to undo Replace All.
+        let harness = TestDirectHarness::new();
+        // Iteration 1: document length 11 ("one two one"), match "one" at 0.
+        harness.push_response(0); // SCI_BEGINUNDOACTION (ignored)
+        harness.push_response(11); // SCI_GETLENGTH
+        harness.push_response(0); // SCI_SEARCHINTARGET finds "one" at 0
+        harness.push_response(0); // SCI_REPLACETARGET (ignored)
+        // Iteration 2: document length now 12 (replaced 3 bytes with 4), match "one" at 9.
+        harness.push_response(12); // SCI_GETLENGTH
+        harness.push_response(9); // SCI_SEARCHINTARGET finds "one" at 9
+        harness.push_response(0); // SCI_REPLACETARGET (ignored)
+        // Iteration 3: no more matches.
+        harness.push_response(13); // SCI_GETLENGTH
+        harness.push_response(-1); // SCI_SEARCHINTARGET finds nothing
+        harness.push_response(0); // SCI_ENDUNDOACTION (ignored)
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        let count = editor.replace_all("one", "1111", 0).unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            harness.replace_bytes(),
+            vec![b"1111".to_vec(), b"1111".to_vec()]
+        );
+        assert_eq!(
+            harness.event_log(),
+            vec!["begin", "replace", "replace", "end"]
+        );
+    }
+
+    #[test]
+    fn replace_all_with_an_empty_query_does_nothing() {
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        let count = editor.replace_all("", "x", 0).unwrap();
+
+        assert_eq!(count, 0);
+        assert!(harness.messages().is_empty());
+    }
+
     #[derive(Default)]
     struct TestDirectState {
         messages: Vec<u32>,
@@ -667,6 +1065,10 @@ mod tests {
         target_range: Option<(usize, isize)>,
         search_flags: Option<usize>,
         search_needle: Option<Vec<u8>>,
+        replace_bytes: Vec<Vec<u8>>,
+        set_sel_calls: Vec<(usize, isize)>,
+        selected_text: Option<Vec<u8>>,
+        event_log: Vec<&'static str>,
     }
 
     struct TestDirectHarness {
@@ -703,6 +1105,22 @@ mod tests {
         fn search_needle(&self) -> Option<Vec<u8>> {
             self.state.lock().unwrap().search_needle.clone()
         }
+
+        fn replace_bytes(&self) -> Vec<Vec<u8>> {
+            self.state.lock().unwrap().replace_bytes.clone()
+        }
+
+        fn set_sel_calls(&self) -> Vec<(usize, isize)> {
+            self.state.lock().unwrap().set_sel_calls.clone()
+        }
+
+        fn set_selected_text(&self, text: &str) {
+            self.state.lock().unwrap().selected_text = Some(text.as_bytes().to_vec());
+        }
+
+        fn event_log(&self) -> Vec<&'static str> {
+            self.state.lock().unwrap().event_log.clone()
+        }
     }
 
     unsafe extern "C" fn test_direct(
@@ -727,6 +1145,35 @@ mod tests {
                 let bytes = unsafe { std::slice::from_raw_parts(lparam as *const u8, wparam) };
                 state.search_needle = Some(bytes.to_vec());
                 state.responses.pop_front().unwrap_or(-1)
+            }
+            SCI_REPLACETARGET => {
+                let bytes = unsafe { std::slice::from_raw_parts(lparam as *const u8, wparam) };
+                state.replace_bytes.push(bytes.to_vec());
+                state.event_log.push("replace");
+                state.responses.pop_front().unwrap_or(0)
+            }
+            SCI_SETSEL => {
+                state.set_sel_calls.push((wparam, lparam));
+                0
+            }
+            SCI_BEGINUNDOACTION => {
+                state.event_log.push("begin");
+                state.responses.pop_front().unwrap_or(0)
+            }
+            SCI_ENDUNDOACTION => {
+                state.event_log.push("end");
+                state.responses.pop_front().unwrap_or(0)
+            }
+            SCI_GETSELTEXT => {
+                let text = state.selected_text.clone().unwrap_or_default();
+                if lparam != 0 {
+                    let buffer = unsafe {
+                        std::slice::from_raw_parts_mut(lparam as *mut u8, text.len() + 1)
+                    };
+                    buffer[..text.len()].copy_from_slice(&text);
+                    buffer[text.len()] = 0;
+                }
+                text.len() as isize
             }
             _ => state.responses.pop_front().unwrap_or(0),
         }
