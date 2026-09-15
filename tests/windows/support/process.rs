@@ -7,19 +7,24 @@ use std::error::Error;
 #[cfg(windows)]
 use std::ffi::OsStr;
 #[cfg(windows)]
+use std::mem::size_of;
+#[cfg(windows)]
 use std::process::Command;
 #[cfg(windows)]
 use std::time::Duration;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{HANDLE, HMODULE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT};
+#[cfg(windows)]
+use windows_sys::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleBaseNameW};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForInputIdle,
-    WaitForSingleObject,
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_VM_READ, WaitForInputIdle, WaitForSingleObject,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+    BM_CLICK, EnumChildWindows, EnumWindows, GetClassNameW, GetWindowTextW,
+    GetWindowThreadProcessId, PostMessageW, SendMessageW, WM_CLOSE,
 };
 #[cfg(windows)]
 use windows_sys::core::BOOL;
@@ -74,6 +79,11 @@ impl FastPadProcess {
         }
     }
 
+    /// Requests a normal shutdown and waits for the process to exit. If a real, blocking
+    /// `MessageBoxW` is showing over the main window — a "Save changes?" prompt (e.g. left behind
+    /// by a test keystroke that unblocked a deferred file open before the real content replaced
+    /// it) or a plain OK warning (e.g. a failed language activation) — this dismisses it so the
+    /// close can keep progressing instead of hanging forever.
     pub fn close(mut self) -> TestResult<()> {
         if let Some(status) = self.process.try_wait()? {
             return if status.success() {
@@ -88,11 +98,24 @@ impl FastPadProcess {
             }
         }
 
-        wait_for_exit(
-            &mut self.process,
-            &Deadline::after(Duration::from_secs(2)),
-            true,
-        )
+        let process_id = self.process.id();
+        let deadline = Deadline::after(Duration::from_secs(4));
+        loop {
+            if let Some(status) = self.process.try_wait()? {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("fastpad exited with nonzero exit code {:?}", status.code()).into())
+                };
+            }
+            if let Some(dialog) = find_unsaved_changes_dialog(process_id)? {
+                dismiss_dialog(dialog);
+            }
+            if deadline.expired() {
+                return Err("timed out waiting for FastPad to exit after WM_CLOSE".into());
+            }
+            deadline.sleep_step();
+        }
     }
 }
 
@@ -100,6 +123,82 @@ impl FastPadProcess {
 impl Drop for FastPadProcess {
     fn drop(&mut self) {
         let _ = cleanup_process(&mut self.process, &Deadline::after(Duration::from_secs(2)));
+    }
+}
+
+/// Checks whether a module named `module_file_name` (e.g. `"Lexilla.dll"`) is currently loaded in
+/// another process, via `EnumProcessModules`/`GetModuleBaseNameW` (Psapi). Used to observe deferred
+/// DLL loading from outside the target process without reaching into its internals.
+#[cfg(windows)]
+pub fn process_has_module_loaded(process_id: u32, module_file_name: &str) -> TestResult<bool> {
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, process_id) };
+    if raw.is_null() {
+        return Err(Box::new(fastpad::platform::last_error()));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_owned(raw) }?;
+
+    let mut needed: u32 = 0;
+    unsafe {
+        EnumProcessModules(handle.as_raw(), std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed == 0 {
+        return Ok(false);
+    }
+    let count = needed as usize / size_of::<HMODULE>();
+    let mut modules: Vec<HMODULE> = vec![std::ptr::null_mut(); count];
+    let mut needed_after: u32 = 0;
+    let ok = unsafe {
+        EnumProcessModules(
+            handle.as_raw(),
+            modules.as_mut_ptr(),
+            needed,
+            &mut needed_after,
+        )
+    };
+    if ok == 0 {
+        return Err(Box::new(fastpad::platform::last_error()));
+    }
+    let actual_count = (needed_after as usize / size_of::<HMODULE>()).min(modules.len());
+
+    for &module in &modules[..actual_count] {
+        let mut name = [0_u16; 260];
+        let length = unsafe {
+            GetModuleBaseNameW(
+                handle.as_raw(),
+                module,
+                name.as_mut_ptr(),
+                name.len() as u32,
+            )
+        };
+        if length == 0 {
+            continue;
+        }
+        if String::from_utf16_lossy(&name[..length as usize]).eq_ignore_ascii_case(module_file_name)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Waits for a standard `MessageBoxW` dialog to appear over `process_id`'s windows and dismisses
+/// it (see `dismiss_dialog`). Useful for deliberately clearing a *predictable, isolated* dialog
+/// (e.g. a failed-language-activation warning) before doing anything else, so it cannot later
+/// overlap with a second dialog `close()` may need to show/dismiss reentrantly (nested modal
+/// `MessageBoxW` calls on the same thread are surprising to reason about; avoiding the overlap in
+/// the first place is simpler than making `close()` robust to it).
+#[cfg(windows)]
+pub fn wait_and_dismiss_dialog(process_id: u32, timeout: Duration) -> TestResult<()> {
+    let deadline = Deadline::after(timeout);
+    loop {
+        if let Some(dialog) = find_unsaved_changes_dialog(process_id)? {
+            dismiss_dialog(dialog);
+            return Ok(());
+        }
+        if deadline.expired() {
+            return Err("timed out waiting for a dialog to appear".into());
+        }
+        deadline.sleep_step();
     }
 }
 
@@ -161,6 +260,94 @@ unsafe extern "system" fn enum_main_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
         GetWindowThreadProcessId(hwnd, &mut process_id);
     }
     if process_id == search.process_id {
+        search.hwnd = Some(hwnd);
+        return 0;
+    }
+    1
+}
+
+/// Clicks whichever of the "No" (discard, for the "Save changes?" prompt) or "OK" (for a plain
+/// warning, e.g. a failed language activation) buttons a standard `MessageBoxW` actually has.
+#[cfg(windows)]
+fn dismiss_dialog(dialog: HWND) {
+    let mut search = ButtonSearch { hwnd: None };
+    unsafe {
+        EnumChildWindows(
+            dialog,
+            Some(enum_no_or_ok_button),
+            &mut search as *mut ButtonSearch as isize,
+        );
+    }
+    if let Some(button) = search.hwnd {
+        unsafe {
+            SendMessageW(button, BM_CLICK, 0, 0);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ButtonSearch {
+    hwnd: Option<HWND>,
+}
+
+/// Matches a standard `MessageBoxW` button by its (English, matching this test suite's existing
+/// hardcoded-English assumption in the prompt text it is dismissing) caption rather than by
+/// control id: `GetDlgItem` did not reliably find these buttons by id cross-process in practice.
+#[cfg(windows)]
+unsafe extern "system" fn enum_no_or_ok_button(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = unsafe { &mut *(lparam as *mut ButtonSearch) };
+    let mut text = [0_u16; 32];
+    let length = unsafe { GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32) };
+    if length > 0 {
+        let text = String::from_utf16_lossy(&text[..length as usize]);
+        let normalized = text.trim_start_matches('&');
+        if normalized.eq_ignore_ascii_case("No") || normalized.eq_ignore_ascii_case("OK") {
+            search.hwnd = Some(hwnd);
+            return 0;
+        }
+    }
+    1
+}
+
+/// Finds a top-level standard `MessageBoxW` dialog (window class `"#32770"`) owned by `process_id`,
+/// such as FastPad's "Save changes?" close prompt.
+#[cfg(windows)]
+fn find_unsaved_changes_dialog(process_id: u32) -> TestResult<Option<HWND>> {
+    let mut search = DialogSearch {
+        process_id,
+        hwnd: None,
+    };
+    let ok = unsafe {
+        EnumWindows(
+            Some(enum_dialog_for_process),
+            &mut search as *mut DialogSearch as isize,
+        )
+    };
+    if ok == 0 && search.hwnd.is_none() {
+        return Err(Box::new(fastpad::platform::last_error()));
+    }
+    Ok(search.hwnd)
+}
+
+#[cfg(windows)]
+struct DialogSearch {
+    process_id: u32,
+    hwnd: Option<HWND>,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_dialog_for_process(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = unsafe { &mut *(lparam as *mut DialogSearch) };
+    let mut process_id = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut process_id);
+    }
+    if process_id != search.process_id {
+        return 1;
+    }
+    let mut class_name = [0_u16; 32];
+    let length = unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+    if length > 0 && String::from_utf16_lossy(&class_name[..length as usize]) == "#32770" {
         search.hwnd = Some(hwnd);
         return 0;
     }

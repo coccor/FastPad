@@ -323,6 +323,21 @@ impl Tabs {
         true
     }
 
+    /// Records the active document's language after an explicit `LanguageX` command or automatic
+    /// detection, independent of applying the actual lexer to the live editor. Returns `false`
+    /// (no-op) when the active document already has this language.
+    pub(crate) fn set_active_language(&mut self, language: crate::document::Language) -> bool {
+        let active = self.active_index();
+        let Some(document) = self.documents.get_mut(active) else {
+            return false;
+        };
+        if document.language == language {
+            return false;
+        }
+        document.language = language;
+        true
+    }
+
     pub(crate) fn note_active_text_change(&mut self) {
         let active = self.active_index();
         if let Some(document) = self.documents.get_mut(active) {
@@ -470,6 +485,26 @@ mod tests {
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs.active_index(), 0);
         assert_eq!(tabs.titles().collect::<Vec<_>>(), ["Untitled"]);
+    }
+
+    #[test]
+    fn set_active_language_updates_only_the_active_document() {
+        // Break caught: explicit language selection or detection-on-open applying to the wrong
+        // tab, or leaving Document::language stale after a real lexer switch.
+        use crate::document::Language;
+        let mut tabs = Tabs::from_documents([document(1), document(2)]).unwrap();
+        tabs.activate(DocumentId(2)).unwrap();
+
+        assert!(tabs.set_active_language(Language::Json));
+        assert!(!tabs.set_active_language(Language::Json));
+        assert_eq!(
+            tabs.document(DocumentId(1)).unwrap().language,
+            Language::PlainText
+        );
+        assert_eq!(
+            tabs.document(DocumentId(2)).unwrap().language,
+            Language::Json
+        );
     }
 
     #[test]

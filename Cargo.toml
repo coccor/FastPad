@@ -20,6 +20,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_Performance",
     "Win32_System_Pipes",
     "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Variant",
@@ -59,3 +60,7 @@ path = "tests/windows/save_file.rs"
 [[test]]
 name = "editing"
 path = "tests/windows/editing.rs"
+
+[[test]]
+name = "highlighting"
+path = "tests/windows/highlighting.rs"

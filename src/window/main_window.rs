@@ -326,6 +326,14 @@ fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
             let _ = record_milestone(hwnd, milestone);
         }
     }
+    // `WM_FASTPAD_APPLY_LANGUAGE` is the only message that classifies into
+    // `PostNext(WM_FASTPAD_RECOVERY)`, so this is exactly the point where that message has just
+    // been processed (input was not pending). It serves double duty: advancing the deferred
+    // startup chain (above/below) and, here, detecting and applying the active document's
+    // language after every successful Open/Save As/launch load that posts it.
+    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_RECOVERY) {
+        apply_detected_language(hwnd);
+    }
     match action {
         DeferredAction::RepostSelf(message) => {
             unsafe {
@@ -759,6 +767,9 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         }),
         CommandId::Find => open_find_bar(hwnd, find_bar::FindBarMode::Find),
         CommandId::Replace => open_find_bar(hwnd, find_bar::FindBarMode::Replace),
+        CommandId::LanguagePlainText => apply_language(hwnd, crate::document::Language::PlainText),
+        CommandId::LanguageJson => apply_language(hwnd, crate::document::Language::Json),
+        CommandId::LanguageMarkdown => apply_language(hwnd, crate::document::Language::Markdown),
         _ => {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.execute(command);
@@ -769,6 +780,128 @@ fn execute_command(hwnd: HWND, command: CommandId) {
 
 fn file_population_active(hwnd: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.populating_file)
+}
+
+/// Detects the active document's language from its path (an untitled document has no path and
+/// stays whatever it already is, i.e. plain text) and applies it. Reached only after `input_pending`
+/// is false for `WM_FASTPAD_APPLY_LANGUAGE` (see `handle_deferred`), so this never runs ahead of
+/// queued user input.
+fn apply_detected_language(hwnd: HWND) {
+    let path =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tabs.active().path.clone());
+    let Some(path) = path else {
+        return;
+    };
+    apply_language(hwnd, crate::languages::detect_language(&path));
+}
+
+/// Applies `language`'s lexer to the active editor via the (lazily created, per Task 13's
+/// `find_bar`/`menu_bar`-style `Option<T>` precedent) `App::language_manager`, then records the
+/// outcome on the active document's metadata: success updates `Document::language` to match what
+/// is now actually shown; failure leaves the document's language metadata unchanged (the editor
+/// itself is also left unchanged by `LanguageManager::apply` on failure) and surfaces the error.
+fn apply_language(hwnd: HWND, language: crate::document::Language) {
+    let Some(editor) =
+        (unsafe { app_ptr(hwnd) }).and_then(|app| unsafe { app.as_ref() }.editor.clone())
+    else {
+        return;
+    };
+    let dark = system_uses_dark_mode();
+    let result = unsafe { app_ptr(hwnd) }.map(|mut app| {
+        let app = unsafe { app.as_mut() };
+        if app.language_manager.is_none() {
+            app.language_manager = Some(crate::languages::LanguageManager::new());
+        }
+        app.language_manager
+            .as_mut()
+            .expect("just populated above if it was absent")
+            .apply(&editor, language, dark)
+    });
+    match result {
+        Some(Ok(())) => {
+            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                unsafe { app.as_mut() }.tabs.set_active_language(language);
+            }
+        }
+        Some(Err(_)) => {
+            show_language_error(
+                hwnd,
+                "FastPad could not enable syntax highlighting for this file. It will remain in \
+                 plain text.",
+            );
+        }
+        None => {}
+    }
+}
+
+/// Reads `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme` on
+/// every call (no caching, no `WM_SETTINGCHANGE` reactivity, no live re-styling of already-open
+/// documents — a real theme subsystem is future scope beyond this task). Defaults to light when
+/// the value cannot be read.
+fn system_uses_dark_mode() -> bool {
+    dark_mode_from_apps_use_light_theme(read_apps_use_light_theme())
+}
+
+/// Pure: `1` (or missing/unreadable) means the light theme is in use; `0` means dark.
+fn dark_mode_from_apps_use_light_theme(apps_use_light_theme: Option<u32>) -> bool {
+    apps_use_light_theme == Some(0)
+}
+
+fn read_apps_use_light_theme() -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    let subkey = wide_null(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let value_name = wide_null("AppsUseLightTheme");
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&raw mut data).cast::<c_void>(),
+            &mut size,
+        )
+    };
+    (status == 0).then_some(data)
+}
+
+// A real MessageBoxW is a blocking, modal native dialog; see `show_save_error`'s longer comment
+// for why the test build records the message instead of showing it.
+#[cfg(not(test))]
+fn show_language_error(hwnd: HWND, message: &str) {
+    let text = wide_null(message);
+    let caption = wide_null("FastPad");
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_ICONWARNING | MB_OK,
+        );
+    }
+}
+
+#[cfg(test)]
+fn show_language_error(_hwnd: HWND, message: &str) {
+    LANGUAGE_ERRORS.with(|errors| errors.borrow_mut().push(message.to_owned()));
+}
+
+#[cfg(test)]
+thread_local! {
+    static LANGUAGE_ERRORS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only accessor for the messages `show_language_error` would otherwise have shown as a real
+/// MessageBoxW. Clears the recorded list.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "consumed by the source-linked highlighting integration target"
+)]
+pub(crate) fn take_language_errors() -> Vec<String> {
+    LANGUAGE_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()))
 }
 
 fn handle_open_request(hwnd: HWND) -> LRESULT {
@@ -1548,8 +1681,8 @@ fn store_app(hwnd: HWND, value: Box<App>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        MainWindowClass, WindowCreateContext, handle_paint_with, mark_first_paint_complete,
-        take_deferred_start_pending,
+        MainWindowClass, WindowCreateContext, dark_mode_from_apps_use_light_theme,
+        handle_paint_with, mark_first_paint_complete, take_deferred_start_pending,
     };
     use crate::app::App;
     use crate::launch::LaunchOptions;
@@ -1564,6 +1697,15 @@ mod tests {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, IsWindow, WM_PAINT,
     };
+
+    #[test]
+    fn dark_mode_is_read_from_the_apps_use_light_theme_registry_value() {
+        // Break caught: inverting the 0/1 sense of AppsUseLightTheme would style every JSON/
+        // Markdown document with the wrong theme's colors.
+        assert!(!dark_mode_from_apps_use_light_theme(Some(1)));
+        assert!(dark_mode_from_apps_use_light_theme(Some(0)));
+        assert!(!dark_mode_from_apps_use_light_theme(None));
+    }
 
     #[test]
     fn create_context_drops_untransferred_value_on_pre_window_failure() {

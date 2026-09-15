@@ -4,8 +4,9 @@ use crate::editor::scintilla_constants::{
     SCI_GETDIRECTPOINTER, SCI_GETDOCPOINTER, SCI_GETLENGTH, SCI_GETSELECTIONEND,
     SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_GETTEXT, SCI_GETTEXTLENGTH, SCI_PASTE, SCI_REDO,
     SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SCROLLCARET, SCI_SEARCHINTARGET, SCI_SETCODEPAGE,
-    SCI_SETDOCPOINTER, SCI_SETSAVEPOINT, SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE,
-    SCI_SETTEXT, SCI_SETUNDOCOLLECTION, SCI_UNDO,
+    SCI_SETDOCPOINTER, SCI_SETILEXER, SCI_SETSAVEPOINT, SCI_SETSEARCHFLAGS, SCI_SETSEL,
+    SCI_SETTARGETRANGE, SCI_SETTEXT, SCI_SETUNDOCOLLECTION, SCI_STYLECLEARALL, SCI_STYLESETBACK,
+    SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
 };
 use crate::{FastPadError, Result};
 use std::ffi::CString;
@@ -489,6 +490,82 @@ impl Editor {
         ))
     }
 
+    /// Installs `lexer` (an opaque `ILexer5*` from Lexilla's `CreateLexer`, or `0` for Scintilla's
+    /// built-in null lexer) via `SCI_SETILEXER`. Scintilla takes ownership of a non-null pointer
+    /// and releases it itself when replaced or the document is destroyed; this method never calls
+    /// `Release()` and never interprets the pointer beyond forwarding it.
+    #[cfg(windows)]
+    pub fn set_lexer(&self, lexer: isize) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_SETILEXER, 0, lexer)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_lexer(&self, _lexer: isize) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Resets every style number to Scintilla's current default look via `SCI_STYLECLEARALL`, so a
+    /// previous language's style overrides cannot bleed into the next one before `set_style`
+    /// reapplies the styles relevant to the newly installed lexer.
+    #[cfg(windows)]
+    pub fn clear_all_styles(&self) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_STYLECLEARALL, 0, 0)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn clear_all_styles(&self) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Sets one lexer style's foreground, background, bold flag, and font face. `bold` is always
+    /// sent explicitly (both true and false) so a previous language's bold flag cannot leak
+    /// through onto this style number.
+    #[cfg(windows)]
+    pub fn set_style(
+        &self,
+        style: u32,
+        foreground: u32,
+        background: u32,
+        bold: bool,
+        face: &str,
+    ) -> Result<()> {
+        let face = CString::new(face).map_err(|_| {
+            FastPadError::Invariant("Scintilla font face may not contain NUL bytes")
+        })?;
+        self.endpoint
+            .send_direct_checked(SCI_STYLESETFORE, style as usize, foreground as isize)?;
+        self.endpoint
+            .send_direct_checked(SCI_STYLESETBACK, style as usize, background as isize)?;
+        self.endpoint
+            .send_direct_checked(SCI_STYLESETBOLD, style as usize, isize::from(bold))?;
+        self.endpoint.send_direct_checked(
+            SCI_STYLESETFONT,
+            style as usize,
+            face.as_ptr() as isize,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_style(
+        &self,
+        _style: u32,
+        _foreground: u32,
+        _background: u32,
+        _bold: bool,
+        _face: &str,
+    ) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
     pub fn set_save_point(&self) {
         let _ = self.endpoint.send_direct_if_alive(SCI_SETSAVEPOINT, 0, 0);
     }
@@ -820,8 +897,9 @@ mod tests {
     use crate::editor::scintilla_constants::{
         SCI_ADDREFDOCUMENT, SCI_BEGINUNDOACTION, SCI_CANREDO, SCI_CANUNDO, SCI_COPY, SCI_CUT,
         SCI_ENDUNDOACTION, SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART, SCI_GETSELTEXT, SCI_PASTE,
-        SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETSEARCHFLAGS,
-        SCI_SETSEL, SCI_SETTARGETRANGE, SCI_UNDO,
+        SCI_REDO, SCI_RELEASEDOCUMENT, SCI_REPLACETARGET, SCI_SEARCHINTARGET, SCI_SETILEXER,
+        SCI_SETSEARCHFLAGS, SCI_SETSEL, SCI_SETTARGETRANGE, SCI_STYLECLEARALL, SCI_STYLESETBACK,
+        SCI_STYLESETBOLD, SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -1048,6 +1126,97 @@ mod tests {
     }
 
     #[test]
+    fn set_lexer_sends_the_raw_pointer_via_sci_setilexer() {
+        // Break caught: not forwarding the exact opaque ILexer5 pointer Lexilla returned (or
+        // routing it through the wrong message) would hand Scintilla a value it cannot own.
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.set_lexer(0x1234).unwrap();
+
+        assert_eq!(harness.messages(), vec![SCI_SETILEXER]);
+        assert_eq!(harness.lexer_calls(), vec![0x1234]);
+    }
+
+    #[test]
+    fn set_lexer_with_null_sends_the_null_lexer() {
+        // Break caught: treating a null (plain text) lexer as a no-op instead of explicitly
+        // clearing any previously installed lexer.
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.set_lexer(0).unwrap();
+
+        assert_eq!(harness.lexer_calls(), vec![0]);
+    }
+
+    #[test]
+    fn clear_all_styles_sends_sci_styleclearall() {
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.clear_all_styles().unwrap();
+
+        assert_eq!(harness.messages(), vec![SCI_STYLECLEARALL]);
+    }
+
+    #[test]
+    fn set_style_sends_foreground_background_bold_and_font_for_the_style_id() {
+        // Break caught: dropping one of fore/back/bold/font, or sending them for the wrong style
+        // id, leaves a lexer's styling stale or bleeding across style numbers.
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor
+            .set_style(2, 0xff0000, 0x00ff00, true, "Consolas")
+            .unwrap();
+
+        assert_eq!(
+            harness.messages(),
+            vec![
+                SCI_STYLESETFORE,
+                SCI_STYLESETBACK,
+                SCI_STYLESETBOLD,
+                SCI_STYLESETFONT
+            ]
+        );
+        assert_eq!(
+            harness.style_calls(),
+            vec![
+                (SCI_STYLESETFORE, 2, 0xff0000),
+                (SCI_STYLESETBACK, 2, 0x00ff00),
+                (SCI_STYLESETBOLD, 2, 1),
+            ]
+        );
+        assert_eq!(harness.font_calls(), vec![(2, b"Consolas".to_vec())]);
+    }
+
+    #[test]
+    fn set_style_sends_a_zero_bold_flag_when_not_bold() {
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.set_style(0, 0, 0, false, "Consolas").unwrap();
+
+        assert_eq!(
+            harness.style_calls(),
+            vec![
+                (SCI_STYLESETFORE, 0, 0),
+                (SCI_STYLESETBACK, 0, 0),
+                (SCI_STYLESETBOLD, 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_style_rejects_a_font_face_containing_nul_bytes() {
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        assert!(editor.set_style(0, 0, 0, false, "bad\0face").is_err());
+    }
+
+    #[test]
     fn replace_all_with_an_empty_query_does_nothing() {
         let harness = TestDirectHarness::new();
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
@@ -1069,6 +1238,9 @@ mod tests {
         set_sel_calls: Vec<(usize, isize)>,
         selected_text: Option<Vec<u8>>,
         event_log: Vec<&'static str>,
+        lexer_calls: Vec<isize>,
+        style_calls: Vec<(u32, usize, isize)>,
+        font_calls: Vec<(usize, Vec<u8>)>,
     }
 
     struct TestDirectHarness {
@@ -1120,6 +1292,18 @@ mod tests {
 
         fn event_log(&self) -> Vec<&'static str> {
             self.state.lock().unwrap().event_log.clone()
+        }
+
+        fn lexer_calls(&self) -> Vec<isize> {
+            self.state.lock().unwrap().lexer_calls.clone()
+        }
+
+        fn style_calls(&self) -> Vec<(u32, usize, isize)> {
+            self.state.lock().unwrap().style_calls.clone()
+        }
+
+        fn font_calls(&self) -> Vec<(usize, Vec<u8>)> {
+            self.state.lock().unwrap().font_calls.clone()
         }
     }
 
@@ -1174,6 +1358,21 @@ mod tests {
                     buffer[text.len()] = 0;
                 }
                 text.len() as isize
+            }
+            SCI_SETILEXER => {
+                state.lexer_calls.push(lparam);
+                0
+            }
+            SCI_STYLESETFORE | SCI_STYLESETBACK | SCI_STYLESETBOLD => {
+                state.style_calls.push((message, wparam, lparam));
+                0
+            }
+            SCI_STYLESETFONT => {
+                let bytes = unsafe { std::ffi::CStr::from_ptr(lparam as *const std::ffi::c_char) }
+                    .to_bytes()
+                    .to_vec();
+                state.font_calls.push((wparam, bytes));
+                0
             }
             _ => state.responses.pop_front().unwrap_or(0),
         }

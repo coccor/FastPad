@@ -1,5 +1,6 @@
 use crate::document::{DocumentId, RecoveryId};
 use crate::editor::Editor;
+use crate::languages::LanguageManager;
 use crate::launch::LaunchOptions;
 use crate::perf::{Milestone, StartupMetrics};
 use crate::window::accessibility::AccessibilityState;
@@ -35,6 +36,7 @@ pub struct App {
     pub(crate) accelerators: Option<AcceleratorTable>,
     pub(crate) menu_bar: Option<MenuBar>,
     pub(crate) find_bar: Option<FindBar>,
+    pub(crate) language_manager: Option<LanguageManager>,
     pub(crate) first_input_accepted: bool,
     pub(crate) deferred_open_waiting: bool,
     pub(crate) launch_open_completed: bool,
@@ -60,6 +62,7 @@ impl App {
             accelerators: AcceleratorTable::create().ok(),
             menu_bar: None,
             find_bar: None,
+            language_manager: None,
             first_input_accepted: false,
             deferred_open_waiting: false,
             launch_open_completed: false,
