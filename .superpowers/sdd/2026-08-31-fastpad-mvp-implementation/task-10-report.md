@@ -1,13 +1,13 @@
 # Task 10 implementation / investigation report
 
-## Current status: paused, not complete
+## Current status: complete with documented verification limitations
 
 Task 10 started from clean required base `6e34ca93348b735e7786ea2de0e04eaa514e2413`.
-The loader/deferred core is implemented and checkpointed. The native Open command displays
-IFileOpenDialog and cancellation is green. Successful automated selection remains unverified:
-the original nested-edit shortcut exposed a shell callback crash, and the replacement character
-driver currently leaves the expected Open dialog live. The required final feature commit and
-complete all-target runtime verification have deliberately not been claimed/performed.
+The loader/deferred core, native Open command, cancellation, and actual selected-file/canonical-
+duplicate integration are now green. The controller-resolution appendix below records the final
+implementation and complete serial runtime verification. The intervening investigation sections
+preserve the earlier paused evidence; their pending/unverified statements are historical and are
+superseded by that appendix. No production dialog workaround was introduced.
 
 ## TDD evidence
 
@@ -174,3 +174,82 @@ task complete, add a final feature commit, ignore the selected-file failure sile
 all-target runtime tests passed until successful-selection coverage is resolved and verified.
 The temporary trace has been removed from production, but test-driver diagnostic prints and
 ignored target dump/symbol tools remain available for the resumed investigation.
+
+## Controller resolution and final verification (supersedes paused status above)
+
+The controller authorized the narrow test-only pre-Show IFileDialog::SetFileName experiment,
+explicitly unavailable in production and with production dialog behavior unchanged. The exact
+method occupies SDK vtable slot 15 and takes `HRESULT (This, LPCWSTR)` with system calling
+convention. Its field remains an unused pointer-sized slot in non-test builds. Test-only filename
+configuration and event collection are thread-local, one-shot, and entirely `cfg(test)`.
+
+The open_file integration source-links the exact library sources under cfg(test), rather than
+exposing a production configuration API. It creates the real application HWND/Scintilla editor,
+executes the actual WM_COMMAND Open handler, invokes real SetFileName before real modal Show,
+and activates the native Open button from a bounded worker. It does not write the private shell
+edit control. The readiness observer accepts the shell's hidden-known-extension display (this
+machine hides `.json`). Initial overly strict readiness assertions were red; observing the actual
+extension-hidden filename established that mismatch before narrowing the test observer.
+
+The selected-file regression now passes and observes, after actual calls return:
+
+```
+CoInitializeEx -> Show returns -> GetResult -> GetDisplayName
+-> CoTaskMemFree -> IShellItem Release -> IFileOpenDialog Release -> CoUninitialize
+```
+
+It verifies exact decoded JSON, requested fixture path, Utf8Bom metadata, clean native state,
+strict `FirstInputAccepted < FileLoaded`, retained original input tab, and native document-pointer
+identity/tab count when opening a canonical `parent/./config.json` alias through a second actual
+dialog. Both selection executions assert the complete cleanup sequence. Production-process launch
+and command-cancellation coverage remain enabled; cancellation also verifies the original dirty
+state. No test is ignored, and all temporary investigation prints/private-edit writes are removed.
+
+This evidences successful Show/result/path/release boundaries with the same production ABI and
+rules out those boundaries as necessary causes of the earlier control-shortcut crash. Together
+with the symbolized crash inside HandleFileNameDirty before Show returned, it supports the narrow
+root-cause conclusion: the original test driver's private filename-control mutation triggered a
+shell callback failure. The precise undocumented shell invariant is not claimed to be proven.
+Production still uses IFileOpenDialog normally; no API substitution or exception suppression.
+
+The independently discovered one-shot APPLY_LANGUAGE fix and reentrancy hardening are retained:
+successful loading owns its continuation, native text queries and retired document drops occur
+outside App borrows, modal Show carries only owned WindowIdentity, and population gates close,
+tab activation/commands, and edit notifications. Existing startup/deferred-input and Task 9
+ownership/review regressions remain green.
+
+Fresh final checks:
+
+- `cargo test file::loader::tests --lib`: 3 passed, 0 failed.
+- `cargo test --test open_file -- --test-threads=1`: 84 passed, 0 failed.
+- `cargo test --all-targets --all-features -- --test-threads=1`: 206 passed, 0 failed:
+  library 77, benchmark 13, editor 5, open_file 84, startup 6, tabs 12, titlebar 9; binary 0.
+  The source-linked open_file target includes the 77 library regressions again plus 3 application
+  scenarios and 4 support tests; 84 is not claimed as 84 independent application scenarios.
+- `cargo clippy --all-targets --all-features -- -D warnings`: exit 0. Two narrow dead-code
+  allowances explain integration-only test seam entry points unused by the ordinary lib-test
+  target; they do not suppress production warnings or unsafe diagnostics.
+- `cargo fmt --all -- --check`, `git diff --check`: exit 0.
+- `cargo build --release --bins`: exit 0.
+
+The optional `target/release/fastpad-bench.exe --runs 10 --warmup 2 --output
+target/task10-bench.jsonl` smoke sample timed out with Win32 1460 before a record was produced.
+The benchmark's owned-child guard cleaned up; a read-only process check found no remaining
+FastPad process. No unexpected crash/error dialog appeared during final verification. No numeric
+performance envelope or reference-hardware qualification is claimed. Input-before-load timing is
+proven by actual QPC milestones in the native regressions, and the source/COM characterization
+still demonstrates that application dialog/COM setup is absent from startup.
+
+Durable checkpoints are `173f9f3` (`wip: checkpoint task 10 deferred loader core`) and `d9c54b7`
+(`wip: capture task 10 native dialog investigation`). The completed implementation and this report
+are committed with the required `feat: defer file opening until after input` message; its final
+hash is supplied in handoff because embedding the commit's own hash here would change that hash.
+
+Final self-review: scope is Task 10 only, no Save/language/persistence expansion; all interfaces
+and shell allocations have balanced guards; cancellation and error paths preserve prior state;
+canonical duplicates preserve ownership and dirty text; startup and stale-HWND defenses remain.
+The user confirmed visible dialog interaction, but this agent does not claim independent physical
+keyboard/manual selection or visual-layout QA. Successful native selection is automated through
+the controller-approved test-only seam and actual modal/result/cleanup calls. Application Verifier
+and quantitative performance qualification remain unperformed. Ignored target investigation
+artifacts are retained as evidence and are not staged; only this required ignored report is added.

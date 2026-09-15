@@ -40,7 +40,10 @@ struct FileDialogVtable {
     set_folder: usize,
     get_folder: usize,
     get_current_selection: usize,
+    #[cfg(not(test))]
     set_file_name: usize,
+    #[cfg(test)]
+    set_file_name: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
     get_file_name: usize,
     set_title: usize,
     set_ok_button_label: usize,
@@ -60,6 +63,8 @@ struct ComApartment;
 impl ComApartment {
     fn initialize() -> Result<Self> {
         check(unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) })?;
+        #[cfg(test)]
+        note_event(DialogEvent::ComInitialized);
         // S_FALSE is success too and also requires a balancing CoUninitialize.
         Ok(Self)
     }
@@ -69,6 +74,8 @@ impl Drop for ComApartment {
         unsafe {
             CoUninitialize();
         }
+        #[cfg(test)]
+        note_event(DialogEvent::ComUninitialized);
     }
 }
 
@@ -98,6 +105,8 @@ impl Drop for Interface {
                 let table = &**(self.0 as *const *const UnknownVtable);
                 (table.release)(self.0);
             }
+            #[cfg(test)]
+            note_event(DialogEvent::InterfaceReleased);
         }
     }
 }
@@ -108,6 +117,8 @@ impl Drop for TaskString {
         unsafe {
             CoTaskMemFree(self.0.cast());
         }
+        #[cfg(test)]
+        note_event(DialogEvent::PathFreed);
     }
 }
 
@@ -137,7 +148,19 @@ pub fn show_open_dialog(owner: HWND) -> Result<Option<PathBuf>> {
     check(unsafe {
         (dialog.dialog().set_options)(dialog.0, options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST)
     })?;
+    #[cfg(test)]
+    if let Some(path) = NEXT_FILE_NAME.with(|value| value.borrow_mut().take()) {
+        use std::os::windows::ffi::OsStrExt;
+        let name = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        check(unsafe { (dialog.dialog().set_file_name)(dialog.0, name.as_ptr()) })?;
+    }
     let status = dialog.show(owner);
+    #[cfg(test)]
+    note_event(DialogEvent::ShowReturned);
     if status == CANCELLED {
         return Ok(None);
     }
@@ -145,8 +168,12 @@ pub fn show_open_dialog(owner: HWND) -> Result<Option<PathBuf>> {
     let mut item = Interface(std::ptr::null_mut());
     check(unsafe { (dialog.dialog().get_result)(dialog.0, &mut item.0) })?;
     item.require()?;
+    #[cfg(test)]
+    note_event(DialogEvent::ResultRetrieved);
     let mut text = TaskString(std::ptr::null_mut());
     check(unsafe { (item.shell_item().get_display_name)(item.0, SIGDN_FILESYSPATH, &mut text.0) })?;
+    #[cfg(test)]
+    note_event(DialogEvent::DisplayNameRetrieved);
     if text.0.is_null() {
         return Err(FastPadError::Invariant("shell item returned a null path"));
     }
@@ -161,4 +188,46 @@ pub fn show_open_dialog(owner: HWND) -> Result<Option<PathBuf>> {
         std::slice::from_raw_parts(text.0, len)
     }));
     Ok(Some(path))
+}
+
+#[cfg(test)]
+thread_local! {
+    static NEXT_FILE_NAME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static EVENTS: std::cell::RefCell<Vec<DialogEvent>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum DialogEvent {
+    ComInitialized,
+    ShowReturned,
+    ResultRetrieved,
+    DisplayNameRetrieved,
+    PathFreed,
+    InterfaceReleased,
+    ComUninitialized,
+}
+
+#[cfg(test)]
+fn note_event(event: DialogEvent) {
+    EVENTS.with(|events| events.borrow_mut().push(event));
+}
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "consumed by the source-linked open_file integration target"
+)]
+pub(crate) fn set_next_open_dialog_filename(path: PathBuf) {
+    NEXT_FILE_NAME.with(|value| *value.borrow_mut() = Some(path));
+    EVENTS.with(|events| events.borrow_mut().clear());
+}
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "consumed by the source-linked open_file integration target"
+)]
+pub(crate) fn take_dialog_events() -> Vec<DialogEvent> {
+    EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }
