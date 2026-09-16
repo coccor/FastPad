@@ -556,6 +556,8 @@ pub(crate) struct TitlePaint<'a> {
     pub palette: Palette,
     pub fonts: TitleFontHandles,
     pub pointer: PointerState,
+    /// The Alt/F10 menu band's state and heading rectangles while menu mode is active.
+    pub menu: Option<(crate::window::menu_band::MenuMode, &'a [RECT])>,
 }
 
 pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
@@ -651,6 +653,19 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
                 format | DT_END_ELLIPSIS,
             );
             restore_font(dc, previous);
+        }
+    }
+
+    if let Some((mode, headings)) = input.menu {
+        unsafe {
+            crate::window::menu_band::paint(
+                dc,
+                client.right,
+                headings,
+                mode,
+                input.palette,
+                input.fonts.text,
+            );
         }
     }
 

@@ -10,10 +10,10 @@ use std::ffi::c_void;
 use std::time::Duration;
 use support::process::FastPadProcess;
 use windows_sys::Win32::Foundation::{
-    E_INVALIDARG, RECT, S_FALSE, S_OK, SysFreeString, SysStringLen,
+    E_INVALIDARG, POINT, RECT, S_FALSE, S_OK, SysFreeString, SysStringLen,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
@@ -25,12 +25,12 @@ use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
     SetThreadDpiAwarenessContext,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F10, VK_MENU, VK_SPACE};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F10, VK_MENU, VK_SPACE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetClientRect, GetMenu, GetMenuItemCount, GetWindowRect, HTCLOSE, HTLEFT,
-    HTMAXBUTTON, HTMINBUTTON, HTTOP, IsIconic, IsWindow, IsZoomed, MINMAXINFO, OBJID_CLIENT,
-    PostMessageW, STATE_SYSTEM_SELECTED, SW_RESTORE, SendMessageW, ShowWindow, WM_CANCELMODE,
-    WM_COMMAND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    FindWindowExW, GetClientRect, GetMenu, GetWindowRect, HTCLOSE, HTLEFT, HTMAXBUTTON,
+    HTMINBUTTON, HTTOP, IsIconic, IsWindow, IsZoomed, MINMAXINFO, OBJID_CLIENT, PostMessageW,
+    STATE_SYSTEM_SELECTED, SW_RESTORE, SendMessageW, ShowWindow, WM_CANCELMODE, WM_COMMAND,
+    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
     WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
@@ -70,7 +70,7 @@ fn wm_command_exit_routes_through_app_execute() -> TestResult<()> {
 }
 
 #[test]
-fn alt_and_f10_from_the_focused_editor_activate_the_transient_menu() -> TestResult<()> {
+fn alt_and_f10_from_the_focused_editor_toggle_the_themed_menu_band() -> TestResult<()> {
     let _dpi = DpiContext::per_monitor_v2()?;
     let mut process = FastPadProcess::spawn(["--new-window"])?;
     let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
@@ -84,6 +84,7 @@ fn alt_and_f10_from_the_focused_editor_activate_the_transient_menu() -> TestResu
         )
     };
     assert!(!editor.is_null());
+    let resting_top = editor_top(hwnd, editor);
 
     for key in [VK_F10, VK_MENU] {
         assert_ne!(
@@ -96,11 +97,16 @@ fn alt_and_f10_from_the_focused_editor_activate_the_transient_menu() -> TestResu
                 0
             );
         }
-        let menu = wait_for_menu(hwnd, true, Duration::from_secs(1))?;
-        assert_eq!(unsafe { GetMenuItemCount(menu) }, 5);
+        // The band is painted in the client area and pushes the editor down; a native menu bar
+        // would be drawn unthemed over the reclaimed caption instead.
+        wait_for_editor_top(hwnd, editor, |top| top > resting_top)?;
+        assert!(unsafe { GetMenu(hwnd) }.is_null());
 
-        assert_ne!(unsafe { PostMessageW(hwnd, WM_CANCELMODE, 0, 0) }, 0);
-        wait_for_menu(hwnd, false, Duration::from_secs(1))?;
+        assert_ne!(
+            unsafe { PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE as usize, 0) },
+            0
+        );
+        wait_for_editor_top(hwnd, editor, |top| top == resting_top)?;
     }
     process.close()
 }
@@ -120,6 +126,7 @@ fn alt_space_does_not_attach_the_transient_menu() -> TestResult<()> {
         )
     };
     assert!(!editor.is_null());
+    let resting_top = editor_top(hwnd, editor);
 
     assert_ne!(
         unsafe { PostMessageW(editor, WM_SYSKEYDOWN, VK_MENU as usize, 0) },
@@ -131,24 +138,39 @@ fn alt_space_does_not_attach_the_transient_menu() -> TestResult<()> {
     );
     std::thread::sleep(Duration::from_millis(100));
     assert!(unsafe { GetMenu(hwnd) }.is_null());
+    assert_eq!(editor_top(hwnd, editor), resting_top);
 
     assert_ne!(unsafe { PostMessageW(hwnd, WM_CANCELMODE, 0, 0) }, 0);
     process.close()
 }
 
-fn wait_for_menu(
+/// The editor's top edge in the main window's client coordinates.
+fn editor_top(
     hwnd: windows_sys::Win32::Foundation::HWND,
-    attached: bool,
-    timeout: Duration,
-) -> TestResult<windows_sys::Win32::UI::WindowsAndMessaging::HMENU> {
-    let deadline = std::time::Instant::now() + timeout;
+    editor: windows_sys::Win32::Foundation::HWND,
+) -> i32 {
+    let mut rect = RECT::default();
+    let mut origin = POINT::default();
+    unsafe {
+        GetWindowRect(editor, &mut rect);
+        ClientToScreen(hwnd, &mut origin);
+    }
+    rect.top - origin.y
+}
+
+fn wait_for_editor_top(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    editor: windows_sys::Win32::Foundation::HWND,
+    expected: impl Fn(i32) -> bool,
+) -> TestResult<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
     loop {
-        let menu = unsafe { GetMenu(hwnd) };
-        if !menu.is_null() == attached {
-            return Ok(menu);
+        let top = editor_top(hwnd, editor);
+        if expected(top) {
+            return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("transient menu attached={attached} was not observed").into());
+            return Err(format!("the menu band did not settle; editor top is {top}").into());
         }
         std::thread::sleep(Duration::from_millis(10));
     }

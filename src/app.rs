@@ -9,6 +9,7 @@ use crate::window::accessibility::AccessibilityState;
 use crate::window::command_palette::CommandPalette;
 use crate::window::commands::CommandId;
 use crate::window::find_bar::FindBar;
+use crate::window::menu_band::MenuMode;
 use crate::window::menus::{AcceleratorTable, MenuBar};
 use crate::window::notification::NotificationCenter;
 use crate::window::status::StatusModel;
@@ -42,6 +43,10 @@ pub struct App {
     pub(crate) accessibility: AccessibilityState,
     pub(crate) accelerators: Option<AcceleratorTable>,
     pub(crate) menu_bar: Option<MenuBar>,
+    /// Present while the Alt/F10 menu band is showing.
+    pub(crate) menu_mode: Option<MenuMode>,
+    /// Where focus returns when menu mode ends; the frame holds it meanwhile for the key handling.
+    pub(crate) menu_return_focus: HWND,
     pub(crate) find_bar: Option<FindBar>,
     pub(crate) command_palette: Option<CommandPalette>,
     pub(crate) language_manager: Option<LanguageManager>,
@@ -88,6 +93,8 @@ impl App {
             accessibility: AccessibilityState::default(),
             accelerators: AcceleratorTable::create().ok(),
             menu_bar: None,
+            menu_mode: None,
+            menu_return_focus: std::ptr::null_mut(),
             find_bar: None,
             command_palette: None,
             language_manager: None,

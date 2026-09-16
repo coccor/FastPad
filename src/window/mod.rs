@@ -3,6 +3,7 @@ pub(crate) mod command_palette;
 pub mod commands;
 pub mod find_bar;
 mod main_window;
+pub(crate) mod menu_band;
 pub(crate) mod menus;
 mod messages;
 mod modal;
