@@ -1319,6 +1319,19 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         CommandId::ThemeSystem => set_theme(hwnd, crate::config::ThemePreference::System),
         CommandId::ThemeLight => set_theme(hwnd, crate::config::ThemePreference::Light),
         CommandId::ThemeDark => set_theme(hwnd, crate::config::ThemePreference::Dark),
+        CommandId::ThemeCatppuccin => set_theme(hwnd, crate::config::ThemePreference::Catppuccin),
+        CommandId::ThemeCatppuccinLatte => {
+            set_theme(hwnd, crate::config::ThemePreference::CatppuccinLatte)
+        }
+        CommandId::ThemeCatppuccinFrappe => {
+            set_theme(hwnd, crate::config::ThemePreference::CatppuccinFrappe)
+        }
+        CommandId::ThemeCatppuccinMacchiato => {
+            set_theme(hwnd, crate::config::ThemePreference::CatppuccinMacchiato)
+        }
+        CommandId::ThemeCatppuccinMocha => {
+            set_theme(hwnd, crate::config::ThemePreference::CatppuccinMocha)
+        }
         CommandId::ToggleWordWrap => change_setting(hwnd, |settings| {
             settings.word_wrap = !settings.word_wrap;
             Some(("word_wrap", settings.word_wrap.to_string()))
@@ -3621,6 +3634,15 @@ mod tests {
             send(SCI_STYLEGETBACK, STYLE_DEFAULT as usize) as u32,
             crate::window::palette::Palette::for_theme(crate::platform::theme::Theme::Dark, false,)
                 .editor_background
+        );
+        execute_command(window.hwnd, CommandId::ThemeCatppuccinMocha);
+        assert_eq!(
+            send(SCI_STYLEGETBACK, STYLE_DEFAULT as usize) as u32,
+            crate::window::palette::Palette::for_theme(
+                crate::platform::theme::Theme::CatppuccinMocha,
+                false,
+            )
+            .editor_background
         );
         execute_command(window.hwnd, CommandId::ThemeLight);
         assert_eq!(

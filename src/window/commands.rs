@@ -48,6 +48,11 @@ pub enum CommandId {
     TabWidth2,
     TabWidth4,
     TabWidth8,
+    ThemeCatppuccin,
+    ThemeCatppuccinLatte,
+    ThemeCatppuccinFrappe,
+    ThemeCatppuccinMacchiato,
+    ThemeCatppuccinMocha,
 }
 
 impl CommandId {
@@ -71,6 +76,11 @@ impl CommandId {
                 | Self::TabWidth2
                 | Self::TabWidth4
                 | Self::TabWidth8
+                | Self::ThemeCatppuccin
+                | Self::ThemeCatppuccinLatte
+                | Self::ThemeCatppuccinFrappe
+                | Self::ThemeCatppuccinMacchiato
+                | Self::ThemeCatppuccinMocha
         )
     }
 
@@ -90,7 +100,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 47] = [
+        const COMMANDS: [CommandId; 52] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -138,6 +148,11 @@ impl TryFrom<u16> for CommandId {
             CommandId::TabWidth2,
             CommandId::TabWidth4,
             CommandId::TabWidth8,
+            CommandId::ThemeCatppuccin,
+            CommandId::ThemeCatppuccinLatte,
+            CommandId::ThemeCatppuccinFrappe,
+            CommandId::ThemeCatppuccinMacchiato,
+            CommandId::ThemeCatppuccinMocha,
         ];
         COMMANDS
             .into_iter()
@@ -176,6 +191,10 @@ mod tests {
         assert_eq!(CommandId::try_from(135), Ok(CommandId::CommandPalette));
         assert!(!CommandId::CommandPalette.needs_document());
         assert_eq!(CommandId::try_from(146), Ok(CommandId::TabWidth8));
+        assert_eq!(
+            CommandId::try_from(151),
+            Ok(CommandId::ThemeCatppuccinMocha)
+        );
         assert!(!CommandId::ToggleWordWrap.needs_document());
     }
 
