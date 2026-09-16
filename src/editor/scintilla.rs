@@ -16,7 +16,11 @@ use crate::editor::scintilla_constants::{
     SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING,
     SCI_SETTABWIDTH, SCI_SETWRAPMODE, SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT,
 };
+#[cfg(windows)]
+use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
+use crate::editor::scintilla_constants::{SCI_GETLINECOUNT, SCI_TEXTWIDTH, STYLE_LINENUMBER};
 use crate::{FastPadError, Result};
+use std::cell::Cell;
 use std::ffi::CString;
 use std::ops::Range;
 use std::rc::Rc;
@@ -35,8 +39,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, SendMessageW, WM_CHAR, WM_NCDESTROY, WS_CHILD,
-    WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, GetClientRect, SendMessageW, WM_CHAR,
+    WM_DPICHANGED_AFTERPARENT, WM_NCDESTROY, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
 };
 
 pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;
@@ -71,8 +75,23 @@ struct EditorEndpoint {
     direct_ptr: isize,
     destroyed: AtomicBool,
     destroy_window_on_drop: bool,
+    line_numbers: Cell<LineNumberMargin>,
     #[cfg(test)]
     release_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+/// Whether margin 0 shows line numbers, and how many digits its current width was measured for
+/// (0 means not measured yet).
+#[derive(Clone, Copy, Debug, Default)]
+struct LineNumberMargin {
+    visible: bool,
+    digits: usize,
+}
+
+/// Digits needed for the largest line number, never fewer than two so the margin does not resize
+/// at line 10.
+fn line_number_digits(line_count: isize) -> usize {
+    (line_count.max(1).ilog10() as usize + 1).max(2)
 }
 
 impl Editor {
@@ -136,6 +155,8 @@ impl Editor {
             .map_err(|_| FastPadError::Invariant("Scintilla text may not contain NUL bytes"))?;
         self.endpoint
             .send_direct_checked(SCI_SETTEXT, 0, text.as_ptr() as isize)?;
+        // File loads suppress the window's edit notifications, so size the gutter here.
+        let _ = self.endpoint.size_line_number_margin(false);
         Ok(())
     }
 
@@ -227,6 +248,7 @@ impl Editor {
         // Scroll width is per view and tracking only grows it; restart from the new document.
         self.endpoint
             .send_direct_checked(SCI_SETSCROLLWIDTH, 1, 0)?;
+        let _ = self.endpoint.size_line_number_margin(false);
         Ok(())
     }
 
@@ -545,8 +567,8 @@ impl Editor {
         ))
     }
 
-    /// Applies user view settings to every style up to `STYLE_DEFAULT` without touching text,
-    /// selection, or colors.
+    /// Applies user view settings to every style up to `STYLE_LINENUMBER` without touching text,
+    /// selection, or colors, then re-sizes the line-number margin for the new font.
     #[cfg(windows)]
     pub fn apply_view_settings(
         &self,
@@ -558,7 +580,7 @@ impl Editor {
         let face = CString::new(face).map_err(|_| {
             FastPadError::Invariant("Scintilla font face may not contain NUL bytes")
         })?;
-        for style in 0..=STYLE_DEFAULT as usize {
+        for style in 0..=STYLE_LINENUMBER as usize {
             self.endpoint
                 .send_direct_checked(SCI_STYLESETFONT, style, face.as_ptr() as isize)?;
             self.endpoint.send_direct_checked(
@@ -576,7 +598,7 @@ impl Editor {
         };
         self.endpoint
             .send_direct_checked(SCI_SETWRAPMODE, wrap as usize, 0)?;
-        Ok(())
+        self.endpoint.size_line_number_margin(true)
     }
 
     #[cfg(not(windows))]
@@ -613,20 +635,31 @@ impl Editor {
         ))
     }
 
-    /// Hides Scintilla's default margins, pads the text area, and lets the horizontal scrollbar
-    /// follow the widest line instead of the default 2000 px scroll width.
+    /// Keeps margin 0 as the only (line-number) margin, on the text background rather than
+    /// Scintilla's grey band, pads the text area, lets the horizontal scrollbar follow the widest
+    /// line instead of the default 2000 px scroll width, and shows line numbers until settings load.
     #[cfg(windows)]
     pub fn apply_chrome_defaults(&self, dpi: u32) -> Result<()> {
-        for margin in 0..=2 {
+        self.endpoint
+            .send_direct_checked(SCI_SETMARGINTYPEN, 0, SC_MARGIN_NUMBER as isize)?;
+        for margin in 1..=2 {
             self.endpoint
                 .send_direct_checked(SCI_SETMARGINWIDTHN, margin, 0)?;
         }
+        let background =
+            self.endpoint
+                .send_direct_checked(SCI_STYLEGETBACK, STYLE_DEFAULT as usize, 0)?;
+        self.endpoint.send_direct_checked(
+            SCI_STYLESETBACK,
+            STYLE_LINENUMBER as usize,
+            background,
+        )?;
         self.set_text_padding(dpi)?;
         self.endpoint
             .send_direct_checked(SCI_SETSCROLLWIDTH, 1, 0)?;
         self.endpoint
             .send_direct_checked(SCI_SETSCROLLWIDTHTRACKING, 1, 0)?;
-        Ok(())
+        self.set_line_numbers(true)
     }
 
     #[cfg(not(windows))]
@@ -634,6 +667,52 @@ impl Editor {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))
+    }
+
+    /// Shows margin 0 sized for the current line count, or collapses it to zero width. Repeating
+    /// the current, already-applied state sends nothing.
+    pub fn set_line_numbers(&self, visible: bool) -> Result<()> {
+        let current = self.endpoint.line_numbers.get();
+        if current.visible == visible && (!visible || current.digits != 0) {
+            return Ok(());
+        }
+        self.endpoint
+            .line_numbers
+            .set(LineNumberMargin { visible, digits: 0 });
+        if visible {
+            self.endpoint.size_line_number_margin(true)
+        } else {
+            self.endpoint
+                .send_direct_checked(SCI_SETMARGINWIDTHN, 0, 0)?;
+            Ok(())
+        }
+    }
+
+    /// Re-sizes visible line numbers only if the line count gained or lost a digit, which keeps it
+    /// cheap enough to run after every line-changing edit.
+    pub fn refresh_line_numbers(&self) -> Result<()> {
+        self.endpoint.size_line_number_margin(false)
+    }
+
+    /// Re-measures visible line numbers unconditionally, for font or DPI changes.
+    pub fn remeasure_line_numbers(&self) -> Result<()> {
+        self.endpoint.size_line_number_margin(true)
+    }
+
+    /// Colors the line-number margin. `SCI_STYLECLEARALL` resets it along with every other style,
+    /// so callers reapply this after a lexer change.
+    pub fn set_line_number_colors(&self, foreground: u32, background: u32) -> Result<()> {
+        self.endpoint.send_direct_checked(
+            SCI_STYLESETFORE,
+            STYLE_LINENUMBER as usize,
+            foreground as isize,
+        )?;
+        self.endpoint.send_direct_checked(
+            SCI_STYLESETBACK,
+            STYLE_LINENUMBER as usize,
+            background as isize,
+        )?;
+        Ok(())
     }
 
     /// Left/right text padding in physical pixels for `dpi` (8 px at 96 DPI).
@@ -848,6 +927,7 @@ impl EditorDocument {
                 direct_ptr: 0,
                 destroyed: AtomicBool::new(false),
                 destroy_window_on_drop: false,
+                line_numbers: Cell::new(LineNumberMargin::default()),
                 release_counter: Some(releases),
             }),
         }
@@ -880,9 +960,34 @@ impl EditorEndpoint {
             direct_ptr,
             destroyed: AtomicBool::new(false),
             destroy_window_on_drop,
+            line_numbers: Cell::new(LineNumberMargin::default()),
             #[cfg(test)]
             release_counter: None,
         }
+    }
+
+    /// Sizes margin 0 for the current line count plus one digit of breathing room. Without `force`
+    /// the font measurement is skipped while the digit count is unchanged.
+    fn size_line_number_margin(&self, force: bool) -> Result<()> {
+        let mut margin = self.line_numbers.get();
+        if !margin.visible {
+            return Ok(());
+        }
+        let line_count = self.send_direct_checked(SCI_GETLINECOUNT, 0, 0)?;
+        let digits = line_number_digits(line_count);
+        if !force && digits == margin.digits {
+            return Ok(());
+        }
+        let sample = CString::new("9".repeat(digits + 1)).expect("digits contain no NUL bytes");
+        let width = self.send_direct_checked(
+            SCI_TEXTWIDTH,
+            STYLE_LINENUMBER as usize,
+            sample.as_ptr() as isize,
+        )?;
+        self.send_direct_checked(SCI_SETMARGINWIDTHN, 0, width)?;
+        margin.digits = digits;
+        self.line_numbers.set(margin);
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -1072,6 +1177,12 @@ unsafe extern "system" fn editor_endpoint_subclass_proc(
             return 0;
         }
     }
+    if message == WM_DPICHANGED_AFTERPARENT {
+        // Scintilla adopts the new DPI inside its own handler; measure digits only after that.
+        let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+        let _ = endpoint.size_line_number_margin(true);
+        return result;
+    }
     if message == WM_NCDESTROY {
         endpoint.destroyed.store(true, Ordering::Release);
         unsafe {
@@ -1107,6 +1218,10 @@ mod tests {
         SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING, SCI_SETSEARCHFLAGS,
         SCI_SETSEL, SCI_SETTARGETRANGE, SCI_STYLECLEARALL, SCI_STYLESETBACK, SCI_STYLESETBOLD,
         SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
+    };
+    use crate::editor::scintilla_constants::{
+        SC_MARGIN_NUMBER, SCI_GETLINECOUNT, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK, SCI_TEXTWIDTH,
+        STYLE_DEFAULT, STYLE_LINENUMBER,
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -1441,10 +1556,12 @@ mod tests {
     }
 
     #[test]
-    fn chrome_defaults_hide_margins_and_track_scroll_width() {
+    fn chrome_defaults_show_only_a_line_number_margin_and_track_scroll_width() {
         // Break caught: Scintilla's default 16 px symbol margin and 2000 px scroll width show an
-        // unthemed grey gutter and a permanent horizontal scrollbar.
+        // unthemed grey gutter and a permanent horizontal scrollbar, and a number margin left at
+        // its default grey background or zero width hides the line numbers shown by default.
         let harness = TestDirectHarness::new();
+        harness.set_line_count(1);
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
         editor.apply_chrome_defaults(144).unwrap();
@@ -1452,13 +1569,121 @@ mod tests {
         assert_eq!(
             harness.calls(),
             vec![
-                (SCI_SETMARGINWIDTHN, 0, 0),
+                (SCI_SETMARGINTYPEN, 0, SC_MARGIN_NUMBER as isize),
                 (SCI_SETMARGINWIDTHN, 1, 0),
                 (SCI_SETMARGINWIDTHN, 2, 0),
+                (SCI_STYLEGETBACK, STYLE_DEFAULT as usize, 0),
+                (
+                    SCI_STYLESETBACK,
+                    STYLE_LINENUMBER as usize,
+                    TEST_DEFAULT_BACKGROUND
+                ),
                 (SCI_SETMARGINLEFT, 0, 12),
                 (SCI_SETMARGINRIGHT, 0, 12),
                 (SCI_SETSCROLLWIDTH, 1, 0),
                 (SCI_SETSCROLLWIDTHTRACKING, 1, 0),
+                (SCI_GETLINECOUNT, 0, 0),
+                (SCI_TEXTWIDTH, STYLE_LINENUMBER as usize, 0),
+                (SCI_SETMARGINWIDTHN, 0, 30),
+            ]
+        );
+        // Two digits plus one digit of breathing room, so short files do not resize at line 10.
+        assert_eq!(harness.text_width_texts(), vec![b"999".to_vec()]);
+    }
+
+    #[test]
+    fn line_number_margin_resizes_only_when_the_line_count_gains_a_digit() {
+        // Break caught: re-measuring on every edit costs a font measurement per keystroke, while
+        // never re-measuring clips line 100 in a margin sized for two digits.
+        let harness = TestDirectHarness::new();
+        harness.set_line_count(9);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+        editor.set_line_numbers(true).unwrap();
+
+        harness.set_line_count(99);
+        editor.refresh_line_numbers().unwrap();
+        harness.set_line_count(100);
+        editor.refresh_line_numbers().unwrap();
+
+        let widths: Vec<_> = harness
+            .calls()
+            .into_iter()
+            .filter(|call| call.0 == SCI_SETMARGINWIDTHN)
+            .collect();
+        assert_eq!(
+            widths,
+            vec![(SCI_SETMARGINWIDTHN, 0, 30), (SCI_SETMARGINWIDTHN, 0, 40)]
+        );
+        assert_eq!(
+            harness.text_width_texts(),
+            vec![b"999".to_vec(), b"9999".to_vec()]
+        );
+    }
+
+    #[test]
+    fn hidden_line_numbers_collapse_the_margin_and_ignore_refreshes() {
+        // Break caught: line_numbers=false still showing a gutter, or a later edit re-opening it.
+        let harness = TestDirectHarness::new();
+        harness.set_line_count(500);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+        editor.set_line_numbers(true).unwrap();
+
+        editor.set_line_numbers(false).unwrap();
+        let hidden_at = harness.calls().len();
+        editor.refresh_line_numbers().unwrap();
+        editor.remeasure_line_numbers().unwrap();
+
+        assert_eq!(harness.calls()[hidden_at - 1], (SCI_SETMARGINWIDTHN, 0, 0));
+        assert_eq!(harness.calls().len(), hidden_at);
+    }
+
+    #[test]
+    fn remeasuring_line_numbers_resizes_even_when_the_digit_count_is_unchanged() {
+        // Break caught: a font-size or DPI change keeping the old pixel width, clipping the numbers.
+        let harness = TestDirectHarness::new();
+        harness.set_line_count(9);
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+        editor.set_line_numbers(true).unwrap();
+
+        editor.remeasure_line_numbers().unwrap();
+
+        assert_eq!(harness.text_width_texts().len(), 2);
+    }
+
+    #[test]
+    fn view_settings_also_restyle_the_line_number_font() {
+        // Break caught: STYLE_LINENUMBER sits just past STYLE_DEFAULT, so a loop ending at
+        // STYLE_DEFAULT leaves line numbers in Scintilla's default font and size.
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor
+            .apply_view_settings("Cascadia Code", 12, 4, false)
+            .unwrap();
+
+        assert!(
+            harness
+                .font_calls()
+                .contains(&(STYLE_LINENUMBER as usize, b"Cascadia Code".to_vec()))
+        );
+    }
+
+    #[test]
+    fn line_number_colors_target_the_line_number_style() {
+        // Break caught: STYLE_LINENUMBER sits outside the base-color loop, so the gutter keeps
+        // Scintilla's grey band, or full-contrast text after a lexer's style reset.
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor
+            .set_line_number_colors(0x0060_6060, 0x00FF_FFFF)
+            .unwrap();
+
+        assert_eq!(
+            harness.style_calls(),
+            vec![
+                (SCI_STYLESETFORE, STYLE_LINENUMBER as usize, 0x0060_6060),
+                (SCI_STYLESETBACK, STYLE_LINENUMBER as usize, 0x00FF_FFFF),
             ]
         );
     }
@@ -1592,8 +1817,12 @@ mod tests {
         lexer_calls: Vec<isize>,
         style_calls: Vec<(u32, usize, isize)>,
         font_calls: Vec<(usize, Vec<u8>)>,
+        line_count: isize,
+        text_width_texts: Vec<Vec<u8>>,
         calls: Vec<(u32, usize, isize)>,
     }
+
+    const TEST_DEFAULT_BACKGROUND: isize = 0x00AB_CDEF;
 
     struct TestDirectHarness {
         state: Arc<Mutex<TestDirectState>>,
@@ -1658,8 +1887,17 @@ mod tests {
             self.state.lock().unwrap().font_calls.clone()
         }
 
+        /// Every direct call, with `SCI_TEXTWIDTH`'s string pointer zeroed so it can be compared.
         fn calls(&self) -> Vec<(u32, usize, isize)> {
             self.state.lock().unwrap().calls.clone()
+        }
+
+        fn set_line_count(&self, line_count: isize) {
+            self.state.lock().unwrap().line_count = line_count;
+        }
+
+        fn text_width_texts(&self) -> Vec<Vec<u8>> {
+            self.state.lock().unwrap().text_width_texts.clone()
         }
     }
 
@@ -1672,8 +1910,20 @@ mod tests {
         let shared = unsafe { &*(direct_ptr as *const Mutex<TestDirectState>) };
         let mut state = shared.lock().unwrap();
         state.messages.push(message);
-        state.calls.push((message, wparam, lparam));
+        let recorded_lparam = if message == SCI_TEXTWIDTH { 0 } else { lparam };
+        state.calls.push((message, wparam, recorded_lparam));
         match message {
+            SCI_GETLINECOUNT => state.line_count,
+            SCI_STYLEGETBACK => TEST_DEFAULT_BACKGROUND,
+            // Ten pixels per measured character keeps the expected widths readable.
+            SCI_TEXTWIDTH => {
+                let bytes = unsafe { std::ffi::CStr::from_ptr(lparam as *const std::ffi::c_char) }
+                    .to_bytes()
+                    .to_vec();
+                let width = bytes.len() as isize * 10;
+                state.text_width_texts.push(bytes);
+                width
+            }
             SCI_SETTARGETRANGE => {
                 state.target_range = Some((wparam, lparam));
                 0

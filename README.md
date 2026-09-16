@@ -41,6 +41,7 @@ notification and every valid line still applies.
 | `font_size` | Positive integer (points) | `11` |
 | `tab_width` | Integer 1-255 | `4` |
 | `word_wrap` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
+| `line_numbers` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `theme` | `system`, `light`, `dark` | `system` |
 | `recovery_interval_seconds` | Positive integer | `30` |
 

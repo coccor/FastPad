@@ -1032,19 +1032,26 @@ fn settings_warning_message(warning: &crate::config::SettingWarning) -> String {
     }
 }
 
+/// Also recolors the line numbers: this runs after every lexer change, whose style reset gives
+/// the gutter full-contrast text. Before chrome exists the neutral palette matches Scintilla's own
+/// black-on-white defaults.
 fn apply_editor_settings(hwnd: HWND) {
-    let Some((editor, settings)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
+    let Some((editor, settings, palette)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        Some((app.editor.clone()?, app.settings.clone()))
+        let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
+        Some((app.editor.clone()?, app.settings.clone(), palette))
     }) else {
         return;
     };
+    let _ = editor.set_line_numbers(settings.line_numbers);
     let _ = editor.apply_view_settings(
         &settings.font_face,
         settings.font_size,
         settings.tab_width,
         settings.word_wrap,
     );
+    let _ =
+        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
 }
 
 /// Runs only inside `WM_FASTPAD_BUILD_CHROME`: the first system theme query, the status model,
@@ -1118,6 +1125,8 @@ fn apply_theme(hwnd: HWND) {
         return;
     };
     let _ = editor.set_base_colors(palette.editor_foreground, palette.editor_background);
+    let _ =
+        editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
     let _ = editor.set_chrome_colors(
         palette.selection_background,
         palette.inactive_selection_background,
@@ -2403,7 +2412,13 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         if modification.modification_type & text_changes as i32 != 0
             && let Some(mut app) = unsafe { app_ptr(hwnd) }
         {
-            unsafe { app.as_mut() }.tabs.note_active_text_change();
+            let app = unsafe { app.as_mut() };
+            app.tabs.note_active_text_change();
+            if modification.lines_added != 0
+                && let Some(editor) = app.editor.as_ref()
+            {
+                let _ = editor.refresh_line_numbers();
+            }
         }
         return;
     }
@@ -2430,6 +2445,9 @@ struct TextModificationNotification {
     character: i32,
     modifiers: i32,
     modification_type: i32,
+    _text: *const u8,
+    _length: isize,
+    lines_added: isize,
 }
 
 fn invalidate_title_strip(hwnd: HWND) {
@@ -2964,6 +2982,43 @@ mod tests {
             crate::window::status::status_height(dpi),
             "dismissing notifications should return exactly the reserved status height"
         );
+    }
+
+    fn line_number_margin_width(editor: &crate::editor::Editor) -> isize {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                editor.hwnd(),
+                crate::editor::scintilla_constants::SCI_GETMARGINWIDTHN,
+                0,
+                0,
+            )
+        }
+    }
+
+    #[test]
+    fn line_numbers_follow_edits_and_the_line_numbers_setting() {
+        // Break caught: typing or pasting past line 99 without re-sizing the gutter clips the
+        // numbers, and line_numbers=false in fastpad.ini leaving the gutter visible.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let two_digits = line_number_margin_width(&editor);
+        assert!(two_digits > 0, "line numbers are shown by default");
+
+        editor.replace_target(0..0, &"\n".repeat(150)).unwrap();
+        let three_digits = line_number_margin_width(&editor);
+        assert!(
+            three_digits > two_digits,
+            "151 lines need a wider gutter than {two_digits}px, got {three_digits}px"
+        );
+
+        editor.undo().unwrap();
+        assert_eq!(line_number_margin_width(&editor), two_digits);
+
+        let mut settings = crate::config::default_settings();
+        settings.line_numbers = false;
+        super::apply_loaded_settings(window.hwnd, settings, Vec::new());
+        assert_eq!(line_number_margin_width(&editor), 0);
     }
 
     #[test]

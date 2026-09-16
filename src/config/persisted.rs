@@ -16,6 +16,7 @@ pub struct Settings {
     pub font_size: u16,
     pub tab_width: u8,
     pub word_wrap: bool,
+    pub line_numbers: bool,
     pub theme: ThemePreference,
     pub recovery_interval_seconds: u32,
 }
@@ -36,6 +37,9 @@ impl Settings {
         }
         if let Some(word_wrap) = delta.word_wrap {
             self.word_wrap = word_wrap;
+        }
+        if let Some(line_numbers) = delta.line_numbers {
+            self.line_numbers = line_numbers;
         }
         if let Some(theme) = delta.theme {
             self.theme = theme;
@@ -65,6 +69,7 @@ pub struct SettingsDelta {
     pub font_size: Option<u16>,
     pub tab_width: Option<u8>,
     pub word_wrap: Option<bool>,
+    pub line_numbers: Option<bool>,
     pub theme: Option<ThemePreference>,
     pub recovery_interval_seconds: Option<u32>,
     pub warnings: Vec<SettingWarning>,
@@ -72,10 +77,11 @@ pub struct SettingsDelta {
 
 /// Parses a hand-written, tolerant `.ini`-style settings source: one `key=value` pair per line: ASCII
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
-/// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`, `theme`, and
-/// `recovery_interval_seconds` are recognized. Every line is handled independently: a line with an
-/// unknown key, a value that fails to parse, or no `=` at all records one `SettingWarning` and is
-/// otherwise skipped — it never discards, and is never affected by, any other line's outcome.
+/// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
+/// `line_numbers`, `theme`, and `recovery_interval_seconds` are recognized. Every line is handled
+/// independently: a line with an unknown key, a value that fails to parse, or no `=` at all records
+/// one `SettingWarning` and is otherwise skipped — it never discards, and is never affected by, any
+/// other line's outcome.
 pub fn parse(source: &str) -> SettingsDelta {
     let mut delta = SettingsDelta::default();
     // An editor that saves fastpad.ini with a UTF-8 BOM must not hide its first setting.
@@ -117,6 +123,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         },
         "word_wrap" => match parse_bool(value) {
             Some(word_wrap) => delta.word_wrap = Some(word_wrap),
+            None => warn(delta, line_number, key, value),
+        },
+        "line_numbers" => match parse_bool(value) {
+            Some(line_numbers) => delta.line_numbers = Some(line_numbers),
             None => warn(delta, line_number, key, value),
         },
         "theme" => match parse_theme(value) {
@@ -262,6 +272,21 @@ mod tests {
         let delta = parse("word_wrap=maybe");
         assert_eq!(delta.word_wrap, None);
         assert_eq!(delta.warnings.len(), 1);
+    }
+
+    #[test]
+    fn line_numbers_accepts_the_same_boolean_spellings_as_word_wrap() {
+        // Break caught: line_numbers being ignored or reported as an unknown key leaves no way to
+        // hide the gutter.
+        assert_eq!(parse("line_numbers=off").line_numbers, Some(false));
+        assert_eq!(parse("line_numbers=Yes").line_numbers, Some(true));
+        let delta = parse("line_numbers=sometimes");
+        assert_eq!(delta.line_numbers, None);
+        assert_eq!(delta.warnings.len(), 1);
+
+        let mut settings = default_settings();
+        settings.apply_delta(&parse("line_numbers=0"));
+        assert!(!settings.line_numbers);
     }
 
     #[test]

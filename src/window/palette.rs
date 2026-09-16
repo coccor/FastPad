@@ -27,6 +27,8 @@ pub struct Palette {
     /// is what the themed palettes want; high contrast must force the system pair to stay legible.
     pub selection_foreground: Option<u32>,
     pub caret_line_background: u32,
+    /// Line numbers in the editor gutter, on `editor_background`.
+    pub line_number_foreground: u32,
     /// Resting caption-button glyphs and status-line text on `strip_background`.
     pub strip_foreground: u32,
     /// Whether the frame and editor scrollbars should request the dark system styling.
@@ -52,6 +54,7 @@ const LIGHT: Palette = Palette {
     inactive_selection_background: rgb(229, 235, 241),
     selection_foreground: None,
     caret_line_background: rgb(245, 247, 250),
+    line_number_foreground: rgb(110, 118, 129),
     strip_foreground: rgb(32, 32, 32),
     dark_frame: false,
 };
@@ -71,6 +74,7 @@ const DARK: Palette = Palette {
     inactive_selection_background: rgb(58, 61, 65),
     selection_foreground: None,
     caret_line_background: rgb(40, 40, 40),
+    line_number_foreground: rgb(133, 133, 133),
     strip_foreground: rgb(212, 212, 212),
     dark_frame: true,
 };
@@ -127,6 +131,7 @@ impl Palette {
             inactive_selection_background: highlight,
             selection_foreground: Some(highlight_text),
             caret_line_background: window,
+            line_number_foreground: text,
             strip_foreground: color(COLOR_BTNTEXT),
             dark_frame: false,
         }
