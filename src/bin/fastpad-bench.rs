@@ -1,6 +1,6 @@
 use fastpad::perf::protocol::BenchmarkRecord;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const BOOTSTRAP_RESAMPLES: usize = 10_000;
 const BOOTSTRAP_SEED: u64 = 0xFA57_0A0D;
@@ -12,6 +12,7 @@ enum Action {
         warmup: usize,
         output: PathBuf,
         enforce_reference: bool,
+        launch_file: Option<PathBuf>,
     },
     Compare {
         baseline: PathBuf,
@@ -39,13 +40,14 @@ where
     let mut warmup = 10_usize;
     let mut output = PathBuf::from("benchmarks/latest.jsonl");
     let mut enforce_reference = false;
+    let mut launch_file = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index]
             .to_str()
             .ok_or_else(|| "benchmark options must be valid Unicode".to_owned())?;
         match flag {
-            "--runs" | "--warmup" | "--output" => {
+            "--runs" | "--warmup" | "--output" | "--launch-file" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| format!("missing value for {flag}"))?;
@@ -53,6 +55,7 @@ where
                     "--runs" => runs = parse_count(value, flag)?,
                     "--warmup" => warmup = parse_count(value, flag)?,
                     "--output" => output = PathBuf::from(value),
+                    "--launch-file" => launch_file = Some(PathBuf::from(value)),
                     _ => unreachable!(),
                 }
                 index += 2;
@@ -72,6 +75,7 @@ where
         warmup,
         output,
         enforce_reference,
+        launch_file,
     })
 }
 
@@ -175,7 +179,14 @@ fn run_main() -> Result<i32, String> {
             warmup,
             output,
             enforce_reference,
-        } => run_distribution(runs, warmup, &output, enforce_reference),
+            launch_file,
+        } => run_distribution(
+            runs,
+            warmup,
+            &output,
+            enforce_reference,
+            launch_file.as_deref(),
+        ),
         Action::Compare {
             baseline,
             candidate,
@@ -186,8 +197,9 @@ fn run_main() -> Result<i32, String> {
 fn run_distribution(
     runs: usize,
     warmup: usize,
-    output: &std::path::Path,
+    output: &Path,
     enforce_reference: bool,
+    launch_file: Option<&Path>,
 ) -> Result<i32, String> {
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
@@ -201,7 +213,7 @@ fn run_distribution(
     let mut records = Vec::with_capacity(runs);
 
     for index in 0..warmup + runs {
-        let record = run_once()?;
+        let record = run_once(launch_file)?;
         if index >= warmup {
             use std::io::Write;
             writeln!(writer, "{}", record_to_json_line(&record))
@@ -363,7 +375,7 @@ fn record_from_json(value: &serde_json::Value) -> Result<BenchmarkRecord, String
 }
 
 #[cfg(not(windows))]
-fn run_once() -> Result<BenchmarkRecord, String> {
+fn run_once(_launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
     Err("the startup benchmark requires Windows".to_owned())
 }
 
@@ -489,7 +501,7 @@ impl Drop for ProcThreadAttributeList {
 }
 
 #[cfg(windows)]
-fn run_once() -> Result<BenchmarkRecord, String> {
+fn run_once(launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
     use fastpad::perf::protocol::{
         BENCHMARK_INPUT_CHAR, BENCHMARK_SHARED_FRAME_LEN, EVENT_HANDLE_ENV, MAPPING_HANDLE_ENV,
         QPC_ORIGIN_ENV,
@@ -592,10 +604,16 @@ fn run_once() -> Result<BenchmarkRecord, String> {
         .encode_wide()
         .chain([0])
         .collect::<Vec<_>>();
-    let mut command_line = format!("\"{}\" --diagnostic", executable.display())
-        .encode_utf16()
-        .chain([0])
-        .collect::<Vec<_>>();
+    let mut command_line = format!(
+        "\"{}\" --diagnostic{}",
+        executable.display(),
+        launch_file
+            .map(|path| format!(" \"{}\"", path.display()))
+            .unwrap_or_default()
+    )
+    .encode_utf16()
+    .chain([0])
+    .collect::<Vec<_>>();
     let cleanup_job = create_cleanup_job()?;
     let inherited_handles = diagnostic_handle_allowlist(mapping.as_raw(), event.as_raw());
     let cleanup_jobs = [cleanup_job.as_raw()];
@@ -1289,8 +1307,13 @@ mod tests {
                 warmup: 5,
                 output: PathBuf::from("sample.jsonl"),
                 enforce_reference: true,
+                launch_file: None,
             }
         );
+        assert!(matches!(
+            parse_args(["--launch-file", "notes.md"]).unwrap(),
+            Action::Run { launch_file: Some(path), .. } if path == std::path::Path::new("notes.md")
+        ));
         assert_eq!(
             parse_args(["compare", "baseline.jsonl", "candidate.jsonl"]).unwrap(),
             Action::Compare {

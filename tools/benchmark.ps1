@@ -7,7 +7,9 @@ param(
 
     [string]$Output = "benchmarks/latest.jsonl",
 
-    [switch]$EnforceReference
+    [switch]$EnforceReference,
+
+    [string]$LaunchFile
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +26,7 @@ try {
         "--output", $Output
     )
     if ($EnforceReference) { $BenchmarkArguments += "--enforce-reference" }
+    if ($LaunchFile) { $BenchmarkArguments += @("--launch-file", $LaunchFile) }
     & cargo @BenchmarkArguments
     if ($LASTEXITCODE -ne 0) { throw "FastPad startup benchmark failed" }
 }
