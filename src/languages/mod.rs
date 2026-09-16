@@ -4,8 +4,10 @@ mod lexilla;
 mod markdown;
 
 use crate::Result;
+use crate::catppuccin::{self, Flavor};
 use crate::document::Language;
 use crate::editor::Editor;
+use crate::platform::theme::Theme;
 use lexilla::LexillaLibrary;
 use std::path::{Path, PathBuf};
 
@@ -20,11 +22,84 @@ pub(crate) struct LexerStyle {
     pub(crate) bold: bool,
 }
 
-/// A language's deterministic light- and dark-theme style tables.
-pub(crate) struct LanguageStyles {
-    pub(crate) light: &'static [LexerStyle],
-    pub(crate) dark: &'static [LexerStyle],
+/// The syntax roles every language's style table draws from, one set per theme. Each language
+/// builds its per-theme tables from these at compile time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SyntaxColors {
+    pub(crate) background: u32,
+    pub(crate) text: u32,
+    pub(crate) string: u32,
+    pub(crate) number: u32,
+    pub(crate) heading: u32,
+    pub(crate) code: u32,
+    pub(crate) code_background: u32,
 }
+
+const LIGHT_SYNTAX: SyntaxColors = SyntaxColors {
+    background: rgb(255, 255, 255),
+    text: rgb(32, 32, 32),
+    string: rgb(163, 21, 21),
+    number: rgb(9, 134, 88),
+    heading: rgb(0, 92, 197),
+    code: rgb(110, 65, 15),
+    code_background: rgb(246, 248, 250),
+};
+
+const DARK_SYNTAX: SyntaxColors = SyntaxColors {
+    background: rgb(30, 30, 30),
+    text: rgb(220, 220, 220),
+    string: rgb(206, 145, 120),
+    number: rgb(181, 206, 168),
+    heading: rgb(86, 156, 214),
+    code: rgb(215, 186, 125),
+    code_background: rgb(45, 45, 45),
+};
+
+/// Catppuccin style guide roles: green strings, peach numbers, red first-level headings.
+const fn catppuccin_syntax(flavor: &Flavor) -> SyntaxColors {
+    SyntaxColors {
+        background: flavor.base,
+        text: flavor.text,
+        string: flavor.green,
+        number: flavor.peach,
+        heading: flavor.red,
+        code: flavor.blue,
+        code_background: flavor.mantle,
+    }
+}
+
+/// Indexed by `Theme as usize`; order must match `Theme::ALL`.
+const SYNTAX_COLORS: [SyntaxColors; Theme::COUNT] = [
+    LIGHT_SYNTAX,
+    DARK_SYNTAX,
+    catppuccin_syntax(&catppuccin::LATTE),
+    catppuccin_syntax(&catppuccin::FRAPPE),
+    catppuccin_syntax(&catppuccin::MACCHIATO),
+    catppuccin_syntax(&catppuccin::MOCHA),
+];
+
+#[cfg(test)]
+pub(crate) const fn syntax_colors(theme: Theme) -> SyntaxColors {
+    SYNTAX_COLORS[theme as usize]
+}
+
+/// Evaluates to one style table per theme, indexed by `Theme as usize`, from a language's
+/// `const fn(&SyntaxColors) -> [LexerStyle; N]` builder. Meant for a `static` initializer, so every
+/// table is built at compile time.
+macro_rules! per_theme_styles {
+    ($builder:path) => {{
+        use $crate::platform::theme::Theme;
+        let colors = &$crate::languages::SYNTAX_COLORS;
+        let mut tables = [$builder(&colors[0]); Theme::COUNT];
+        let mut index = 1;
+        while index < Theme::COUNT {
+            tables[index] = $builder(&colors[index]);
+            index += 1;
+        }
+        tables
+    }};
+}
+pub(crate) use per_theme_styles;
 
 /// Packs 8-bit components into the `0x00BBGGRR` layout Scintilla's `SCI_STYLESETFORE`/`_BACK`
 /// expect (Windows `COLORREF` byte order), so style tables can be written as ordinary `(r, g, b)`.
@@ -78,33 +153,24 @@ impl LanguageManager {
     /// Applies `language`'s lexer to `editor`. `Language::PlainText` installs Scintilla's null
     /// lexer (`SCI_SETILEXER` with a null pointer), which never touches Lexilla. JSON/Markdown
     /// load `Lexilla.dll` on first use, request the matching lexer by name, install it, and apply
-    /// its light or dark style table (`dark` selects which). On a Lexilla load or lexer-creation
-    /// failure, the editor is left exactly as it was (this method never calls `set_lexer` before
-    /// a real lexer pointer is in hand) and the error is returned for the caller's notification.
-    pub fn apply(&mut self, editor: &Editor, language: Language, dark: bool) -> Result<()> {
+    /// `theme`'s compiled style table. On a Lexilla load or lexer-creation failure, the editor is
+    /// left exactly as it was (this method never calls `set_lexer` before a real lexer pointer is
+    /// in hand) and the error is returned for the caller's notification.
+    pub fn apply(&mut self, editor: &Editor, language: Language, theme: Theme) -> Result<()> {
         match language {
             Language::PlainText => {
                 editor.set_lexer(0)?;
                 Ok(())
             }
-            Language::Json => self.apply_lexer(editor, "json", &json::JSON_STYLES, dark),
-            Language::Markdown => {
-                self.apply_lexer(editor, "markdown", &markdown::MARKDOWN_STYLES, dark)
-            }
+            Language::Json => self.apply_lexer(editor, "json", json::styles(theme)),
+            Language::Markdown => self.apply_lexer(editor, "markdown", markdown::styles(theme)),
         }
     }
 
-    fn apply_lexer(
-        &mut self,
-        editor: &Editor,
-        name: &str,
-        styles: &LanguageStyles,
-        dark: bool,
-    ) -> Result<()> {
+    fn apply_lexer(&mut self, editor: &Editor, name: &str, table: &[LexerStyle]) -> Result<()> {
         let lexer = self.ensure_lexilla()?.create_lexer(name)?;
         editor.set_lexer(lexer)?;
         editor.clear_all_styles()?;
-        let table = if dark { styles.dark } else { styles.light };
         for style in table {
             editor.set_style(
                 style.style,
@@ -156,6 +222,7 @@ mod tests {
     use crate::document::Language;
     use crate::editor::Editor;
     use crate::editor::scintilla_constants::{SCE_JSON_DEFAULT, SCI_SETILEXER, SCI_STYLESETFORE};
+    use crate::platform::theme::Theme;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -180,7 +247,9 @@ mod tests {
         let editor = fake_editor(&harness);
         let mut manager = LanguageManager::new();
 
-        manager.apply(&editor, Language::PlainText, false).unwrap();
+        manager
+            .apply(&editor, Language::PlainText, Theme::Light)
+            .unwrap();
 
         assert_eq!(harness.setilexer_calls(), vec![0]);
         assert!(!manager.is_loaded());
@@ -200,7 +269,11 @@ mod tests {
         ));
         let mut manager = LanguageManager::with_dll_path_for_test(missing);
 
-        assert!(manager.apply(&editor, Language::Json, false).is_err());
+        assert!(
+            manager
+                .apply(&editor, Language::Json, Theme::Light)
+                .is_err()
+        );
 
         assert!(harness.setilexer_calls().is_empty());
         assert!(!manager.is_loaded());
@@ -215,7 +288,9 @@ mod tests {
         let editor = fake_editor(&harness);
         let mut manager = LanguageManager::with_dll_path_for_test(native_lexilla_path());
 
-        manager.apply(&editor, Language::Json, false).unwrap();
+        manager
+            .apply(&editor, Language::Json, Theme::Light)
+            .unwrap();
 
         let calls = harness.setilexer_calls();
         assert_eq!(calls.len(), 1);
@@ -236,45 +311,47 @@ mod tests {
         let editor = fake_editor(&harness);
         let mut manager = LanguageManager::with_dll_path_for_test(native_lexilla_path());
 
-        manager.apply(&editor, Language::Json, false).unwrap();
+        manager
+            .apply(&editor, Language::Json, Theme::Light)
+            .unwrap();
         manager.dll_path_override = Some(std::env::temp_dir().join(format!(
             "fastpad-languages-lexilla-missing-after-first-load-{}-{}.dll",
             std::process::id(),
             next_unique()
         )));
 
-        manager.apply(&editor, Language::Markdown, false).unwrap();
+        manager
+            .apply(&editor, Language::Markdown, Theme::Light)
+            .unwrap();
 
         assert_eq!(harness.setilexer_calls().len(), 2);
         assert!(manager.is_loaded());
     }
 
     #[test]
-    fn apply_selects_the_light_or_dark_style_table_for_the_default_style() {
+    fn apply_selects_the_theme_style_table_for_the_default_style() {
         let _guard = super::NATIVE_LEXILLA_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let light_harness = FakeHarness::new();
-        let light_editor = fake_editor(&light_harness);
-        let mut light_manager = LanguageManager::with_dll_path_for_test(native_lexilla_path());
-        light_manager
-            .apply(&light_editor, Language::Json, false)
-            .unwrap();
-
-        let dark_harness = FakeHarness::new();
-        let dark_editor = fake_editor(&dark_harness);
-        let mut dark_manager = LanguageManager::with_dll_path_for_test(native_lexilla_path());
-        dark_manager
-            .apply(&dark_editor, Language::Json, true)
-            .unwrap();
+        let default_foreground = |theme| {
+            let harness = FakeHarness::new();
+            let editor = fake_editor(&harness);
+            let mut manager = LanguageManager::with_dll_path_for_test(native_lexilla_path());
+            manager.apply(&editor, Language::Json, theme).unwrap();
+            harness.style_fore_for(SCE_JSON_DEFAULT as usize)
+        };
 
         assert_eq!(
-            light_harness.style_fore_for(SCE_JSON_DEFAULT as usize),
+            default_foreground(Theme::Light),
             Some(rgb(32, 32, 32) as isize)
         );
         assert_eq!(
-            dark_harness.style_fore_for(SCE_JSON_DEFAULT as usize),
+            default_foreground(Theme::Dark),
             Some(rgb(220, 220, 220) as isize)
+        );
+        assert_eq!(
+            default_foreground(Theme::CatppuccinMocha),
+            Some(crate::catppuccin::MOCHA.text as isize)
         );
     }
 

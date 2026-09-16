@@ -1200,7 +1200,7 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
     else {
         return;
     };
-    let dark = effective_dark(hwnd);
+    let theme = effective_theme(hwnd);
     let result = unsafe { app_ptr(hwnd) }.map(|mut app| {
         let app = unsafe { app.as_mut() };
         if app.language_manager.is_none() {
@@ -1209,7 +1209,7 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
         app.language_manager
             .as_mut()
             .expect("just populated above if it was absent")
-            .apply(&editor, language, dark)
+            .apply(&editor, language, theme)
     });
     match result {
         Some(Ok(())) => {
@@ -1324,22 +1324,21 @@ fn refresh_theme(hwnd: HWND) {
     }
 }
 
-/// Before chrome exists there is no cached theme, so the `System` preference falls back to the
-/// one-shot registry read `apply_language` has always used.
-fn effective_dark(hwnd: HWND) -> bool {
+/// Before chrome exists there is no cached theme, so system-following preferences fall back to the
+/// one-shot registry read `apply_language` has always used; fixed themes skip it.
+fn effective_theme(hwnd: HWND) -> crate::platform::theme::Theme {
     let (theme, preference) = unsafe { app_ptr(hwnd) }
         .map(|app| {
             let app = unsafe { app.as_ref() };
             (app.theme, app.settings.theme)
         })
         .unwrap_or((None, crate::config::ThemePreference::System));
-    match (theme, preference) {
-        (Some(theme), preference) => theme.effective_dark(preference),
-        (None, crate::config::ThemePreference::System) => {
-            crate::platform::theme::system_uses_dark_mode()
-        }
-        (None, crate::config::ThemePreference::Light) => false,
-        (None, crate::config::ThemePreference::Dark) => true,
+    match theme {
+        Some(theme) => theme.effective_theme(preference),
+        None => crate::platform::theme::Theme::resolve(
+            preference,
+            preference.follows_system() && crate::platform::theme::system_uses_dark_mode(),
+        ),
     }
 }
 

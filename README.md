@@ -42,8 +42,12 @@ notification and every valid line still applies.
 | `tab_width` | Integer 1-255 | `4` |
 | `word_wrap` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `line_numbers` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
-| `theme` | `system`, `light`, `dark` | `system` |
+| `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
 | `recovery_interval_seconds` | Positive integer | `30` |
+
+`system` and `catppuccin` follow the Windows light/dark app setting (`catppuccin` uses Latte when
+light and Mocha when dark); the other themes are fixed. Windows high contrast always overrides the
+configured theme.
 
 ## Crash recovery
 

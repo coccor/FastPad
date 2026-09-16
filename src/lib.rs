@@ -1,5 +1,6 @@
 pub mod app;
 pub mod bootstrap;
+pub mod catppuccin;
 pub mod config;
 pub mod document;
 pub mod editor;

@@ -43,16 +43,56 @@ impl SystemTheme {
         }
     }
 
-    /// Resolves the *effective* dark/light choice the editor should render with, given the user's
-    /// configured `preference`: `System` follows this snapshot; `Light`/`Dark` overrides it
-    /// unconditionally. High contrast is reported separately on `self` — callers decide whether and
-    /// how to react to it, since it is orthogonal to the light/dark axis.
-    pub fn effective_dark(&self, preference: ThemePreference) -> bool {
+    /// Resolves the *effective* theme the editor should render with, given the user's configured
+    /// `preference`: system-following preferences use this snapshot's dark flag; fixed themes
+    /// ignore it. High contrast is reported separately on `self` — callers decide whether and how
+    /// to react to it, since it is orthogonal to the theme choice.
+    pub const fn effective_theme(&self, preference: ThemePreference) -> Theme {
+        Theme::resolve(preference, self.dark)
+    }
+}
+
+/// One concrete color theme. Every theme's palette and lexer style tables are compiled-in static
+/// data indexed by the discriminant, so switching themes never allocates or computes colors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Theme {
+    Light,
+    Dark,
+    CatppuccinLatte,
+    CatppuccinFrappe,
+    CatppuccinMacchiato,
+    CatppuccinMocha,
+}
+
+impl Theme {
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Every theme, in discriminant order (`Self::ALL[theme as usize] == theme`).
+    pub const ALL: [Self; 6] = [
+        Self::Light,
+        Self::Dark,
+        Self::CatppuccinLatte,
+        Self::CatppuccinFrappe,
+        Self::CatppuccinMacchiato,
+        Self::CatppuccinMocha,
+    ];
+
+    /// `system_dark` is only consulted by preferences that follow the system.
+    pub const fn resolve(preference: ThemePreference, system_dark: bool) -> Self {
         match preference {
-            ThemePreference::System => self.dark,
-            ThemePreference::Light => false,
-            ThemePreference::Dark => true,
+            ThemePreference::System if system_dark => Self::Dark,
+            ThemePreference::System | ThemePreference::Light => Self::Light,
+            ThemePreference::Dark => Self::Dark,
+            ThemePreference::Catppuccin if system_dark => Self::CatppuccinMocha,
+            ThemePreference::Catppuccin | ThemePreference::CatppuccinLatte => Self::CatppuccinLatte,
+            ThemePreference::CatppuccinFrappe => Self::CatppuccinFrappe,
+            ThemePreference::CatppuccinMacchiato => Self::CatppuccinMacchiato,
+            ThemePreference::CatppuccinMocha => Self::CatppuccinMocha,
         }
+    }
+
+    pub const fn is_dark(self) -> bool {
+        !matches!(self, Self::Light | Self::CatppuccinLatte)
     }
 }
 
@@ -116,7 +156,7 @@ fn read_high_contrast() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SystemTheme, dark_mode_from_apps_use_light_theme};
+    use super::{SystemTheme, Theme, dark_mode_from_apps_use_light_theme};
     use crate::config::ThemePreference;
 
     #[test]
@@ -129,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_dark_follows_system_only_for_the_system_preference() {
+    fn effective_theme_follows_system_only_for_system_following_preferences() {
         let dark_system = SystemTheme {
             dark: true,
             high_contrast: false,
@@ -138,9 +178,54 @@ mod tests {
             dark: false,
             high_contrast: false,
         };
-        assert!(dark_system.effective_dark(ThemePreference::System));
-        assert!(!light_system.effective_dark(ThemePreference::System));
-        assert!(!dark_system.effective_dark(ThemePreference::Light));
-        assert!(light_system.effective_dark(ThemePreference::Dark));
+        assert_eq!(
+            dark_system.effective_theme(ThemePreference::System),
+            Theme::Dark
+        );
+        assert_eq!(
+            light_system.effective_theme(ThemePreference::System),
+            Theme::Light
+        );
+        assert_eq!(
+            dark_system.effective_theme(ThemePreference::Light),
+            Theme::Light
+        );
+        assert_eq!(
+            light_system.effective_theme(ThemePreference::Dark),
+            Theme::Dark
+        );
+        assert_eq!(
+            dark_system.effective_theme(ThemePreference::Catppuccin),
+            Theme::CatppuccinMocha
+        );
+        assert_eq!(
+            light_system.effective_theme(ThemePreference::Catppuccin),
+            Theme::CatppuccinLatte
+        );
+        for (preference, theme) in [
+            (ThemePreference::CatppuccinLatte, Theme::CatppuccinLatte),
+            (ThemePreference::CatppuccinFrappe, Theme::CatppuccinFrappe),
+            (
+                ThemePreference::CatppuccinMacchiato,
+                Theme::CatppuccinMacchiato,
+            ),
+            (ThemePreference::CatppuccinMocha, Theme::CatppuccinMocha),
+        ] {
+            assert!(!preference.follows_system());
+            assert_eq!(dark_system.effective_theme(preference), theme);
+            assert_eq!(light_system.effective_theme(preference), theme);
+        }
+    }
+
+    #[test]
+    fn all_lists_every_theme_at_its_discriminant() {
+        // Break caught: static per-theme tables are indexed by discriminant, so a reordered `ALL`
+        // would paint one theme's chrome with another theme's colors.
+        for (index, theme) in Theme::ALL.into_iter().enumerate() {
+            assert_eq!(theme as usize, index);
+        }
+        assert!(!Theme::Light.is_dark());
+        assert!(!Theme::CatppuccinLatte.is_dark());
+        assert!(Theme::CatppuccinMocha.is_dark());
     }
 }

@@ -1,8 +1,11 @@
 //! The single owner of FastPad's UI colors: title strip, tabs, caption buttons, status line, and the
 //! editor's base/selection/caret-line colors. High contrast always uses system colors.
+//!
+//! Every themed palette is compiled-in static data, so resolving one is an array index.
 
+use crate::catppuccin::{self, Flavor};
 use crate::languages::rgb;
-use crate::platform::theme::SystemTheme;
+use crate::platform::theme::{SystemTheme, Theme};
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
     COLOR_WINDOWTEXT, GetSysColor,
@@ -79,6 +82,40 @@ const DARK: Palette = Palette {
     dark_frame: true,
 };
 
+/// Maps a Catppuccin flavor onto FastPad's UI roles per the Catppuccin style guide: `mantle`
+/// chrome around a `base` editor, `overlay2` selection at ~25% opacity, `text` caret line at ~10%.
+const fn catppuccin(flavor: &Flavor, dark: bool) -> Palette {
+    Palette {
+        strip_background: flavor.mantle,
+        editor_background: flavor.base,
+        editor_foreground: flavor.text,
+        muted_foreground: flavor.subtext0,
+        hover_foreground: flavor.text,
+        hover_background: flavor.surface0,
+        pressed_background: flavor.surface1,
+        close_hover_background: flavor.red,
+        close_hover_foreground: flavor.crust,
+        close_pressed_background: flavor.maroon,
+        selection_background: catppuccin::blend(flavor.overlay2, flavor.base, 64),
+        inactive_selection_background: catppuccin::blend(flavor.overlay2, flavor.base, 38),
+        selection_foreground: None,
+        caret_line_background: catppuccin::blend(flavor.text, flavor.base, 26),
+        line_number_foreground: flavor.overlay1,
+        strip_foreground: flavor.text,
+        dark_frame: dark,
+    }
+}
+
+/// Indexed by `Theme as usize`; order must match `Theme::ALL`.
+static PALETTES: [Palette; Theme::COUNT] = [
+    LIGHT,
+    DARK,
+    catppuccin(&catppuccin::LATTE, false),
+    catppuccin(&catppuccin::FRAPPE, true),
+    catppuccin(&catppuccin::MACCHIATO, true),
+    catppuccin(&catppuccin::MOCHA, true),
+];
+
 impl Palette {
     /// The compiled palette used before `WM_FASTPAD_BUILD_CHROME`, so first paint makes no theme
     /// queries.
@@ -86,13 +123,11 @@ impl Palette {
         LIGHT
     }
 
-    pub fn for_theme(dark: bool, high_contrast: bool) -> Self {
+    pub fn for_theme(theme: Theme, high_contrast: bool) -> Self {
         if high_contrast {
             Self::high_contrast()
-        } else if dark {
-            DARK
         } else {
-            LIGHT
+            PALETTES[theme as usize]
         }
     }
 
@@ -102,7 +137,7 @@ impl Palette {
         preference: crate::config::ThemePreference,
     ) -> Self {
         theme.map_or_else(Self::neutral, |theme| {
-            Self::for_theme(theme.effective_dark(preference), theme.high_contrast)
+            Self::for_theme(theme.effective_theme(preference), theme.high_contrast)
         })
     }
 
@@ -141,33 +176,53 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::Palette;
-    use crate::languages::rgb;
+    use crate::catppuccin;
+    use crate::languages::{rgb, syntax_colors};
+    use crate::platform::theme::Theme;
     use windows_sys::Win32::Graphics::Gdi::{
         COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
     };
 
     #[test]
-    fn dark_and_light_palettes_are_distinct_and_neutral_is_light() {
+    fn every_theme_has_a_distinct_palette_and_neutral_is_light() {
         // Break caught: a strip that ignores the theme paints the same light chrome over a dark
         // editor, and a neutral first paint that is not the light palette flashes a third look.
-        let dark = Palette::for_theme(true, false);
-        let light = Palette::for_theme(false, false);
-        assert_ne!(dark, light);
-        assert_ne!(dark.strip_background, light.strip_background);
-        assert_ne!(dark.editor_background, light.editor_background);
-        assert_eq!(Palette::neutral(), light);
-        assert!(dark.dark_frame);
-        assert!(!light.dark_frame);
-        // Themed palettes leave selected text to the lexer colors; only high contrast forces it.
-        assert_eq!(dark.selection_foreground, None);
-        assert_eq!(light.selection_foreground, None);
+        for (index, theme) in Theme::ALL.into_iter().enumerate() {
+            let palette = Palette::for_theme(theme, false);
+            for other in &Theme::ALL[index + 1..] {
+                let other = Palette::for_theme(*other, false);
+                assert_ne!(palette.strip_background, other.strip_background);
+                assert_ne!(palette.editor_background, other.editor_background);
+            }
+            assert_eq!(palette.dark_frame, theme.is_dark());
+            // Themed palettes leave selected text to the lexer colors; only high contrast forces it.
+            assert_eq!(palette.selection_foreground, None);
+            // Break caught: selection or caret line blending into the editor background.
+            assert_ne!(palette.selection_background, palette.editor_background);
+            assert_ne!(palette.caret_line_background, palette.editor_background);
+            assert_ne!(palette.selection_background, palette.caret_line_background);
+        }
+        assert_eq!(Palette::neutral(), Palette::for_theme(Theme::Light, false));
+    }
+
+    #[test]
+    fn catppuccin_palettes_use_the_flavor_swatches() {
+        let mocha = Palette::for_theme(Theme::CatppuccinMocha, false);
+        assert_eq!(mocha.editor_background, catppuccin::MOCHA.base);
+        assert_eq!(mocha.strip_background, catppuccin::MOCHA.mantle);
+        assert_eq!(mocha.editor_foreground, catppuccin::MOCHA.text);
+        let latte = Palette::for_theme(Theme::CatppuccinLatte, false);
+        assert_eq!(latte.editor_background, catppuccin::LATTE.base);
+        assert!(!latte.dark_frame);
     }
 
     #[test]
     fn active_tab_background_is_the_editor_background() {
-        for (dark, high_contrast) in [(false, false), (true, false), (false, true)] {
-            let palette = Palette::for_theme(dark, high_contrast);
-            assert_eq!(palette.active_tab_background(), palette.editor_background);
+        for high_contrast in [false, true] {
+            for theme in Theme::ALL {
+                let palette = Palette::for_theme(theme, high_contrast);
+                assert_eq!(palette.active_tab_background(), palette.editor_background);
+            }
         }
     }
 
@@ -175,20 +230,28 @@ mod tests {
     fn editor_backgrounds_match_the_lexer_style_tables() {
         // Break caught: a palette editor background that drifts from the JSON/Markdown style tables
         // leaves highlighted text on a different background than the active tab.
+        for theme in Theme::ALL {
+            assert_eq!(
+                Palette::for_theme(theme, false).editor_background,
+                syntax_colors(theme).background
+            );
+        }
         assert_eq!(
-            Palette::for_theme(true, false).editor_background,
+            Palette::for_theme(Theme::Dark, false).editor_background,
             rgb(30, 30, 30)
         );
         assert_eq!(
-            Palette::for_theme(false, false).editor_background,
+            Palette::for_theme(Theme::Light, false).editor_background,
             rgb(255, 255, 255)
         );
     }
 
     #[test]
-    fn high_contrast_uses_system_colors_regardless_of_dark_preference() {
-        let palette = Palette::for_theme(true, true);
-        assert_eq!(palette, Palette::for_theme(false, true));
+    fn high_contrast_uses_system_colors_regardless_of_theme() {
+        let palette = Palette::for_theme(Theme::Dark, true);
+        for theme in Theme::ALL {
+            assert_eq!(palette, Palette::for_theme(theme, true));
+        }
         unsafe {
             assert_eq!(palette.editor_background, GetSysColor(COLOR_WINDOW));
             assert_eq!(palette.editor_foreground, GetSysColor(COLOR_WINDOWTEXT));
@@ -210,12 +273,19 @@ mod tests {
     }
 
     #[test]
-    fn close_hover_is_red_with_a_white_glyph_outside_high_contrast() {
-        for dark in [false, true] {
-            let palette = Palette::for_theme(dark, false);
+    fn close_hover_is_red_with_a_white_glyph_in_the_system_themes() {
+        for theme in [Theme::Light, Theme::Dark] {
+            let palette = Palette::for_theme(theme, false);
             assert_eq!(palette.close_hover_background, rgb(0xC4, 0x2B, 0x1C));
             assert_eq!(palette.close_hover_foreground, rgb(255, 255, 255));
+        }
+        for theme in Theme::ALL {
+            let palette = Palette::for_theme(theme, false);
             assert_ne!(palette.muted_foreground, palette.hover_foreground);
+            assert_ne!(
+                palette.close_hover_background,
+                palette.close_hover_foreground
+            );
         }
     }
 }
