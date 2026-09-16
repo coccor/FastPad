@@ -129,6 +129,8 @@ try {
         Assert-NoDynamicCrtImports -Dumpbin $dumpbin -Path (Join-Path $PackageRoot $binary)
     }
     Write-Output "No packaged binary imports the dynamic C runtime."
+    Assert-NoNetworkImports -Dumpbin $dumpbin -Path (Join-Path $PackageRoot "FastPad.exe")
+    Write-Output "FastPad.exe imports no network libraries."
 
     if ($RequireSignature) {
         foreach ($binary in $PackageBinaries) {
@@ -161,11 +163,14 @@ try {
         $hwnd = [FastPadSmoke]::FindChild($mainWindow, "Scintilla")
         if ($hwnd -ne [IntPtr]::Zero) { $hwnd }
     }
+    Wait-Until "the launch file to open without any input" {
+        [FastPadSmoke]::GetText($editor) -eq '{"smoke": true}'
+    } | Out-Null
     if (-not [FastPadSmoke]::SendChar($editor, [char]'x')) {
         throw "FastPad did not accept keyboard input."
     }
-    Wait-Until "the launch file to open after first input" {
-        [FastPadSmoke]::GetText($editor) -eq '{"smoke": true}'
+    Wait-Until "the typed character to reach the editor" {
+        [FastPadSmoke]::GetText($editor) -ne '{"smoke": true}'
     } | Out-Null
 
     $packagePrefix = [System.IO.Path]::TrimEndingDirectorySeparator($PackageRoot) + "\"
