@@ -1,18 +1,24 @@
 use crate::Result;
 use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
+use crate::window::menu_band::{self, MENU_TITLES};
 use crate::window::modal::ModalScope;
-use windows_sys::Win32::Foundation::{HWND, POINT};
+use std::cell::RefCell;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_ADD, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5,
-    VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_OEM_MINUS, VK_OEM_PLUS, VK_SUBTRACT, VK_TAB,
+    VIRTUAL_KEY, VK_ADD, VK_ESCAPE, VK_LEFT, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3,
+    VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_OEM_MINUS,
+    VK_OEM_PLUS, VK_RIGHT, VK_SUBTRACT, VK_TAB,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ACCEL, AppendMenuW, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
-    DestroyAcceleratorTable, DestroyMenu, DrawMenuBar, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
-    HMENU, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SetMenu, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenuEx, TranslateAcceleratorW,
+    ACCEL, AppendMenuW, CallNextHookEx, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
+    DestroyAcceleratorTable, DestroyMenu, EndMenu, FALT, FCONTROL, FSHIFT, FVIRTKEY, GetSubMenu,
+    HACCEL, HMENU, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MSGF_MENU, SetWindowsHookExW,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TPM_VERTICAL, TPMPARAMS,
+    TrackPopupMenuEx, TranslateAcceleratorW, UnhookWindowsHookEx, WH_MSGFILTER, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,7 +143,7 @@ impl MenuBar {
                 MenuEntry::Separator,
                 MenuEntry::command("E&xit", CommandId::Exit),
             ])?;
-            append_popup(root, "&File", file)?;
+            append_popup(root, MENU_TITLES[0], file)?;
             let edit = create_popup(&[
                 MenuEntry::command("&Undo\tCtrl+Z", CommandId::Undo),
                 MenuEntry::command("&Redo\tCtrl+Y", CommandId::Redo),
@@ -146,12 +152,12 @@ impl MenuBar {
                 MenuEntry::command("&Copy", CommandId::Copy),
                 MenuEntry::command("&Paste", CommandId::Paste),
             ])?;
-            append_popup(root, "&Edit", edit)?;
+            append_popup(root, MENU_TITLES[1], edit)?;
             let search = create_popup(&[
                 MenuEntry::command("&Find\tCtrl+F", CommandId::Find),
                 MenuEntry::command("&Replace\tCtrl+H", CommandId::Replace),
             ])?;
-            append_popup(root, "&Search", search)?;
+            append_popup(root, MENU_TITLES[2], search)?;
             let view = create_popup(&[
                 MenuEntry::command("Plain text", CommandId::LanguagePlainText),
                 MenuEntry::command("JSON", CommandId::LanguageJson),
@@ -172,9 +178,7 @@ impl MenuBar {
                     CommandId::CommandPalette,
                 ),
             ])?;
-            append_popup(root, "&View", view)?;
-            let help = create_popup(&[])?;
-            append_popup(root, "&Help", help)
+            append_popup(root, MENU_TITLES[3], view)
         })();
         match result {
             Ok(()) => Ok(Self(root)),
@@ -187,27 +191,14 @@ impl MenuBar {
         }
     }
 
-    pub(crate) fn raw(&self) -> HMENU {
-        self.0
+    /// The dropdown under heading `index` of `MENU_TITLES`.
+    pub(crate) fn dropdown(&self, index: usize) -> HMENU {
+        unsafe { GetSubMenu(self.0, index as i32) }
     }
 }
 
 pub(crate) fn translate_accelerator(handle: HACCEL, hwnd: HWND, message: &MSG) -> bool {
     unsafe { TranslateAcceleratorW(hwnd, handle, message) != 0 }
-}
-
-pub(crate) fn attach_menu(hwnd: HWND, menu: HMENU) {
-    unsafe {
-        SetMenu(hwnd, menu);
-        DrawMenuBar(hwnd);
-    }
-}
-
-pub(crate) fn detach_menu(hwnd: HWND) {
-    unsafe {
-        SetMenu(hwnd, std::ptr::null_mut());
-        DrawMenuBar(hwnd);
-    }
 }
 
 impl Drop for MenuBar {
@@ -329,6 +320,155 @@ fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> Option<Comma
         .and_then(|value| CommandId::try_from(value).ok())
 }
 
+/// How a menu-band dropdown closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DropdownExit {
+    Command(CommandId),
+    /// Left/Right, or the pointer moving onto another heading: open that heading's dropdown next.
+    Switch(usize),
+    /// Escape closes just the dropdown and leaves its heading highlighted.
+    Escape,
+    /// A click outside, or on the open heading itself, leaves menu mode.
+    Dismissed,
+}
+
+struct DropdownTracking {
+    current: usize,
+    /// Heading rectangles in screen coordinates.
+    headings: Vec<RECT>,
+    exit: Option<DropdownExit>,
+}
+
+thread_local! {
+    static DROPDOWN: RefCell<Option<DropdownTracking>> = const { RefCell::new(None) };
+}
+
+/// Opens `menu` below heading `current` (`headings` are client rectangles) and reports how it
+/// closed. Moving between headings needs a message filter: a popup menu's modal loop otherwise
+/// swallows Left/Right and pointer movement over the band.
+pub(crate) fn track_dropdown(
+    hwnd: HWND,
+    menu: HMENU,
+    current: usize,
+    headings: &[RECT],
+) -> DropdownExit {
+    let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    if let Some(answer) = DROPDOWN_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+        return answer(hwnd, current);
+    }
+    let headings = headings
+        .iter()
+        .map(|rect| client_to_screen(hwnd, *rect))
+        .collect::<Vec<_>>();
+    let Some(anchor) = headings.get(current).copied() else {
+        return DropdownExit::Dismissed;
+    };
+    DROPDOWN.with(|tracking| {
+        *tracking.borrow_mut() = Some(DropdownTracking {
+            current,
+            headings,
+            exit: None,
+        });
+    });
+    let hook = unsafe {
+        SetWindowsHookExW(
+            WH_MSGFILTER,
+            Some(dropdown_filter),
+            std::ptr::null_mut(),
+            GetCurrentThreadId(),
+        )
+    };
+    let params = TPMPARAMS {
+        cbSize: std::mem::size_of::<TPMPARAMS>() as u32,
+        rcExclude: anchor,
+    };
+    let selected = unsafe {
+        TrackPopupMenuEx(
+            menu,
+            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_VERTICAL,
+            anchor.left,
+            anchor.bottom,
+            hwnd,
+            &params,
+        )
+    };
+    if !hook.is_null() {
+        unsafe {
+            UnhookWindowsHookEx(hook);
+        }
+    }
+    let exit = DROPDOWN.with(|tracking| tracking.borrow_mut().take().and_then(|state| state.exit));
+    u16::try_from(selected)
+        .ok()
+        .and_then(|value| CommandId::try_from(value).ok())
+        .map(DropdownExit::Command)
+        .or(exit)
+        .unwrap_or(DropdownExit::Dismissed)
+}
+
+fn client_to_screen(hwnd: HWND, rect: RECT) -> RECT {
+    let mut top_left = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let mut bottom_right = POINT {
+        x: rect.right,
+        y: rect.bottom,
+    };
+    unsafe {
+        ClientToScreen(hwnd, &mut top_left);
+        ClientToScreen(hwnd, &mut bottom_right);
+    }
+    RECT {
+        left: top_left.x,
+        top: top_left.y,
+        right: bottom_right.x,
+        bottom: bottom_right.y,
+    }
+}
+
+/// The `WH_MSGFILTER` hook installed for one dropdown: decides from each message of the popup's
+/// modal loop whether to close it in favor of a neighboring heading.
+unsafe extern "system" fn dropdown_filter(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == MSGF_MENU as i32 && lparam != 0 {
+        let message = unsafe { &*(lparam as *const MSG) };
+        let exit = DROPDOWN.with(|tracking| {
+            let mut tracking = tracking.borrow_mut();
+            let state = tracking.as_mut()?;
+            let under_pointer = menu_band::heading_at(&state.headings, message.pt.x, message.pt.y);
+            let exit = match message.message {
+                WM_KEYDOWN if message.wParam == VK_LEFT as usize => {
+                    DropdownExit::Switch(menu_band::neighbor(state.current, false))
+                }
+                WM_KEYDOWN if message.wParam == VK_RIGHT as usize => {
+                    DropdownExit::Switch(menu_band::neighbor(state.current, true))
+                }
+                WM_KEYDOWN if message.wParam == VK_ESCAPE as usize => DropdownExit::Escape,
+                WM_MOUSEMOVE => match under_pointer {
+                    Some(index) if index != state.current => DropdownExit::Switch(index),
+                    _ => return None,
+                },
+                WM_LBUTTONDOWN if under_pointer == Some(state.current) => DropdownExit::Dismissed,
+                _ => return None,
+            };
+            state.exit = Some(exit);
+            Some(exit)
+        });
+        match exit {
+            // The popup's own Escape handling closes it; only the reason is recorded.
+            Some(DropdownExit::Escape) | None => {}
+            Some(_) => {
+                unsafe {
+                    EndMenu();
+                }
+                return 1;
+            }
+        }
+    }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
 #[cfg(test)]
 type PopupAnswer = Box<dyn FnOnce(HWND) -> Option<CommandId>>;
 
@@ -336,6 +476,21 @@ type PopupAnswer = Box<dyn FnOnce(HWND) -> Option<CommandId>>;
 thread_local! {
     static POPUP_ANSWERS: std::cell::RefCell<std::collections::VecDeque<PopupAnswer>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+type DropdownAnswer = Box<dyn FnOnce(HWND, usize) -> DropdownExit>;
+
+#[cfg(test)]
+thread_local! {
+    static DROPDOWN_ANSWERS: std::cell::RefCell<std::collections::VecDeque<DropdownAnswer>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Answers the next menu-band dropdown (given its heading) instead of tracking a real popup.
+#[cfg(test)]
+pub(crate) fn answer_next_dropdown(answer: impl FnOnce(HWND, usize) -> DropdownExit + 'static) {
+    DROPDOWN_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
 }
 
 /// Answers the next popup menu from inside its modal scope instead of tracking a real popup.

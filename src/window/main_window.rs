@@ -8,7 +8,8 @@ use crate::window::accessibility::{self, AccessibleSelectRequest, WM_FASTPAD_ACC
 use crate::window::command_palette::{self, CommandPalette};
 use crate::window::commands::CommandId;
 use crate::window::find_bar;
-use crate::window::menus::{self, MenuBar};
+use crate::window::menu_band::{self, MenuMode};
+use crate::window::menus::{self, DropdownExit, MenuBar};
 use crate::window::messages::{
     DeferredAction, classify_deferred_message, completed_milestone, deferred_start_message,
 };
@@ -26,21 +27,21 @@ use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, NMHDR, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, GetLastInputInfo, LASTINPUTINFO, ReleaseCapture, SetCapture, SetFocus,
-    VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
+    VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F10, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE, GWL_STYLE,
-    GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCAPTION, IsZoomed, KillTimer, MoveWindow,
-    OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU,
-    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, UnregisterClassW, WHEEL_DELTA, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
-    WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT,
-    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCAPTION, IsWindow, IsWindowVisible,
+    IsZoomed, KillTimer, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT,
+    RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW, WHEEL_DELTA, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED,
+    WM_DRAWITEM, WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY,
+    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
@@ -161,14 +162,29 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_SETFOCUS => {
-            // With no tab open the editor is hidden and the frame itself keeps the focus.
-            if tab_count(hwnd) > 0
+            // With no tab open the editor is hidden and the frame itself keeps the focus, as it
+            // does in menu mode to take the menu keys.
+            if menu_mode(hwnd).is_none()
+                && tab_count(hwnd) > 0
                 && let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) }
             {
                 unsafe {
                     SetFocus(editor_hwnd);
                 }
             }
+            0
+        }
+        // Focus leaving the frame ends menu mode. Activating an inactive window from SetFocus
+        // reports a loss to the frame itself, which is not one.
+        WM_KILLFOCUS => {
+            if wparam as HWND != hwnd && menu_mode(hwnd).is_some_and(|mode| !mode.open) {
+                exit_menu_mode(hwnd);
+            }
+            0
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN
+            if menu_mode(hwnd).is_some() && handle_menu_key(hwnd, message, wparam) =>
+        {
             0
         }
         WM_CLOSE => {
@@ -204,6 +220,7 @@ unsafe extern "system" fn main_window_proc(
                 let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
                 let status = current_status_bar(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
+                let headings = menu_headings(hwnd);
                 unsafe {
                     crate::window::titlebar::paint(
                         hwnd,
@@ -216,6 +233,7 @@ unsafe extern "system" fn main_window_proc(
                             palette,
                             fonts,
                             pointer,
+                            menu: menu_mode(hwnd).map(|mode| (mode, headings.as_slice())),
                         },
                     )
                 };
@@ -249,6 +267,7 @@ unsafe extern "system" fn main_window_proc(
             crate::window::titlebar::constrain_maximized_window(hwnd, lparam)
         },
         WM_MOUSEMOVE => {
+            hover_menu_heading(hwnd, lparam);
             drag_tab_thumb(hwnd, lparam);
             crate::window::titlebar::track_pointer_leave(hwnd, false);
             let target = client_title_target(hwnd, lparam);
@@ -272,6 +291,19 @@ unsafe extern "system" fn main_window_proc(
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_LBUTTONDOWN => {
+            if menu_mode(hwnd).is_some() {
+                let (x, y) = (
+                    (lparam as u32 & 0xffff) as u16 as i16 as i32,
+                    ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+                );
+                match menu_band::heading_at(&menu_headings(hwnd), x, y) {
+                    Some(index) => {
+                        open_menu(hwnd, index);
+                        return 0;
+                    }
+                    None => exit_menu_mode(hwnd),
+                }
+            }
             let target = client_title_target(hwnd, lparam);
             update_title_pointer(hwnd, |pointer| pointer.hover(target).press(target));
             if target == Some(HitTarget::ScrollBar) {
@@ -411,13 +443,24 @@ unsafe extern "system" fn main_window_proc(
             }
             0
         }
-        WM_SYSCOMMAND if transient_menu_syscommand(wparam, lparam) => {
-            show_menu_mode(hwnd);
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-        }
-        WM_EXITMENULOOP => {
-            menus::detach_menu(hwnd);
-            0
+        // A tapped Alt or F10 toggles the menu band; Alt+letter opens that heading's dropdown.
+        // Alt+Space (the system menu) and unknown letters keep the default handling.
+        WM_SYSCOMMAND if wparam & 0xfff0 == SC_KEYMENU as usize => {
+            if lparam == 0 {
+                if menu_mode(hwnd).is_some() {
+                    exit_menu_mode(hwnd);
+                } else {
+                    enter_menu_mode(hwnd, 0);
+                }
+                return 0;
+            }
+            match menu_band::mnemonic_heading(lparam as u32) {
+                Some(index) => {
+                    open_menu(hwnd, index);
+                    0
+                }
+                None => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+            }
         }
         WM_GETOBJECT if lparam as i32 == OBJID_CLIENT => {
             let provider = ensure_accessibility(hwnd);
@@ -460,7 +503,6 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_NCDESTROY => {
-            menus::detach_menu(hwnd);
             let app = unsafe { take_app(hwnd) };
             if let Some(app) = app.as_ref() {
                 app.invalidate_window(hwnd);
@@ -774,7 +816,7 @@ fn layout_editor_and_find_bar(hwnd: HWND) {
     let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
         return;
     };
-    let title_height = title_layout(hwnd).height;
+    let title_height = title_layout(hwnd).height + menu_band_height(hwnd);
     let mut rect = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut rect);
@@ -878,7 +920,7 @@ fn layout_command_palette(hwnd: HWND) {
                 unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96),
             )
         });
-    let top = title_layout(hwnd).height + find_bar_height;
+    let top = title_layout(hwnd).height + menu_band_height(hwnd) + find_bar_height;
     let mut rect = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut rect);
@@ -1312,6 +1354,7 @@ fn refresh_tabs(hwnd: HWND) {
 }
 
 fn execute_command(hwnd: HWND, command: CommandId) {
+    exit_menu_mode(hwnd);
     if file_population_active(hwnd) {
         return;
     }
@@ -3158,16 +3201,190 @@ fn ensure_accessibility(hwnd: HWND) -> *mut c_void {
         .unwrap_or(std::ptr::null_mut())
 }
 
-fn show_menu_mode(hwnd: HWND) {
-    let menu = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+fn menu_mode(hwnd: HWND) -> Option<MenuMode> {
+    unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.menu_mode)
+}
+
+fn menu_band_height(hwnd: HWND) -> i32 {
+    menu_mode(hwnd).map_or(0, |_| {
+        menu_band::band_height(
+            unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96),
+        )
+    })
+}
+
+/// The menu band's heading rectangles, or none outside menu mode.
+fn menu_headings(hwnd: HWND) -> Vec<RECT> {
+    if menu_mode(hwnd).is_none() {
+        return Vec::new();
+    }
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    let widths = menu_band::measure_titles(hwnd, title_chrome(hwnd).1.text());
+    menu_band::heading_rects(&widths, title_layout(hwnd).height, dpi)
+}
+
+/// Stores `mode`, re-laying out the window when the band appears or disappears.
+fn set_menu_mode(hwnd: HWND, mode: Option<MenuMode>) {
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
+    let app = unsafe { app.as_mut() };
+    let previous = std::mem::replace(&mut app.menu_mode, mode);
+    if previous == mode {
+        return;
+    }
+    if previous.is_some() != mode.is_some() {
+        layout_editor_and_find_bar(hwnd);
+    }
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+}
+
+fn enter_menu_mode(hwnd: HWND, hot: usize) {
+    if menu_mode(hwnd).is_some() {
+        return;
+    }
+    let ready = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
         let app = unsafe { app.as_mut() };
         if app.menu_bar.is_none() {
             app.menu_bar = MenuBar::create().ok();
         }
-        app.menu_bar.as_ref().map(MenuBar::raw)
+        app.menu_return_focus = unsafe { GetFocus() };
+        app.menu_bar.is_some()
     });
-    if let Some(menu) = menu {
-        menus::attach_menu(hwnd, menu);
+    if !ready {
+        return;
+    }
+    set_menu_mode(hwnd, Some(MenuMode { hot, open: false }));
+    unsafe {
+        SetFocus(hwnd);
+    }
+}
+
+fn exit_menu_mode(hwnd: HWND) {
+    if menu_mode(hwnd).is_none() {
+        return;
+    }
+    set_menu_mode(hwnd, None);
+    // Focus moved elsewhere (a click on the editor, another app) is left where it went.
+    if unsafe { GetFocus() } != hwnd {
+        return;
+    }
+    let previous = unsafe { app_ptr(hwnd) }
+        .map(|app| unsafe { app.as_ref() }.menu_return_focus)
+        .unwrap_or(std::ptr::null_mut());
+    let target = if !previous.is_null()
+        && previous != hwnd
+        && unsafe { IsWindow(previous) } != 0
+        && unsafe { IsWindowVisible(previous) } != 0
+    {
+        Some(previous)
+    } else if tab_count(hwnd) > 0 {
+        unsafe { editor_hwnd(hwnd) }
+    } else {
+        None
+    };
+    if let Some(target) = target {
+        unsafe {
+            SetFocus(target);
+        }
+    }
+}
+
+/// Opens heading `index`'s dropdown, then follows the user between headings until a command is
+/// picked or the menu is dismissed.
+fn open_menu(hwnd: HWND, mut index: usize) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    enter_menu_mode(hwnd, index);
+    loop {
+        let Some(menu) = unsafe { app_ptr(hwnd) }.and_then(|app| {
+            unsafe { app.as_ref() }
+                .menu_bar
+                .as_ref()
+                .map(|bar| bar.dropdown(index))
+        }) else {
+            return;
+        };
+        set_menu_mode(
+            hwnd,
+            Some(MenuMode {
+                hot: index,
+                open: true,
+            }),
+        );
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+        }
+        let headings = menu_headings(hwnd);
+        let exit = menus::track_dropdown(hwnd, menu, index, &headings);
+        if !identity.is_live_for(hwnd) {
+            return;
+        }
+        match exit {
+            DropdownExit::Switch(next) => index = next,
+            DropdownExit::Escape => {
+                set_menu_mode(
+                    hwnd,
+                    Some(MenuMode {
+                        hot: index,
+                        open: false,
+                    }),
+                );
+                return;
+            }
+            DropdownExit::Dismissed => {
+                exit_menu_mode(hwnd);
+                return;
+            }
+            DropdownExit::Command(command) => {
+                exit_menu_mode(hwnd);
+                execute_command(hwnd, command);
+                return;
+            }
+        }
+    }
+}
+
+/// Keyboard navigation of the menu band; false leaves the key to the default handling.
+fn handle_menu_key(hwnd: HWND, message: u32, key: WPARAM) -> bool {
+    let Some(mode) = menu_mode(hwnd) else {
+        return false;
+    };
+    let Ok(key) = u16::try_from(key) else {
+        return false;
+    };
+    match key {
+        VK_LEFT | VK_RIGHT => {
+            let hot = menu_band::neighbor(mode.hot, key == VK_RIGHT);
+            set_menu_mode(hwnd, Some(MenuMode { hot, ..mode }));
+        }
+        VK_DOWN | VK_UP | VK_RETURN => open_menu(hwnd, mode.hot),
+        VK_ESCAPE => exit_menu_mode(hwnd),
+        // Alt and F10 toggle the band through `translate_accelerator`.
+        VK_MENU | VK_F10 | VK_SHIFT | VK_CONTROL => {}
+        // Alt+letter arrives again as SC_KEYMENU with the letter, which opens the heading.
+        _ if message == WM_SYSKEYDOWN => return false,
+        _ => match menu_band::mnemonic_heading(u32::from(key)) {
+            Some(index) => open_menu(hwnd, index),
+            None => exit_menu_mode(hwnd),
+        },
+    }
+    true
+}
+
+fn hover_menu_heading(hwnd: HWND, lparam: LPARAM) {
+    let Some(mode) = menu_mode(hwnd).filter(|mode| !mode.open) else {
+        return;
+    };
+    let (x, y) = (
+        (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    );
+    if let Some(hot) = menu_band::heading_at(&menu_headings(hwnd), x, y) {
+        set_menu_mode(hwnd, Some(MenuMode { hot, ..mode }));
     }
 }
 
@@ -3222,10 +3439,6 @@ fn menu_activation_message(
         app.set_menu_alt_pending(false);
     }
     false
-}
-
-fn transient_menu_syscommand(wparam: WPARAM, lparam: LPARAM) -> bool {
-    wparam & 0xfff0 == SC_KEYMENU as usize && lparam == 0
 }
 
 unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Result<()> {
@@ -3642,6 +3855,96 @@ mod tests {
         assert_eq!(
             unsafe { SendMessageW(editor.hwnd(), SCI_GETZOOM, 0, 0) },
             -1
+        );
+    }
+
+    #[test]
+    fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_commands() {
+        // Break caught: Alt attached a native menu bar, which Windows drew unthemed over the editor
+        // (the reclaimed caption leaves it no room) and left a "File" remnant behind after Escape.
+        use crate::window::menus::{DropdownExit, answer_next_dropdown};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenu, GetWindowRect, SC_KEYMENU};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        super::build_chrome(window.hwnd);
+        let editor_top = || {
+            let mut rect = RECT::default();
+            let mut origin = windows_sys::Win32::Foundation::POINT::default();
+            unsafe {
+                GetWindowRect(editor.hwnd(), &mut rect);
+                windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut origin);
+            }
+            rect.top - origin.y
+        };
+        let key_menu = |letter: u8| unsafe {
+            SendMessageW(
+                window.hwnd,
+                super::WM_SYSCOMMAND,
+                SC_KEYMENU as usize,
+                letter as isize,
+            )
+        };
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
+        let title_height = super::title_layout(window.hwnd).height;
+        let band = super::menu_band::band_height(dpi);
+
+        key_menu(0);
+        assert_eq!(
+            app_mut(window.hwnd).menu_mode,
+            Some(super::MenuMode {
+                hot: 0,
+                open: false
+            })
+        );
+        assert!(
+            unsafe { GetMenu(window.hwnd) }.is_null(),
+            "no native menu bar"
+        );
+        assert_eq!(editor_top(), title_height + band);
+        assert_eq!(super::menu_headings(window.hwnd).len(), 4);
+
+        key_menu(0);
+        assert_eq!(app_mut(window.hwnd).menu_mode, None);
+        assert_eq!(editor_top(), title_height);
+
+        // Alt+E opens Edit; Right moves to Search, whose Escape leaves Search highlighted.
+        answer_next_dropdown(|hwnd, heading| {
+            assert_eq!(heading, 1);
+            assert_eq!(
+                app_mut(hwnd).menu_mode,
+                Some(super::MenuMode { hot: 1, open: true })
+            );
+            DropdownExit::Switch(2)
+        });
+        answer_next_dropdown(|_, heading| {
+            assert_eq!(heading, 2);
+            DropdownExit::Escape
+        });
+        key_menu(b'e');
+        assert_eq!(
+            app_mut(window.hwnd).menu_mode,
+            Some(super::MenuMode {
+                hot: 2,
+                open: false
+            })
+        );
+
+        // Down opens the highlighted heading; a picked command leaves menu mode before it runs.
+        answer_next_dropdown(|_, heading| {
+            assert_eq!(heading, 2);
+            DropdownExit::Command(CommandId::Find)
+        });
+        assert!(super::handle_menu_key(
+            window.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            super::VK_DOWN as usize,
+        ));
+        assert_eq!(app_mut(window.hwnd).menu_mode, None);
+        assert!(app_mut(window.hwnd).find_bar.as_ref().unwrap().is_visible());
+        assert_eq!(
+            editor_top(),
+            title_height + super::find_bar::find_bar_height(dpi)
         );
     }
 
