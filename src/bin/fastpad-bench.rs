@@ -676,7 +676,7 @@ fn run_once(launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
     send_benchmark_char(scintilla, BENCHMARK_INPUT_CHAR)?;
     wait_for_event(event.as_raw(), &child)?;
     // The rendered-input event is still required with a launch file, but the buffer check is not:
-    // the file's text replaces the empty document the benchmark character was typed into.
+    // the character lands in the initial Untitled tab while the file opens in a tab of its own.
     if launch_file.is_none() {
         verify_benchmark_char(scintilla)?;
     }
@@ -684,7 +684,15 @@ fn run_once(launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
     std::thread::sleep(std::time::Duration::from_secs(2));
     record.idle_private_working_set_bytes = private_working_set(child.process.as_raw())?;
     validate_record(&record, child.pid)?;
-    // The benchmark character dirties the document; a save prompt would block WM_CLOSE.
+    // The benchmark character dirties the document; a save prompt would block WM_CLOSE. With a
+    // launch file that document is the first (Untitled) tab, not the active file tab.
+    if launch_file.is_some() {
+        send_scintilla_scalar(
+            main_hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_COMMAND,
+            fastpad::window::commands::CommandId::SelectTab1 as usize,
+        )?;
+    }
     send_scintilla_scalar(
         scintilla,
         fastpad::editor::scintilla_constants::SCI_SETSAVEPOINT,
