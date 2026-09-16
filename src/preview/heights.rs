@@ -80,7 +80,9 @@ impl HeightIndex {
             return 0;
         }
         self.ensure_prefix(count);
-        self.prefix[..count].partition_point(|top| *top <= y).saturating_sub(1)
+        self.prefix[..count]
+            .partition_point(|top| *top <= y)
+            .saturating_sub(1)
     }
 
     pub fn anchor(&mut self, scroll_y: f32) -> (usize, f32) {
@@ -169,11 +171,19 @@ mod tests {
         let source = "# A\n\none\ntwo\nthree\n\n- x\n- y\n";
         let (blocks, _) = parse_document(source);
         let mut heights = HeightIndex::default();
-        heights.reset(blocks.iter().map(|block| estimate_height(block.lines.len(), 20.0, 16.0)));
+        heights.reset(
+            blocks
+                .iter()
+                .map(|block| estimate_height(block.lines.len(), 20.0, 16.0)),
+        );
         for block in &blocks {
             for line in block.lines.clone() {
                 let offset = offset_for_line(&blocks, &mut heights, line);
-                assert_eq!(line_for_offset(&blocks, &mut heights, offset), line, "line {line}");
+                assert_eq!(
+                    line_for_offset(&blocks, &mut heights, offset),
+                    line,
+                    "line {line}"
+                );
             }
         }
     }
@@ -183,8 +193,12 @@ mod tests {
         let (blocks, _) = parse_document("a\n\nb\n\nc\n");
         let mut heights = HeightIndex::default();
         heights.reset(blocks.iter().map(|_| 36.0));
-        assert!(offset_for_line(&blocks, &mut heights, 0) < offset_for_line(&blocks, &mut heights, 2));
-        assert!(offset_for_line(&blocks, &mut heights, 2) < offset_for_line(&blocks, &mut heights, 4));
+        assert!(
+            offset_for_line(&blocks, &mut heights, 0) < offset_for_line(&blocks, &mut heights, 2)
+        );
+        assert!(
+            offset_for_line(&blocks, &mut heights, 2) < offset_for_line(&blocks, &mut heights, 4)
+        );
         assert_eq!(offset_for_line(&blocks, &mut heights, 99), heights.total());
     }
 }

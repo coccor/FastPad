@@ -226,10 +226,16 @@ mod tests {
 
     #[test]
     fn markdown_preview_commands_have_stable_values() {
-        assert_eq!(CommandId::try_from(152), Ok(CommandId::MarkdownPreviewCycle));
+        assert_eq!(
+            CommandId::try_from(152),
+            Ok(CommandId::MarkdownPreviewCycle)
+        );
         assert_eq!(CommandId::try_from(153), Ok(CommandId::MarkdownPreviewSide));
         assert_eq!(CommandId::try_from(154), Ok(CommandId::MarkdownPreviewFull));
-        assert_eq!(CommandId::try_from(155), Ok(CommandId::MarkdownPreviewClose));
+        assert_eq!(
+            CommandId::try_from(155),
+            Ok(CommandId::MarkdownPreviewClose)
+        );
         assert!(CommandId::MarkdownPreviewSide.needs_document());
         assert!(CommandId::MarkdownPreviewClose.is_markdown_preview());
         assert!(!CommandId::Save.is_markdown_preview());

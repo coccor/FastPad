@@ -117,7 +117,10 @@ impl SourceText for str {
 pub enum Update {
     Unchanged,
     /// Blocks `old` (pre-update indices) were replaced by blocks `new` (post-update indices).
-    Replaced { old: Range<usize>, new: Range<usize> },
+    Replaced {
+        old: Range<usize>,
+        new: Range<usize>,
+    },
     Full,
 }
 
@@ -131,7 +134,11 @@ pub struct PreviewDocument {
 impl PreviewDocument {
     pub fn parse(source: &str) -> Self {
         let (blocks, refdefs) = parse_document(source);
-        Self { blocks, revision: 1, refdefs }
+        Self {
+            blocks,
+            revision: 1,
+            refdefs,
+        }
     }
 
     pub fn reparse(&mut self, source: &(impl SourceText + ?Sized)) -> Update {
@@ -151,22 +158,38 @@ impl PreviewDocument {
     }
 
     /// Like `apply`, but returns `None` where `apply` would parse the whole document.
-    pub fn try_apply(&mut self, source: &(impl SourceText + ?Sized), edits: &[Edit]) -> Option<Update> {
+    pub fn try_apply(
+        &mut self,
+        source: &(impl SourceText + ?Sized),
+        edits: &[Edit],
+    ) -> Option<Update> {
         if edits.is_empty() {
             return Some(Update::Unchanged);
         }
         let dirty = self.shift_for_edits(edits)?;
         let count = self.blocks.len();
-        let first = self.blocks.partition_point(|block| block.bytes.end < dirty.start);
-        let last = self.blocks.partition_point(|block| block.bytes.start <= dirty.end);
+        let first = self
+            .blocks
+            .partition_point(|block| block.bytes.end < dirty.start);
+        let last = self
+            .blocks
+            .partition_point(|block| block.bytes.start <= dirty.end);
         let mut low = first.saturating_sub(SENTINELS);
         let mut high = (last.max(first) + SENTINELS).min(count);
         for _ in 0..=MAX_WIDENINGS {
             if low == 0 && high == count {
                 break;
             }
-            let start = if low == 0 { 0 } else { self.blocks[low].bytes.start };
-            let end = if high == count { source.len() } else { self.blocks[high - 1].bytes.end };
+            let start = if low == 0 {
+                0
+            } else {
+                self.blocks[low].bytes.start
+            };
+            let end = if high == count {
+                source.len()
+            } else {
+                self.blocks[high - 1].bytes.end
+            };
             let text = source.slice(start..end);
             if text.contains("]:") {
                 return None;
@@ -178,7 +201,10 @@ impl PreviewDocument {
                 let new = low..low + parsed.len();
                 self.blocks.splice(low..high, parsed);
                 self.revision += 1;
-                return Some(Update::Replaced { old: low..high, new });
+                return Some(Update::Replaced {
+                    old: low..high,
+                    new,
+                });
             }
             if !start_ok {
                 low = low.saturating_sub(1);
@@ -197,11 +223,9 @@ impl PreviewDocument {
         let mut dirty: Option<Range<usize>> = None;
         for edit in edits {
             let removed_end = edit.position + edit.removed;
-            if self
-                .refdefs
-                .iter()
-                .any(|definition| definition.span.start <= removed_end && edit.position <= definition.span.end)
-            {
+            if self.refdefs.iter().any(|definition| {
+                definition.span.start <= removed_end && edit.position <= definition.span.end
+            }) {
                 return None;
             }
             for block in &mut self.blocks {
@@ -263,8 +287,24 @@ mod tests {
     ];
 
     const INSERTS: [&str; 18] = [
-        "x", "\n", "\n\n", "```", "~~~", "- ", "1. ", "> ", "    ", "|", "---", "[a]: /u\n",
-        "<!--", "-->", "**", "`", " ", "===\n",
+        "x",
+        "\n",
+        "\n\n",
+        "```",
+        "~~~",
+        "- ",
+        "1. ",
+        "> ",
+        "    ",
+        "|",
+        "---",
+        "[a]: /u\n",
+        "<!--",
+        "-->",
+        "**",
+        "`",
+        " ",
+        "===\n",
     ];
 
     /// xorshift64*: deterministic and dependency-free.
@@ -295,7 +335,11 @@ mod tests {
         let position = boundary(text, rng.below(text.len() + 1));
         if rng.below(3) == 0 && position < text.len() {
             let end = boundary(text, position + 1 + rng.below(8));
-            let end = if end == position { boundary(text, text.len()) } else { end };
+            let end = if end == position {
+                boundary(text, text.len())
+            } else {
+                end
+            };
             let removed_text = text[position..end].to_owned();
             text.replace_range(position..end, "");
             Edit {
@@ -347,7 +391,12 @@ mod tests {
         text.insert(12, 'x');
         let update = document.apply(
             text.as_str(),
-            &[Edit { position: 12, removed: 0, inserted: 1, lines_delta: 0 }],
+            &[Edit {
+                position: 12,
+                removed: 0,
+                inserted: 1,
+                lines_delta: 0,
+            }],
         );
         let Update::Replaced { old, new } = update else {
             panic!("expected a partial update, got {update:?}");
@@ -363,7 +412,12 @@ mod tests {
         text.replace_range(10..13, "two");
         let update = document.apply(
             text.as_str(),
-            &[Edit { position: 10, removed: 3, inserted: 3, lines_delta: 0 }],
+            &[Edit {
+                position: 10,
+                removed: 3,
+                inserted: 3,
+                lines_delta: 0,
+            }],
         );
         assert_eq!(update, Update::Full);
         assert_eq!(document.blocks, parse_document(&text).0);
@@ -372,7 +426,12 @@ mod tests {
     #[test]
     fn the_edit_log_caps_pending_edits_and_then_requests_a_full_parse() {
         let mut log = EditLog::default();
-        let edit = Edit { position: 0, removed: 0, inserted: 1, lines_delta: 0 };
+        let edit = Edit {
+            position: 0,
+            removed: 0,
+            inserted: 1,
+            lines_delta: 0,
+        };
         for _ in 0..MAX_PENDING_EDITS {
             log.record(edit);
         }
@@ -387,7 +446,12 @@ mod tests {
     #[test]
     fn restored_pending_edits_are_not_lost() {
         let mut log = EditLog::default();
-        let edit = Edit { position: 3, removed: 1, inserted: 0, lines_delta: 0 };
+        let edit = Edit {
+            position: 3,
+            removed: 1,
+            inserted: 0,
+            lines_delta: 0,
+        };
         log.record(edit);
         let pending = log.take();
         log.restore(pending);
@@ -399,9 +463,17 @@ mod tests {
         let mut text = String::from("[a]\n\n[a]: /one\n");
         let mut document = PreviewDocument::parse(&text);
         text.replace_range(10..13, "two");
-        let edit = Edit { position: 10, removed: 3, inserted: 3, lines_delta: 0 };
+        let edit = Edit {
+            position: 10,
+            removed: 3,
+            inserted: 3,
+            lines_delta: 0,
+        };
         assert_eq!(document.try_apply(text.as_str(), &[edit]), None);
-        assert_eq!(document.try_apply(text.as_str(), &[]), Some(Update::Unchanged));
+        assert_eq!(
+            document.try_apply(text.as_str(), &[]),
+            Some(Update::Unchanged)
+        );
     }
 
     #[test]
@@ -410,7 +482,15 @@ mod tests {
         let mut document = PreviewDocument::parse(&text);
         let first = document.revision;
         text.push('b');
-        document.apply(text.as_str(), &[Edit { position: 2, removed: 0, inserted: 1, lines_delta: 0 }]);
+        document.apply(
+            text.as_str(),
+            &[Edit {
+                position: 2,
+                removed: 0,
+                inserted: 1,
+                lines_delta: 0,
+            }],
+        );
         assert!(document.revision > first);
     }
 }

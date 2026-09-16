@@ -115,7 +115,11 @@ pub fn preview_colors(theme: Theme, high_contrast: bool) -> PreviewColors {
                 windows_sys::Win32::Graphics::Gdi::COLOR_HOTLIGHT,
             )
         };
-        let link = if link == palette.editor_background { palette.editor_foreground } else { link };
+        let link = if link == palette.editor_background {
+            palette.editor_foreground
+        } else {
+            link
+        };
         return PreviewColors {
             background: palette.editor_background,
             text: palette.editor_foreground,
@@ -137,7 +141,10 @@ pub fn preview_colors(theme: Theme, high_contrast: bool) -> PreviewColors {
         Theme::CatppuccinMacchiato => catppuccin_colors(&catppuccin::MACCHIATO),
         Theme::CatppuccinMocha => catppuccin_colors(&catppuccin::MOCHA),
     };
-    PreviewColors { background: palette.editor_background, ..colors }
+    PreviewColors {
+        background: palette.editor_background,
+        ..colors
+    }
 }
 
 #[cfg(test)]
@@ -162,7 +169,12 @@ mod tests {
         for theme in Theme::ALL {
             for high_contrast in [false, true] {
                 let colors = preview_colors(theme, high_contrast);
-                for role in [ColorRole::Text, ColorRole::Muted, ColorRole::Heading, ColorRole::Link] {
+                for role in [
+                    ColorRole::Text,
+                    ColorRole::Muted,
+                    ColorRole::Heading,
+                    ColorRole::Link,
+                ] {
                     assert_ne!(colors.get(role), colors.background, "{theme:?} {role:?}");
                 }
             }

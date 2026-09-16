@@ -23,13 +23,26 @@ pub struct Block {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockKind {
-    Heading { level: u8, text: RichText },
+    Heading {
+        level: u8,
+        text: RichText,
+    },
     Paragraph(RichText),
     Images(Vec<ImageRef>),
-    List { start: Option<u64>, items: Vec<ListItem> },
+    List {
+        start: Option<u64>,
+        items: Vec<ListItem>,
+    },
     Quote(Vec<BlockKind>),
-    Code { language: String, text: String },
-    Table { alignments: Vec<CellAlign>, head: Vec<RichText>, rows: Vec<Vec<RichText>> },
+    Code {
+        language: String,
+        text: String,
+    },
+    Table {
+        alignments: Vec<CellAlign>,
+        head: Vec<RichText>,
+        rows: Vec<Vec<RichText>>,
+    },
     Rule,
     Html(String),
 }
@@ -126,16 +139,18 @@ pub fn parse_blocks(
 ) -> Vec<Block> {
     let resolve = |link: BrokenLink<'_>| {
         let key = normalize_label(&link.reference);
-        refdefs.iter().find(|definition| definition.key == key).map(|definition| {
-            (
-                CowStr::from(definition.dest.clone()),
-                CowStr::from(definition.title.clone()),
-            )
-        })
+        refdefs
+            .iter()
+            .find(|definition| definition.key == key)
+            .map(|definition| {
+                (
+                    CowStr::from(definition.dest.clone()),
+                    CowStr::from(definition.title.clone()),
+                )
+            })
     };
-    let mut events =
-        Parser::new_with_broken_link_callback(source, PARSE_OPTIONS, Some(resolve))
-            .into_offset_iter();
+    let mut events = Parser::new_with_broken_link_callback(source, PARSE_OPTIONS, Some(resolve))
+        .into_offset_iter();
     collect_blocks(&mut events, source, base_byte, base_line)
 }
 
@@ -178,7 +193,11 @@ struct LineCounter<'a> {
 
 impl<'a> LineCounter<'a> {
     fn new(source: &'a str) -> Self {
-        Self { bytes: source.as_bytes(), position: 0, line: 0 }
+        Self {
+            bytes: source.as_bytes(),
+            position: 0,
+            line: 0,
+        }
     }
 
     fn line_of(&mut self, offset: usize) -> usize {
@@ -226,7 +245,10 @@ impl TextBuilder {
         if let Some((style, start)) = self.open.pop()
             && start < self.utf16_len
         {
-            self.spans.push(Span { range: start..self.utf16_len, style });
+            self.spans.push(Span {
+                range: start..self.utf16_len,
+                style,
+            });
         }
     }
 
@@ -235,14 +257,25 @@ impl TextBuilder {
             return;
         };
         let start = self.utf16_len;
-        let alt = if image.alt.is_empty() { "image".to_owned() } else { image.alt.clone() };
+        let alt = if image.alt.is_empty() {
+            "image".to_owned()
+        } else {
+            image.alt.clone()
+        };
         self.push(&alt, false);
-        self.spans.push(Span { range: start..self.utf16_len, style: InlineStyle::ImageAlt });
+        self.spans.push(Span {
+            range: start..self.utf16_len,
+            style: InlineStyle::ImageAlt,
+        });
         self.images.push(image);
     }
 
     fn into_rich_text(self) -> RichText {
-        RichText { text: self.text, utf16_len: self.utf16_len, spans: self.spans }
+        RichText {
+            text: self.text,
+            utf16_len: self.utf16_len,
+            spans: self.spans,
+        }
     }
 
     /// A paragraph of only images (and whitespace) becomes an image block.
@@ -256,14 +289,31 @@ impl TextBuilder {
 }
 
 enum Frame {
-    Heading { level: u8, text: TextBuilder },
+    Heading {
+        level: u8,
+        text: TextBuilder,
+    },
     Paragraph(TextBuilder),
-    List { start: Option<u64>, items: Vec<ListItem> },
-    Item { task: Option<bool>, blocks: Vec<BlockKind>, loose: Option<TextBuilder> },
+    List {
+        start: Option<u64>,
+        items: Vec<ListItem>,
+    },
+    Item {
+        task: Option<bool>,
+        blocks: Vec<BlockKind>,
+        loose: Option<TextBuilder>,
+    },
     Quote(Vec<BlockKind>),
-    Code { language: String, text: String },
+    Code {
+        language: String,
+        text: String,
+    },
     Html(String),
-    Table { alignments: Vec<CellAlign>, head: Vec<RichText>, rows: Vec<Vec<RichText>> },
+    Table {
+        alignments: Vec<CellAlign>,
+        head: Vec<RichText>,
+        rows: Vec<Vec<RichText>>,
+    },
     Row(Vec<RichText>),
     Cell(TextBuilder),
 }
@@ -356,7 +406,10 @@ impl Builder {
             Tag::Link { dest_url, .. } => self.open_style(InlineStyle::Link(dest_url.to_string())),
             Tag::Image { dest_url, .. } => {
                 if let Some(target) = self.inline_target() {
-                    target.image_stack.push(ImageRef { dest: dest_url.to_string(), alt: String::new() });
+                    target.image_stack.push(ImageRef {
+                        dest: dest_url.to_string(),
+                        alt: String::new(),
+                    });
                 }
             }
             Tag::Paragraph => self.push_block_frame(Frame::Paragraph(TextBuilder::default())),
@@ -367,16 +420,28 @@ impl Builder {
             Tag::BlockQuote(_) => self.push_block_frame(Frame::Quote(Vec::new())),
             Tag::CodeBlock(kind) => {
                 let language = match kind {
-                    CodeBlockKind::Fenced(info) => {
-                        info.split_whitespace().next().unwrap_or_default().to_owned()
-                    }
+                    CodeBlockKind::Fenced(info) => info
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                self.push_block_frame(Frame::Code { language, text: String::new() });
+                self.push_block_frame(Frame::Code {
+                    language,
+                    text: String::new(),
+                });
             }
             Tag::HtmlBlock => self.push_block_frame(Frame::Html(String::new())),
-            Tag::List(start) => self.push_block_frame(Frame::List { start, items: Vec::new() }),
-            Tag::Item => self.stack.push(Frame::Item { task: None, blocks: Vec::new(), loose: None }),
+            Tag::List(start) => self.push_block_frame(Frame::List {
+                start,
+                items: Vec::new(),
+            }),
+            Tag::Item => self.stack.push(Frame::Item {
+                task: None,
+                blocks: Vec::new(),
+                loose: None,
+            }),
             Tag::Table(alignments) => self.push_block_frame(Frame::Table {
                 alignments: alignments.into_iter().map(cell_align).collect(),
                 head: Vec::new(),
@@ -470,7 +535,10 @@ impl Builder {
 
 fn finish_block(frame: Frame) -> BlockKind {
     match frame {
-        Frame::Heading { level, text } => BlockKind::Heading { level, text: text.into_rich_text() },
+        Frame::Heading { level, text } => BlockKind::Heading {
+            level,
+            text: text.into_rich_text(),
+        },
         Frame::Paragraph(text) => text.into_paragraph(),
         Frame::List { start, items } => BlockKind::List { start, items },
         Frame::Quote(blocks) => BlockKind::Quote(blocks),
@@ -479,7 +547,15 @@ fn finish_block(frame: Frame) -> BlockKind {
             text: text.strip_suffix('\n').unwrap_or(&text).to_owned(),
         },
         Frame::Html(html) => BlockKind::Html(html.trim_end().to_owned()),
-        Frame::Table { alignments, head, rows } => BlockKind::Table { alignments, head, rows },
+        Frame::Table {
+            alignments,
+            head,
+            rows,
+        } => BlockKind::Table {
+            alignments,
+            head,
+            rows,
+        },
         // Items, rows, and cells close through their own end tags and never reach this function;
         // these arms only keep the match exhaustive without a panic in an abort-on-panic build.
         Frame::Item { blocks, .. } => BlockKind::Quote(blocks),
@@ -501,7 +577,11 @@ mod tests {
     use super::*;
 
     fn kinds(source: &str) -> Vec<BlockKind> {
-        parse_document(source).0.into_iter().map(|block| block.kind).collect()
+        parse_document(source)
+            .0
+            .into_iter()
+            .map(|block| block.kind)
+            .collect()
     }
 
     fn plain(text: &str) -> RichText {
@@ -513,7 +593,10 @@ mod tests {
     }
 
     fn styled(text: &str, spans: Vec<Span>) -> RichText {
-        RichText { spans, ..plain(text) }
+        RichText {
+            spans,
+            ..plain(text)
+        }
     }
 
     fn span(range: Range<u32>, style: InlineStyle) -> Span {
@@ -525,12 +608,21 @@ mod tests {
         let source = "# Title\n\nHello *world*\n";
         let (blocks, _) = parse_document(source);
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].kind, BlockKind::Heading { level: 1, text: plain("Title") });
+        assert_eq!(
+            blocks[0].kind,
+            BlockKind::Heading {
+                level: 1,
+                text: plain("Title")
+            }
+        );
         assert_eq!(source[blocks[0].bytes.clone()].trim_end(), "# Title");
         assert_eq!(blocks[0].lines, 0..1);
         assert_eq!(
             blocks[1].kind,
-            BlockKind::Paragraph(styled("Hello world", vec![span(6..11, InlineStyle::Emphasis)]))
+            BlockKind::Paragraph(styled(
+                "Hello world",
+                vec![span(6..11, InlineStyle::Emphasis)]
+            ))
         );
         assert_eq!(source[blocks[1].bytes.clone()].trim_end(), "Hello *world*");
         assert_eq!(blocks[1].lines, 2..3);
@@ -540,7 +632,10 @@ mod tests {
     fn setext_headings_are_headings() {
         assert_eq!(
             kinds("Title\n=====\n"),
-            vec![BlockKind::Heading { level: 1, text: plain("Title") }]
+            vec![BlockKind::Heading {
+                level: 1,
+                text: plain("Title")
+            }]
         );
     }
 
@@ -549,7 +644,10 @@ mod tests {
         let expected = BlockKind::List {
             start: None,
             items: vec![
-                ListItem { task: Some(true), blocks: vec![BlockKind::Paragraph(plain("done"))] },
+                ListItem {
+                    task: Some(true),
+                    blocks: vec![BlockKind::Paragraph(plain("done"))],
+                },
                 ListItem {
                     task: Some(false),
                     blocks: vec![
@@ -565,7 +663,10 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(kinds("- [x] done\n- [ ] todo\n  - nested\n"), vec![expected]);
+        assert_eq!(
+            kinds("- [x] done\n- [ ] todo\n  - nested\n"),
+            vec![expected]
+        );
     }
 
     #[test]
@@ -573,8 +674,14 @@ mod tests {
         let expected = BlockKind::List {
             start: None,
             items: vec![
-                ListItem { task: Some(true), blocks: vec![BlockKind::Paragraph(plain("a"))] },
-                ListItem { task: Some(false), blocks: vec![BlockKind::Paragraph(plain("b"))] },
+                ListItem {
+                    task: Some(true),
+                    blocks: vec![BlockKind::Paragraph(plain("a"))],
+                },
+                ListItem {
+                    task: Some(false),
+                    blocks: vec![BlockKind::Paragraph(plain("b"))],
+                },
             ],
         };
         assert_eq!(kinds("- [x] a\n\n- [ ] b\n"), vec![expected]);
@@ -605,11 +712,17 @@ mod tests {
     fn fenced_and_indented_code_blocks() {
         assert_eq!(
             kinds("```rust\nfn main() {}\n```\n"),
-            vec![BlockKind::Code { language: "rust".into(), text: "fn main() {}".into() }]
+            vec![BlockKind::Code {
+                language: "rust".into(),
+                text: "fn main() {}".into()
+            }]
         );
         assert_eq!(
             kinds("    x = 1\n"),
-            vec![BlockKind::Code { language: String::new(), text: "x = 1".into() }]
+            vec![BlockKind::Code {
+                language: String::new(),
+                text: "x = 1".into()
+            }]
         );
     }
 
@@ -620,7 +733,10 @@ mod tests {
             vec![BlockKind::Table {
                 alignments: vec![CellAlign::Left, CellAlign::Right],
                 head: vec![plain("a"), plain("b")],
-                rows: vec![vec![plain("1"), styled("2", vec![span(0..1, InlineStyle::Strong)])]],
+                rows: vec![vec![
+                    plain("1"),
+                    styled("2", vec![span(0..1, InlineStyle::Strong)])
+                ]],
             }]
         );
     }
@@ -674,7 +790,10 @@ mod tests {
     fn span_offsets_are_utf16() {
         assert_eq!(
             kinds("**é😀**\n"),
-            vec![BlockKind::Paragraph(styled("é😀", vec![span(0..3, InlineStyle::Strong)]))]
+            vec![BlockKind::Paragraph(styled(
+                "é😀",
+                vec![span(0..3, InlineStyle::Strong)]
+            ))]
         );
     }
 

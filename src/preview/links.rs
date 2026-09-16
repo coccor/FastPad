@@ -15,7 +15,8 @@ pub enum LinkAction {
 pub fn classify_link(dest: &str, document_dir: Option<&Path>) -> LinkAction {
     let dest = dest.trim();
     let lower = dest.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:") {
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+    {
         return LinkAction::External(dest.to_owned());
     }
     if let Some(anchor) = dest.strip_prefix('#') {
@@ -61,7 +62,10 @@ fn has_scheme(dest: &str) -> bool {
     let scheme = &dest[..colon];
     let is_drive = scheme.len() == 1 && scheme.as_bytes()[0].is_ascii_alphabetic();
     !is_drive
-        && scheme.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && scheme
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
         && scheme
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'))
@@ -139,8 +143,8 @@ mod tests {
 
     impl ScratchDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("fastpad-links-{name}-{}", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("fastpad-links-{name}-{}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
@@ -155,7 +159,10 @@ mod tests {
     #[test]
     fn web_and_mail_links_open_externally() {
         for dest in ["https://x.dev/a", "HTTP://X.DEV", "mailto:me@x.dev"] {
-            assert_eq!(classify_link(dest, None), LinkAction::External(dest.to_owned()));
+            assert_eq!(
+                classify_link(dest, None),
+                LinkAction::External(dest.to_owned())
+            );
         }
     }
 
@@ -173,8 +180,14 @@ mod tests {
         std::fs::write(dir.0.join("notes.md"), "x").unwrap();
         let expected = LinkAction::LocalFile(dir.0.join("notes.md"));
         assert_eq!(classify_link("notes.md", Some(&dir.0)), expected);
-        assert_eq!(classify_link("./notes.md#part", Some(&dir.0)), LinkAction::LocalFile(dir.0.join(".\\notes.md")));
-        assert_eq!(classify_link("missing.md", Some(&dir.0)), LinkAction::Ignored);
+        assert_eq!(
+            classify_link("./notes.md#part", Some(&dir.0)),
+            LinkAction::LocalFile(dir.0.join(".\\notes.md"))
+        );
+        assert_eq!(
+            classify_link("missing.md", Some(&dir.0)),
+            LinkAction::Ignored
+        );
         assert_eq!(classify_link("notes.md", None), LinkAction::Ignored);
         let absolute = dir.0.join("notes.md");
         assert_eq!(
@@ -185,7 +198,13 @@ mod tests {
 
     #[test]
     fn other_schemes_are_ignored() {
-        for dest in ["ftp://x.dev", "javascript:alert(1)", "file:///C:/x", "//host/share", ""] {
+        for dest in [
+            "ftp://x.dev",
+            "javascript:alert(1)",
+            "file:///C:/x",
+            "//host/share",
+            "",
+        ] {
             assert_eq!(classify_link(dest, None), LinkAction::Ignored, "{dest}");
         }
     }
@@ -198,17 +217,28 @@ mod tests {
             Some(PathBuf::from(r"C:\docs\img\a b.png"))
         );
         assert_eq!(resolve_image_path("https://x.dev/a.png", Some(&dir)), None);
-        assert_eq!(resolve_image_path("data:image/png;base64,AAAA", Some(&dir)), None);
+        assert_eq!(
+            resolve_image_path("data:image/png;base64,AAAA", Some(&dir)),
+            None
+        );
         assert_eq!(resolve_image_path("a.png", None), None);
     }
 
     #[test]
     fn unc_and_device_paths_never_resolve() {
         let dir = PathBuf::from(r"C:\docs");
-        for dest in [r"/\host/share/a.png", "%2F%2Fhost/share/a.png", r"\\host\share\a.png", r"\\?\C:\x.png"]
-        {
+        for dest in [
+            r"/\host/share/a.png",
+            "%2F%2Fhost/share/a.png",
+            r"\\host\share\a.png",
+            r"\\?\C:\x.png",
+        ] {
             assert_eq!(resolve_image_path(dest, Some(&dir)), None, "{dest}");
-            assert_eq!(classify_link(dest, Some(&dir)), LinkAction::Ignored, "{dest}");
+            assert_eq!(
+                classify_link(dest, Some(&dir)),
+                LinkAction::Ignored,
+                "{dest}"
+            );
         }
     }
 

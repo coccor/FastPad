@@ -63,7 +63,10 @@ pub(crate) const ENTRIES: [PaletteEntry; 45] = [
     entry("Language: Plain text", CommandId::LanguagePlainText),
     entry("Language: JSON", CommandId::LanguageJson),
     entry("Language: Markdown", CommandId::LanguageMarkdown),
-    entry("Markdown Preview: Side by Side", CommandId::MarkdownPreviewSide),
+    entry(
+        "Markdown Preview: Side by Side",
+        CommandId::MarkdownPreviewSide,
+    ),
     entry("Markdown Preview: Full", CommandId::MarkdownPreviewFull),
     entry("Markdown Preview: Close", CommandId::MarkdownPreviewClose),
     entry("View: Next tab", CommandId::NextTab),

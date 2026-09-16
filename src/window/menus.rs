@@ -175,7 +175,10 @@ impl MenuBar {
                 MenuEntry::command("&Word wrap	Alt+Z", CommandId::ToggleWordWrap),
                 MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
                 MenuEntry::Separator,
-                MenuEntry::command("Markdown preview &side by side", CommandId::MarkdownPreviewSide),
+                MenuEntry::command(
+                    "Markdown preview &side by side",
+                    CommandId::MarkdownPreviewSide,
+                ),
                 MenuEntry::command("Markdown preview f&ull", CommandId::MarkdownPreviewFull),
                 MenuEntry::command("Close Markdown pre&view", CommandId::MarkdownPreviewClose),
                 MenuEntry::Separator,
@@ -611,10 +614,12 @@ mod tests {
         let bar = MenuBar::create().unwrap();
         let view = bar.dropdown(3);
         set_markdown_preview_enabled(view, false);
-        let state = unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
+        let state =
+            unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
         assert_ne!(state & MF_GRAYED, 0);
         set_markdown_preview_enabled(view, true);
-        let state = unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
+        let state =
+            unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
         assert_eq!(state & MF_GRAYED, 0);
     }
 }

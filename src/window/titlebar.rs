@@ -1426,7 +1426,11 @@ mod tests {
             TitleBarLayout::calculate_scrolled(client, 96, 3, 0),
             TitleBarLayout::calculate_with_preview(client, 96, 3, 0, false)
         );
-        assert!(TitleBarLayout::calculate_scrolled(client, 96, 3, 0).preview_side.is_none());
+        assert!(
+            TitleBarLayout::calculate_scrolled(client, 96, 3, 0)
+                .preview_side
+                .is_none()
+        );
     }
 
     #[test]
@@ -1440,7 +1444,8 @@ mod tests {
         assert_eq!(layout.drag_region.right, side.left);
         assert_eq!(layout.hit_test(side.center()), HitTarget::PreviewSide);
         assert_eq!(layout.hit_test(full.center()), HitTarget::PreviewFull);
-        let without = TitleBarLayout::calculate_with_preview(Size::new(1200, 800), 144, 20, 0, false);
+        let without =
+            TitleBarLayout::calculate_with_preview(Size::new(1200, 800), 144, 20, 0, false);
         assert!(layout.tabs.right < without.tabs.right);
     }
 }

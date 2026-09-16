@@ -344,7 +344,9 @@ impl Editor {
             self.endpoint
                 .send_direct_checked(SCI_GETRANGEPOINTER, range.start, length as isize)?;
         if pointer == 0 {
-            return Err(FastPadError::Invariant("Scintilla returned no range pointer"));
+            return Err(FastPadError::Invariant(
+                "Scintilla returned no range pointer",
+            ));
         }
         Ok(unsafe { std::slice::from_raw_parts(pointer as *const u8, length) })
     }
@@ -1518,7 +1520,10 @@ mod tests {
                 std::ptr::null(),
             )
         };
-        assert!(!parent.is_null(), "failed to create a host window for tests");
+        assert!(
+            !parent.is_null(),
+            "failed to create a host window for tests"
+        );
 
         let editor =
             Editor::create(parent).expect("failed to create a native Scintilla editor for tests");
@@ -1552,7 +1557,10 @@ mod tests {
     fn notification_struct_matches_scnotification_layout() {
         use std::mem::offset_of;
         assert_eq!(offset_of!(super::ScintillaNotification, position), 24);
-        assert_eq!(offset_of!(super::ScintillaNotification, modification_type), 40);
+        assert_eq!(
+            offset_of!(super::ScintillaNotification, modification_type),
+            40
+        );
         assert_eq!(offset_of!(super::ScintillaNotification, lines_added), 64);
         // 144, not the task brief's stated 136: native/src/scintilla/include/Sci_Position.h
         // defines `Sci_Position` (used by `annotationLinesAdded`, just before `updated`) as
