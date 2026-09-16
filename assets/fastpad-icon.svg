@@ -10,17 +10,15 @@
     </g>
   </defs>
 
-  <rect width="256" height="256" rx="56" fill="#2B5BF0"/>
-
   <!-- Flat shadow under the notepad. -->
-  <g fill="#173AA6" transform="translate(0 8)">
+  <g fill="#181818" transform="translate(0 8)">
     <rect x="48" y="44" width="144" height="172" rx="16"/>
     <use href="#rings"/>
   </g>
 
   <rect x="48" y="44" width="144" height="172" rx="16" fill="#FFFFFF"/>
   <path d="M64 44h112a16 16 0 0 1 16 16v20H48V60a16 16 0 0 1 16-16z" fill="#FFB020"/>
-  <g fill="#0E2A6E">
+  <g fill="#181818">
     <circle cx="71" cy="60" r="5"/>
     <circle cx="95" cy="60" r="5"/>
     <circle cx="119" cy="60" r="5"/>
@@ -39,6 +37,6 @@
 
   <!-- Lightning bolt badge in the corner, outlined in the background color to lift it off the page. -->
   <polygon points="202,132 162,194 188,194 176,240 222,172 196,172"
-           fill="#FFE14D" stroke="#2B5BF0" stroke-width="12" stroke-linejoin="round"
+           fill="#FFE14D" stroke="#181818" stroke-width="12" stroke-linejoin="round"
            paint-order="stroke"/>
 </svg>
