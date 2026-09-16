@@ -1,7 +1,7 @@
 //! What a preview link or image reference points at. Classification never touches the network;
 //! local targets resolve against the document's folder.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,7 +39,13 @@ fn local_path(dest: &str, document_dir: Option<&Path>) -> Option<PathBuf> {
     if without_suffix.is_empty() {
         return None;
     }
-    let path = PathBuf::from(percent_decode(without_suffix).replace('/', "\\"));
+    let normalized = percent_decode(without_suffix).replace('/', "\\");
+    // Reject UNC (`\\host\share`) and device paths (`\\?\`, `\\.\`) after decoding and slash
+    // normalization: an untrusted document must never reach the network through a share path.
+    if normalized.starts_with("\\\\") {
+        return None;
+    }
+    let path = PathBuf::from(normalized);
     if path.is_absolute() {
         Some(path)
     } else {
@@ -98,17 +104,23 @@ pub fn slug(text: &str) -> String {
 
 #[derive(Debug, Default)]
 pub struct SlugSet {
-    seen: HashMap<String, usize>,
+    seen: HashSet<String>,
 }
 
 impl SlugSet {
-    /// Repeated headings get `-1`, `-2`, ... suffixes, as on GitHub.
+    /// Repeated headings get `-1`, `-2`, ... suffixes, as on GitHub; a heading that collides with
+    /// a suffix already emitted for an earlier heading (e.g. an explicit "Intro-1") keeps
+    /// climbing until it finds a slug nothing has used yet.
     pub fn unique(&mut self, text: &str) -> String {
         let base = slug(text);
-        let count = self.seen.entry(base.clone()).or_insert(0);
-        let result = if *count == 0 { base } else { format!("{base}-{count}") };
-        *count += 1;
-        result
+        let mut candidate = base.clone();
+        let mut suffix = 1_usize;
+        while self.seen.contains(&candidate) {
+            candidate = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        self.seen.insert(candidate.clone());
+        candidate
     }
 }
 
@@ -184,6 +196,16 @@ mod tests {
     }
 
     #[test]
+    fn unc_and_device_paths_never_resolve() {
+        let dir = PathBuf::from(r"C:\docs");
+        for dest in [r"/\host/share/a.png", "%2F%2Fhost/share/a.png", r"\\host\share\a.png", r"\\?\C:\x.png"]
+        {
+            assert_eq!(resolve_image_path(dest, Some(&dir)), None, "{dest}");
+            assert_eq!(classify_link(dest, Some(&dir)), LinkAction::Ignored, "{dest}");
+        }
+    }
+
+    #[test]
     fn slugs_follow_github_rules() {
         assert_eq!(slug("Getting Started!"), "getting-started");
         assert_eq!(slug("C++ & Rust"), "c--rust");
@@ -191,6 +213,14 @@ mod tests {
         let mut slugs = SlugSet::default();
         assert_eq!(slugs.unique("Intro"), "intro");
         assert_eq!(slugs.unique("Intro"), "intro-1");
+        assert_eq!(slugs.unique("Intro"), "intro-2");
+    }
+
+    #[test]
+    fn slug_set_skips_suffixes_already_taken_by_an_explicit_heading() {
+        let mut slugs = SlugSet::default();
+        assert_eq!(slugs.unique("Intro-1"), "intro-1");
+        assert_eq!(slugs.unique("Intro"), "intro");
         assert_eq!(slugs.unique("Intro"), "intro-2");
     }
 }

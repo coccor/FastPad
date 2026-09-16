@@ -301,11 +301,21 @@ impl Builder {
             Event::SoftBreak => self.text(" ", false),
             Event::HardBreak => self.text("\n", false),
             Event::Rule => self.add_block(BlockKind::Rule),
-            Event::TaskListMarker(checked) => {
-                if let Some(Frame::Item { task, .. }) = self.stack.last_mut() {
-                    *task = Some(checked);
+            Event::TaskListMarker(checked) => match self.stack.last_mut() {
+                Some(Frame::Item { task, .. }) => *task = Some(checked),
+                // A loose item's marker arrives inside its first paragraph: Start(Item),
+                // Start(Paragraph), TaskListMarker. The item frame sits one below the top.
+                _ => {
+                    let len = self.stack.len();
+                    if len >= 2
+                        && matches!(self.stack[len - 1], Frame::Paragraph(_))
+                        && let Frame::Item { task, blocks, .. } = &mut self.stack[len - 2]
+                        && blocks.is_empty()
+                    {
+                        *task = Some(checked);
+                    }
                 }
-            }
+            },
         }
     }
 
@@ -556,6 +566,18 @@ mod tests {
             ],
         };
         assert_eq!(kinds("- [x] done\n- [ ] todo\n  - nested\n"), vec![expected]);
+    }
+
+    #[test]
+    fn loose_task_lists_keep_their_checkboxes() {
+        let expected = BlockKind::List {
+            start: None,
+            items: vec![
+                ListItem { task: Some(true), blocks: vec![BlockKind::Paragraph(plain("a"))] },
+                ListItem { task: Some(false), blocks: vec![BlockKind::Paragraph(plain("b"))] },
+            ],
+        };
+        assert_eq!(kinds("- [x] a\n\n- [ ] b\n"), vec![expected]);
     }
 
     #[test]
