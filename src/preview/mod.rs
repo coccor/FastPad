@@ -4,6 +4,7 @@
 pub mod colors;
 pub mod dwrite;
 pub mod heights;
+pub mod images;
 pub mod incremental;
 pub mod layout;
 pub mod links;
