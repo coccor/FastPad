@@ -1022,6 +1022,9 @@ fn from_native(rect: RECT) -> Rect {
 }
 
 unsafe fn measure_text(dc: HDC, text: &str, format: u32) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
     let wide = text.encode_utf16().collect::<Vec<_>>();
     let mut rect = RECT::default();
     unsafe {
@@ -1037,6 +1040,11 @@ unsafe fn measure_text(dc: HDC, text: &str, format: u32) -> i32 {
 }
 
 unsafe fn draw_text(dc: HDC, text: &str, rect: Rect, format: u32) {
+    // An empty Vec's pointer is dangling, and DT_END_ELLIPSIS makes DrawTextW read through it; the
+    // bottom bar's left side is empty whenever no tab is open and no notice is pending.
+    if text.is_empty() {
+        return;
+    }
     let wide = text.encode_utf16().collect::<Vec<_>>();
     let mut rect = native_rect(rect);
     unsafe {
