@@ -1,6 +1,7 @@
 //! Markdown preview: a block model, incremental reparsing, and a lazily created Direct2D view.
 //! Nothing here runs until the user opens a preview.
 
+pub mod incremental;
 pub mod model;
 
 /// How the preview shares the content area with the editor. Owned by the window, not the tab.
