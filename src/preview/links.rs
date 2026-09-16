@@ -1,7 +1,7 @@
 //! What a preview link or image reference points at. Classification never touches the network;
 //! local targets resolve against the document's folder.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +105,10 @@ pub fn slug(text: &str) -> String {
 #[derive(Debug, Default)]
 pub struct SlugSet {
     seen: HashSet<String>,
+    /// The first suffix not yet tried for each base. Every smaller suffix was already taken, and
+    /// `seen` only grows, so resuming here keeps `unique` linear in documents that repeat a
+    /// heading thousands of times.
+    next_suffix: HashMap<String, usize>,
 }
 
 impl SlugSet {
@@ -113,14 +117,17 @@ impl SlugSet {
     /// climbing until it finds a slug nothing has used yet.
     pub fn unique(&mut self, text: &str) -> String {
         let base = slug(text);
-        let mut candidate = base.clone();
-        let mut suffix = 1_usize;
-        while self.seen.contains(&candidate) {
-            candidate = format!("{base}-{suffix}");
-            suffix += 1;
+        if self.seen.insert(base.clone()) {
+            return base;
         }
-        self.seen.insert(candidate.clone());
-        candidate
+        let suffix = self.next_suffix.entry(base.clone()).or_insert(1);
+        loop {
+            let candidate = format!("{base}-{suffix}");
+            *suffix += 1;
+            if self.seen.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
     }
 }
 
@@ -222,5 +229,21 @@ mod tests {
         assert_eq!(slugs.unique("Intro-1"), "intro-1");
         assert_eq!(slugs.unique("Intro"), "intro");
         assert_eq!(slugs.unique("Intro"), "intro-2");
+    }
+
+    #[test]
+    fn slug_set_stays_linear_for_thousands_of_repeated_headings() {
+        // Break caught: restarting the suffix search at 1 for every repeat made anchor collection
+        // quadratic, stalling each preview update of a large document for seconds.
+        let mut slugs = SlugSet::default();
+        assert_eq!(slugs.unique("Intro-3"), "intro-3");
+        for index in 0..20_000 {
+            let expected = match index {
+                0 => "intro".to_owned(),
+                1..=2 => format!("intro-{index}"),
+                _ => format!("intro-{}", index + 1),
+            };
+            assert_eq!(slugs.unique("Intro"), expected);
+        }
     }
 }
