@@ -102,7 +102,7 @@ impl MainWindowClass {
             CreateWindowExW(
                 0,
                 self.class_name.as_ptr(),
-                self.class_name.as_ptr(),
+                wide_null("FastPad").as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 100,
                 100,
@@ -162,7 +162,7 @@ unsafe extern "system" fn main_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
-        WM_NCCREATE => unsafe { on_nc_create(hwnd, lparam) },
+        WM_NCCREATE => unsafe { on_nc_create(hwnd, wparam, lparam) },
         WM_SIZE => {
             layout_editor_and_find_bar(hwnd);
             invalidate_title_strip(hwnd);
@@ -642,7 +642,7 @@ where
     result
 }
 
-unsafe fn on_nc_create(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+unsafe fn on_nc_create(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(mut app) = (unsafe { take_create_context_app(lparam) }) else {
         return 0;
     };
@@ -650,7 +650,8 @@ unsafe fn on_nc_create(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         return 0;
     }
     store_app(hwnd, app);
-    1
+    // The default handling stores the window text, which the taskbar button and Alt+Tab show.
+    unsafe { DefWindowProcW(hwnd, WM_NCCREATE, wparam, lparam) }
 }
 
 fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
@@ -3650,6 +3651,22 @@ mod tests {
                 DispatchMessageW(&message);
             }
         }
+    }
+
+    #[test]
+    fn the_main_window_has_a_title_for_the_taskbar() {
+        // Break caught: WM_NCCREATE handled without the default processing leaves the window text
+        // empty, so the taskbar button and Alt+Tab show only the icon.
+        let window = ProductionWindow::new(make_app());
+        let mut text = [0u16; 32];
+        let len = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                window.hwnd,
+                text.as_mut_ptr(),
+                text.len() as i32,
+            )
+        };
+        assert_eq!(String::from_utf16_lossy(&text[..len as usize]), "FastPad");
     }
 
     #[test]
