@@ -379,6 +379,14 @@ unsafe extern "system" fn main_window_proc(
             result
         }
         _ => {
+            // A nested modal loop dispatches whatever is queued. Deferred startup units and the
+            // IPC drain wait for it to end so they cannot change the document it acts on.
+            if (message == crate::window::WM_FASTPAD_IPC_REQUEST
+                || classify_deferred_message(message, false).is_some())
+                && crate::window::modal::hold_while_modal(hwnd, message)
+            {
+                return 0;
+            }
             if message == crate::window::WM_FASTPAD_IPC_REQUEST {
                 return handle_ipc_requests(hwnd);
             }
@@ -2102,7 +2110,7 @@ fn snapshot_next_document(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    if file_population_active(hwnd) {
+    if file_population_active(hwnd) || crate::window::modal::modal_active(hwnd) {
         return;
     }
     let Some(root) = recovery_root(hwnd) else {
@@ -2695,7 +2703,8 @@ mod tests {
         take_json_valid_count, take_language_errors,
     };
     use crate::app::App;
-    use crate::document::{Language, RecoveryId};
+    use crate::document::{CloseDecision, Language, RecoveryId};
+    use crate::window::modal::{answer_next_close_prompt, answer_next_save_dialog};
     use crate::editor::scintilla_constants::SCI_GETMODIFY;
     use crate::file::encoding::Encoding;
     use crate::languages::LanguageManager;
@@ -2714,9 +2723,159 @@ mod tests {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IsWindow, SendMessageW,
-        WM_CLOSE, WM_PAINT,
+        DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IsWindow,
+        MSG, PM_REMOVE, PeekMessageW, SendMessageW, WM_CLOSE, WM_PAINT,
     };
+
+    /// Dispatches everything already posted to `hwnd`, leaving any WM_QUIT for the harness.
+    fn pump_posted_messages(hwnd: HWND) {
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE) } != 0 {
+            unsafe {
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_startup_work_is_held_until_the_modal_prompt_closes() {
+        // Break caught: a nested modal loop dispatches deferred chain units, so recovery can push
+        // and activate tabs while a close prompt or file dialog is deciding about another one.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("modal-deferred");
+        write_snapshot(
+            root.path(),
+            &Snapshot::new(
+                RecoveryId::from_u128(0x5151),
+                None,
+                Encoding::Utf8,
+                "recovered elsewhere",
+            ),
+        )
+        .unwrap();
+        app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+        editor.set_text("dirty").unwrap();
+        let before = app_mut(window.hwnd).tabs.len();
+
+        answer_next_close_prompt(|hwnd| {
+            unsafe {
+                SendMessageW(hwnd, crate::window::WM_FASTPAD_RECOVERY, 0, 0);
+            }
+            CloseDecision::Cancel
+        });
+        execute_command(window.hwnd, CommandId::CloseTab);
+
+        assert_eq!(
+            app_mut(window.hwnd).tabs.len(),
+            before,
+            "the recovery unit ran inside the modal loop"
+        );
+
+        pump_posted_messages(window.hwnd);
+
+        assert_eq!(
+            app_mut(window.hwnd).tabs.len(),
+            before + 1,
+            "the held recovery unit must run once the modal loop ends"
+        );
+    }
+
+    #[test]
+    fn queued_ipc_requests_wait_for_the_modal_prompt_to_close() {
+        // Break caught: a forwarded launch is dispatched inside a close prompt (opening tabs the
+        // review never saw) or dropped entirely instead of staying queued.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("dirty").unwrap();
+        app_mut(window.hwnd)
+            .ipc_requests
+            .push(crate::ipc::IpcRequest::New);
+        let before = app_mut(window.hwnd).tabs.len();
+
+        answer_next_close_prompt(|hwnd| {
+            unsafe {
+                SendMessageW(hwnd, crate::window::WM_FASTPAD_IPC_REQUEST, 0, 0);
+            }
+            CloseDecision::Cancel
+        });
+        execute_command(window.hwnd, CommandId::CloseTab);
+
+        assert_eq!(
+            app_mut(window.hwnd).tabs.len(),
+            before,
+            "a forwarded request was handled inside the modal loop"
+        );
+        assert_eq!(
+            app_mut(window.hwnd).ipc_requests.len(),
+            1,
+            "the request must stay queued while a modal loop runs"
+        );
+
+        pump_posted_messages(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).tabs.len(), before + 1);
+        assert!(app_mut(window.hwnd).ipc_requests.is_empty());
+    }
+
+    #[test]
+    fn recovery_snapshot_ticks_are_skipped_inside_a_modal_prompt() {
+        // Break caught: the recovery WM_TIMER fires inside a modal loop and swaps documents in and
+        // out of the view under the operation the modal dialog is about to complete.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("modal-snapshot");
+        app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+        editor.set_text("typed").unwrap();
+        let snapshot = snapshot_path(root.path(), app_mut(window.hwnd).tabs.active().recovery_id);
+
+        answer_next_close_prompt(|hwnd| {
+            super::snapshot_next_document(hwnd);
+            CloseDecision::Cancel
+        });
+        execute_command(window.hwnd, CommandId::CloseTab);
+
+        assert!(
+            !snapshot.exists(),
+            "a snapshot tick ran inside the modal loop"
+        );
+
+        super::snapshot_next_document(window.hwnd);
+
+        assert!(snapshot.exists(), "snapshots must resume after the modal");
+    }
+
+    #[test]
+    fn save_as_writes_the_document_chosen_before_the_dialog_opened() {
+        // Break caught: the Save As dialog's modal loop activates another tab (a recovered one, a
+        // forwarded open), and complete_save then renames and overwrites whatever is active now.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("modal-save-as");
+        let target = root.path().join("chosen.txt");
+        editor.set_text("alpha").unwrap();
+        let chosen = app_mut(window.hwnd).tabs.active().id;
+        let destination = target.clone();
+        answer_next_save_dialog(move |hwnd| {
+            super::create_new_document(hwnd).unwrap();
+            Some(destination)
+        });
+
+        assert!(super::save_active_document_as(window.hwnd));
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"alpha");
+        let app = app_mut(window.hwnd);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs.active().id, chosen);
+        assert_eq!(
+            app.tabs.document(chosen).unwrap().path.as_deref(),
+            Some(target.as_path())
+        );
+    }
 
     #[test]
     fn failed_language_activation_leaves_document_language_unchanged_and_records_a_warning() {
