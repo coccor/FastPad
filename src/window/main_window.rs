@@ -3145,7 +3145,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         return;
     }
     if notification.code == crate::editor::scintilla_constants::SCN_MODIFIED {
-        let modification = unsafe { &*(lparam as *const TextModificationNotification) };
+        let modification = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
         let text_changes = crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
             | crate::editor::scintilla_constants::SC_MOD_DELETETEXT;
         if modification.modification_type & text_changes as i32 != 0
@@ -3175,18 +3175,6 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     if changed {
         invalidate_title_strip(hwnd);
     }
-}
-
-#[repr(C)]
-struct TextModificationNotification {
-    header: NMHDR,
-    position: isize,
-    character: i32,
-    modifiers: i32,
-    modification_type: i32,
-    _text: *const u8,
-    _length: isize,
-    lines_added: isize,
 }
 
 fn invalidate_title_strip(hwnd: HWND) {

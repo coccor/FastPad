@@ -19,7 +19,9 @@ use crate::editor::scintilla_constants::{
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
 use crate::editor::scintilla_constants::{
-    SCI_COUNTCHARACTERS, SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_LINEFROMPOSITION,
+    SCI_COUNTCHARACTERS, SCI_DOCLINEFROMVISIBLE, SCI_GETCOLUMN, SCI_GETCURRENTPOS,
+    SCI_GETFIRSTVISIBLELINE, SCI_GETRANGEPOINTER, SCI_LINEFROMPOSITION, SCI_SETFIRSTVISIBLELINE,
+    SCI_VISIBLEFROMDOCLINE,
 };
 use crate::editor::scintilla_constants::{
     SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
@@ -71,6 +73,35 @@ pub struct CaretStatus {
 pub enum TextDirection {
     LeftToRight,
     RightToLeft,
+}
+
+/// Scintilla's `SCNotification` (Scintilla.h), complete through `updated` so both `SCN_MODIFIED`
+/// and `SCN_UPDATEUI` can be read from one definition.
+#[repr(C)]
+pub struct ScintillaNotification {
+    pub header: windows_sys::Win32::UI::Controls::NMHDR,
+    pub position: isize,
+    pub ch: i32,
+    pub modifiers: i32,
+    pub modification_type: i32,
+    pub text: *const u8,
+    pub length: isize,
+    pub lines_added: isize,
+    pub message: i32,
+    pub wparam: usize,
+    pub lparam: isize,
+    pub line: isize,
+    pub fold_level_now: i32,
+    pub fold_level_prev: i32,
+    pub margin: i32,
+    pub list_type: i32,
+    pub x: i32,
+    pub y: i32,
+    pub token: i32,
+    pub annotation_lines_added: isize,
+    pub updated: i32,
+    pub list_completion_method: i32,
+    pub character_source: i32,
 }
 
 #[derive(Debug)]
@@ -299,6 +330,92 @@ impl Editor {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))
+    }
+
+    /// Borrows `range` straight out of Scintilla's buffer. The slice stays valid only until the
+    /// document is next modified, so callers must finish with it inside the current message.
+    #[cfg(windows)]
+    pub fn range_bytes(&self, range: Range<usize>) -> Result<&[u8]> {
+        let length = range.end.saturating_sub(range.start);
+        if length == 0 {
+            return Ok(&[]);
+        }
+        let pointer =
+            self.endpoint
+                .send_direct_checked(SCI_GETRANGEPOINTER, range.start, length as isize)?;
+        if pointer == 0 {
+            return Err(FastPadError::Invariant("Scintilla returned no range pointer"));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(pointer as *const u8, length) })
+    }
+
+    #[cfg(not(windows))]
+    pub fn range_bytes(&self, _range: Range<usize>) -> Result<&[u8]> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    #[cfg(windows)]
+    pub fn line_from_position(&self, position: usize) -> Result<usize> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_LINEFROMPOSITION, position, 0)?
+            .max(0) as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn line_from_position(&self, _position: usize) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    #[cfg(windows)]
+    pub fn first_visible_line(&self) -> Result<usize> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_GETFIRSTVISIBLELINE, 0, 0)?
+            .max(0) as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn first_visible_line(&self) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    #[cfg(windows)]
+    pub fn set_first_visible_line(&self, display_line: usize) -> Result<()> {
+        self.endpoint
+            .send_direct_checked(SCI_SETFIRSTVISIBLELINE, display_line, 0)
+            .map(|_| ())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_first_visible_line(&self, _display_line: usize) -> Result<()> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    #[cfg(windows)]
+    pub fn doc_line_from_visible(&self, display_line: usize) -> Result<usize> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_DOCLINEFROMVISIBLE, display_line, 0)?
+            .max(0) as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn doc_line_from_visible(&self, _display_line: usize) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
+    }
+
+    #[cfg(windows)]
+    pub fn visible_from_doc_line(&self, doc_line: usize) -> Result<usize> {
+        Ok(self
+            .endpoint
+            .send_direct_checked(SCI_VISIBLEFROMDOCLINE, doc_line, 0)?
+            .max(0) as usize)
+    }
+
+    #[cfg(not(windows))]
+    pub fn visible_from_doc_line(&self, _doc_line: usize) -> Result<usize> {
+        Err(FastPadError::Invariant("Scintilla unavailable"))
     }
 
     /// Scrolls so the caret (the end of the current selection) is visible, without changing it.
@@ -1331,6 +1448,84 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WS_POPUP};
+
+    /// Creates a real Scintilla editor backed by the native DLL, for tests that need genuine
+    /// buffer memory (`SCI_GETRANGEPOINTER`) or genuine line/visible-line bookkeeping that the fake
+    /// `TestDirectHarness` below cannot provide. The loaded module and host window are
+    /// deliberately never freed/destroyed: each test binary run is a short-lived, single-threaded
+    /// (`--test-threads=1`) process, so leaking a handful of test-only handles is harmless.
+    fn test_editor() -> Editor {
+        let dll_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("native/out/x64/Scintilla.dll");
+        let wide_path = crate::platform::wide_null(dll_path.to_str().unwrap());
+        let module = unsafe {
+            LoadLibraryExW(
+                wide_path.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        assert!(!module.is_null(), "failed to load native Scintilla.dll for tests");
+
+        let host_class = crate::platform::wide_null("STATIC");
+        let parent = unsafe {
+            CreateWindowExW(
+                0,
+                host_class.as_ptr(),
+                std::ptr::null(),
+                WS_POPUP,
+                0,
+                0,
+                800,
+                600,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!parent.is_null(), "failed to create a host window for tests");
+
+        Editor::create(parent).expect("failed to create a native Scintilla editor for tests")
+    }
+
+    #[test]
+    fn range_bytes_returns_the_requested_slice_without_copying_the_document() {
+        let editor = test_editor();
+        editor.set_text("alpha\nbeta\ngamma").unwrap();
+        assert_eq!(editor.range_bytes(6..10).unwrap(), b"beta");
+        assert_eq!(editor.range_bytes(0..0).unwrap(), b"");
+    }
+
+    #[test]
+    fn line_queries_map_positions_and_visible_lines() {
+        let editor = test_editor();
+        editor.set_text("a\nb\nc\nd\n").unwrap();
+        assert_eq!(editor.line_from_position(4).unwrap(), 2);
+        assert_eq!(editor.doc_line_from_visible(3).unwrap(), 3);
+        assert_eq!(editor.visible_from_doc_line(3).unwrap(), 3);
+        editor.set_first_visible_line(2).unwrap();
+        assert!(editor.first_visible_line().unwrap() <= 2);
+    }
+
+    #[test]
+    fn notification_struct_matches_scnotification_layout() {
+        use std::mem::offset_of;
+        assert_eq!(offset_of!(super::ScintillaNotification, position), 24);
+        assert_eq!(offset_of!(super::ScintillaNotification, modification_type), 40);
+        assert_eq!(offset_of!(super::ScintillaNotification, lines_added), 64);
+        // 144, not the task brief's stated 136: native/src/scintilla/include/Sci_Position.h
+        // defines `Sci_Position` (used by `annotationLinesAdded`, just before `updated`) as
+        // `ptrdiff_t`, 8 bytes on x64, and native/src/scintilla/include/Scintilla.h has no
+        // `#pragma pack`, so the default MSVC x64 ABI pads `annotationLinesAdded` to an 8-byte
+        // boundary after the seven `int` fields (foldLevelNow..token) that precede it. Verified by
+        // hand against the C header field-by-field, matching `offset_of!`'s own computed value.
+        assert_eq!(offset_of!(super::ScintillaNotification, updated), 144);
+    }
 
     #[test]
     fn test_fixture_clone_and_drop_are_inert() {
