@@ -1,0 +1,107 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit-linux:
+    # The library is Windows-only today, so Linux runs formatting and a Windows-target Clippy
+    # type-check (no linking). Unit and integration tests execute in windows-integration.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Windows MSVC target for type-checking
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (x86_64-pc-windows-msvc type-check, warnings denied)
+        run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
+
+  windows-integration:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache pinned native source archives
+        uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
+      - name: Fetch pinned Scintilla and Lexilla sources
+        shell: pwsh
+        run: ./tools/fetch-native.ps1
+      - name: Verify native archive hashes and versions
+        shell: pwsh
+        run: ./tools/fetch-native.ps1 -VerifyOnly
+      - name: Build native DLLs from pinned sources
+        shell: pwsh
+        run: ./tools/build-native.ps1
+      # Same explicit target as the test step so Clippy and tests share one target directory.
+      - name: Clippy (warnings denied)
+        run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
+      - name: Unit and Windows integration tests (serial)
+        run: cargo test --locked --target x86_64-pc-windows-msvc -- --test-threads=1
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Locked dependency audit
+        shell: pwsh
+        run: ./tools/audit-dependencies.ps1
+
+  package:
+    needs: [windows-integration, dependency-audit]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache pinned native source archives
+        uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
+      - name: Build portable ZIP
+        shell: pwsh
+        run: ./tools/package.ps1
+      - name: Verify portable ZIP
+        shell: pwsh
+        run: ./tools/verify-package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FastPad-0.1.0-windows-x64
+          path: |
+            dist/FastPad-0.1.0-windows-x64.zip
+            dist/FastPad-0.1.0-windows-x64.sha256
+          if-no-files-found: error
+
+  benchmark-trend:
+    # Hosted runners are noisy and unrepresentative: samples are uploaded for trend comparison only.
+    # Absolute millisecond thresholds are enforced only on the documented reference machine.
+    needs: windows-integration
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache pinned native source archives
+        uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
+      - name: Build native DLLs from pinned sources
+        shell: pwsh
+        run: ./tools/build-native.ps1
+      - name: Build release binaries
+        run: cargo build --locked --release --bins
+      - name: Collect 30 startup samples
+        run: cargo run --locked --release --bin fastpad-bench -- --runs 30 --warmup 5 --output benchmarks/trend.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-trend-${{ github.sha }}
+          path: benchmarks/trend.jsonl
+          if-no-files-found: error

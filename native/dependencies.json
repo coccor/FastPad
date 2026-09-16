@@ -1,0 +1,18 @@
+{
+  "scintilla": {
+    "version": "5.6.6",
+    "url": "https://www.scintilla.org/scintilla566.zip",
+    "mirrors": [
+      "https://downloads.sourceforge.net/project/scintilla/scintilla/5.6.6/scintilla566.zip"
+    ],
+    "sha256": "a0c0cdf1cf226dc6252020ce9a87a939a8b615e65269db40ac9123b28fa20a9d"
+  },
+  "lexilla": {
+    "version": "5.5.3",
+    "url": "https://www.scintilla.org/lexilla553.zip",
+    "mirrors": [
+      "https://downloads.sourceforge.net/project/scintilla/lexilla/5.5.3/lexilla553.zip"
+    ],
+    "sha256": "2092b1dd18355321717e3bde25148e4c87e691723ca2b06a65e29a307c5462a6"
+  }
+}
