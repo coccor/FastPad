@@ -3931,9 +3931,13 @@ mod tests {
         execute_command(window.hwnd, CommandId::CommandPalette);
         assert!(palette(window.hwnd).is_visible());
         assert!(panel_visible(window.hwnd));
+        // Markdown preview commands are listed only while the active tab is Markdown.
         assert_eq!(
             palette(window.hwnd).shown().len(),
-            crate::window::command_palette::ENTRIES.len()
+            crate::window::command_palette::ENTRIES
+                .iter()
+                .filter(|entry| !entry.command.is_markdown_preview())
+                .count()
         );
         let query = palette(window.hwnd).query_hwnd();
         let typed = crate::platform::wide_null("zoom");
