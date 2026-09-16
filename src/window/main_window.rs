@@ -32,17 +32,18 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE, GWL_STYLE,
     GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCAPTION, IsWindow, IsWindowVisible,
-    IsZoomed, KillTimer, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT,
-    RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW, WHEEL_DELTA, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED,
-    WM_DRAWITEM, WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY,
-    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    IsZoomed, KillTimer, LoadIconW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage,
+    QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE,
+    SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW,
+    WHEEL_DELTA, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_DWMCOLORIZATIONCOLORCHANGED, WM_GETMINMAXINFO,
+    WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE,
+    WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -51,6 +52,9 @@ pub(crate) const INPUT_MESSAGE_FIRST: u32 =
     windows_sys::Win32::UI::WindowsAndMessaging::WM_INPUT_DEVICE_CHANGE;
 pub(crate) const INPUT_MESSAGE_LAST: u32 =
     windows_sys::Win32::UI::WindowsAndMessaging::WM_POINTERROUTEDRELEASED;
+
+/// Icon resource id embedded by `build.rs` from `assets/fastpad.ico`.
+const APP_ICON_RESOURCE_ID: usize = 1;
 
 pub struct MainWindowClass {
     class_name: Vec<u16>,
@@ -77,6 +81,9 @@ impl MainWindowClass {
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(main_window_proc),
             hInstance: instance,
+            // MAKEINTRESOURCEW; a module without the resource (e.g. a test binary) gets null, which
+            // falls back to the default window icon.
+            hIcon: unsafe { LoadIconW(instance, APP_ICON_RESOURCE_ID as *const u16) },
             lpszClassName: class_name.as_ptr(),
             ..Default::default()
         };
