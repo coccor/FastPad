@@ -14,11 +14,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CallNextHookEx, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
-    DestroyAcceleratorTable, DestroyMenu, EndMenu, FALT, FCONTROL, FSHIFT, FVIRTKEY, GetSubMenu,
-    HACCEL, HMENU, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MSGF_MENU, SetWindowsHookExW,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TPM_VERTICAL, TPMPARAMS,
-    TrackPopupMenuEx, TranslateAcceleratorW, UnhookWindowsHookEx, WH_MSGFILTER, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_MOUSEMOVE,
+    DestroyAcceleratorTable, DestroyMenu, EnableMenuItem, EndMenu, FALT, FCONTROL, FSHIFT,
+    FVIRTKEY, GetSubMenu, HACCEL, HMENU, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MSG, MSGF_MENU, SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TPM_TOPALIGN, TPM_VERTICAL, TPMPARAMS, TrackPopupMenuEx,
+    TranslateAcceleratorW, UnhookWindowsHookEx, WH_MSGFILTER, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,7 +29,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 41] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 42] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -71,6 +72,7 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 41] {
         accelerator(FCONTROL, b'L', CommandId::TextLeftToRight),
         accelerator(FCONTROL, b'R', CommandId::TextRightToLeft),
         accelerator(FCONTROL | FSHIFT, b'P', CommandId::CommandPalette),
+        accelerator(FCONTROL | FSHIFT, b'V', CommandId::MarkdownPreviewCycle),
         accelerator(FALT, b'Z', CommandId::ToggleWordWrap),
     ]
 }
@@ -173,6 +175,10 @@ impl MenuBar {
                 MenuEntry::command("&Word wrap	Alt+Z", CommandId::ToggleWordWrap),
                 MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
                 MenuEntry::Separator,
+                MenuEntry::command("Markdown preview &side by side", CommandId::MarkdownPreviewSide),
+                MenuEntry::command("Markdown preview f&ull", CommandId::MarkdownPreviewFull),
+                MenuEntry::command("Close Markdown pre&view", CommandId::MarkdownPreviewClose),
+                MenuEntry::Separator,
                 MenuEntry::command(
                     "Command &palette...	Ctrl+Shift+P",
                     CommandId::CommandPalette,
@@ -199,6 +205,18 @@ impl MenuBar {
 
 pub(crate) fn translate_accelerator(handle: HACCEL, hwnd: HWND, message: &MSG) -> bool {
     unsafe { TranslateAcceleratorW(hwnd, handle, message) != 0 }
+}
+
+/// Grays the View menu's preview entries while the active tab is not Markdown.
+pub(crate) fn set_markdown_preview_enabled(menu: HMENU, enabled: bool) {
+    let state = MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED };
+    for command in [
+        CommandId::MarkdownPreviewSide,
+        CommandId::MarkdownPreviewFull,
+        CommandId::MarkdownPreviewClose,
+    ] {
+        unsafe { EnableMenuItem(menu, command as u32, state) };
+    }
 }
 
 impl Drop for MenuBar {
@@ -514,7 +532,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 41);
+        assert_eq!(specs.len(), 42);
     }
 
     #[test]
@@ -584,5 +602,19 @@ mod tests {
             ),
             Some(CommandId::ToggleWordWrap)
         );
+    }
+
+    #[test]
+    fn preview_entries_gray_out_and_re_enable() {
+        use super::{MenuBar, set_markdown_preview_enabled};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND, MF_GRAYED};
+        let bar = MenuBar::create().unwrap();
+        let view = bar.dropdown(3);
+        set_markdown_preview_enabled(view, false);
+        let state = unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
+        assert_ne!(state & MF_GRAYED, 0);
+        set_markdown_preview_enabled(view, true);
+        let state = unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };
+        assert_eq!(state & MF_GRAYED, 0);
     }
 }

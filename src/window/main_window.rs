@@ -234,6 +234,7 @@ unsafe extern "system" fn main_window_proc(
                             fonts,
                             pointer,
                             menu: menu_mode(hwnd).map(|mode| (mode, headings.as_slice())),
+                            preview: None,
                         },
                     )
                 };
@@ -260,6 +261,7 @@ unsafe extern "system" fn main_window_proc(
                 lparam,
                 tab_count(hwnd),
                 tab_scroll(hwnd),
+                preview_buttons_visible(hwnd),
             )
         },
         WM_NCCALCSIZE => unsafe { crate::window::titlebar::reclaim_caption(hwnd, wparam, lparam) },
@@ -1211,7 +1213,17 @@ fn tab_scroll(hwnd: HWND) -> i32 {
 }
 
 fn title_layout(hwnd: HWND) -> TitleBarLayout {
-    crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd), tab_scroll(hwnd))
+    crate::window::titlebar::layout_for_window(
+        hwnd,
+        tab_count(hwnd),
+        tab_scroll(hwnd),
+        preview_buttons_visible(hwnd),
+    )
+}
+
+/// Whether the title strip shows the Markdown preview buttons (the active tab is Markdown).
+fn preview_buttons_visible(_hwnd: HWND) -> bool {
+    false
 }
 
 /// Titles, active index, scroll offset, and whether the editor is hidden because no tab is open.

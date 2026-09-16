@@ -29,6 +29,8 @@ const GLYPH_MAXIMIZE: &str = "\u{E922}";
 const GLYPH_RESTORE: &str = "\u{E923}";
 pub(crate) const GLYPH_CLOSE: &str = "\u{E8BB}";
 const GLYPH_MORE: &str = "\u{E712}";
+const GLYPH_PREVIEW_SIDE: &str = "\u{E90D}";
+const GLYPH_PREVIEW_FULL: &str = "\u{E8FF}";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Point {
@@ -112,6 +114,8 @@ pub enum HitTarget {
     /// The band along the bottom of the tab viewport while the tabs overflow it.
     ScrollBar,
     Overflow,
+    PreviewSide,
+    PreviewFull,
     ResizeTop,
     ResizeTopLeft,
     ResizeTopRight,
@@ -133,6 +137,8 @@ impl HitTarget {
                 | Self::CloseTab(_)
                 | Self::ScrollBar
                 | Self::Overflow
+                | Self::PreviewSide
+                | Self::PreviewFull
         )
     }
 
@@ -212,6 +218,9 @@ pub struct TitleBarLayout {
     pub maximize: Rect,
     pub close: Rect,
     pub overflow: Rect,
+    /// "Open Preview to the Side" and "Open Preview", present only for Markdown tabs.
+    pub preview_side: Option<Rect>,
+    pub preview_full: Option<Rect>,
     pub height: i32,
     /// Height of the top band that resizes a restored window.
     pub resize_border: i32,
@@ -237,6 +246,16 @@ impl TitleBarLayout {
     }
 
     pub fn calculate_scrolled(client: Size, dpi: u32, tab_count: usize, scroll: i32) -> Self {
+        Self::calculate_with_preview(client, dpi, tab_count, scroll, false)
+    }
+
+    pub fn calculate_with_preview(
+        client: Size,
+        dpi: u32,
+        tab_count: usize,
+        scroll: i32,
+        preview_buttons: bool,
+    ) -> Self {
         let width = client.width.max(0);
         let dpi = dpi.max(1);
         let height = scale(40, dpi).max(unsafe { GetSystemMetricsForDpi(SM_CYSIZE, dpi) });
@@ -253,8 +272,21 @@ impl TitleBarLayout {
         let overflow_left = (actions_right - scale(40, dpi)).max(0);
         let overflow = Rect::new(overflow_left, 0, actions_right, height);
 
+        let (preview_side, preview_full, buttons_left) = if preview_buttons {
+            let button = scale(40, dpi);
+            let full_left = (overflow_left - button).max(0);
+            let side_left = (full_left - button).max(0);
+            (
+                Some(Rect::new(side_left, 0, full_left, height)),
+                Some(Rect::new(full_left, 0, overflow_left, height)),
+                side_left,
+            )
+        } else {
+            (None, None, overflow_left)
+        };
+
         // Some empty strip always stays reachable, however many tabs are open.
-        let tabs_right = overflow_left - scale(48, dpi).min(overflow_left);
+        let tabs_right = buttons_left - scale(48, dpi).min(buttons_left);
         let tabs = Rect::new(0, 0, tabs_right, height);
         let preferred_tab_width = scale(200, dpi);
         let tab_width = if tab_count == 0 {
@@ -279,7 +311,7 @@ impl TitleBarLayout {
         let drag_region = Rect::new(
             (content_width - scroll).clamp(0, tabs_right),
             0,
-            overflow_left,
+            buttons_left,
             height,
         );
         let scroll_bar = (max_scroll > 0)
@@ -292,6 +324,8 @@ impl TitleBarLayout {
             maximize,
             close,
             overflow,
+            preview_side,
+            preview_full,
             height,
             resize_border,
             scroll,
@@ -366,6 +400,12 @@ impl TitleBarLayout {
         if self.overflow.contains(point) {
             return HitTarget::Overflow;
         }
+        if self.preview_side.is_some_and(|rect| rect.contains(point)) {
+            return HitTarget::PreviewSide;
+        }
+        if self.preview_full.is_some_and(|rect| rect.contains(point)) {
+            return HitTarget::PreviewFull;
+        }
         if self.scroll_bar.is_some_and(|bar| bar.contains(point)) {
             return HitTarget::ScrollBar;
         }
@@ -437,21 +477,27 @@ pub fn frame_client_rect(proposed: Rect, default_client: Rect, work_area: Option
     }
 }
 
-pub(crate) fn layout_for_window(hwnd: HWND, tab_count: usize, scroll: i32) -> TitleBarLayout {
+pub(crate) fn layout_for_window(
+    hwnd: HWND,
+    tab_count: usize,
+    scroll: i32,
+    preview_buttons: bool,
+) -> TitleBarLayout {
     let mut client = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut client);
     }
-    TitleBarLayout::calculate_scrolled(
+    TitleBarLayout::calculate_with_preview(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(hwnd) }.max(96),
         tab_count,
         scroll,
+        preview_buttons,
     )
 }
 
 pub(crate) fn invalidate_strip(hwnd: HWND) {
-    let strip = native_rect(layout_for_window(hwnd, 0, 0).strip());
+    let strip = native_rect(layout_for_window(hwnd, 0, 0, false).strip());
     unsafe {
         InvalidateRect(hwnd, &strip, 0);
     }
@@ -558,6 +604,8 @@ pub(crate) struct TitlePaint<'a> {
     pub pointer: PointerState,
     /// The Alt/F10 menu band's state and heading rectangles while menu mode is active.
     pub menu: Option<(crate::window::menu_band::MenuMode, &'a [RECT])>,
+    /// The current preview mode while the preview buttons are shown; `None` hides them.
+    pub preview: Option<crate::preview::PreviewMode>,
 }
 
 pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
@@ -568,7 +616,12 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
     }
 
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-    let layout = layout_for_window(hwnd, input.titles.len(), input.scroll);
+    let layout = layout_for_window(
+        hwnd,
+        input.titles.len(),
+        input.scroll,
+        input.preview.is_some(),
+    );
     let maximized = unsafe { IsZoomed(hwnd) } != 0;
     if paint.rcPaint.top < layout.height {
         unsafe { paint_strip_buffered(dc, &layout, dpi, maximized, input) };
@@ -839,6 +892,44 @@ unsafe fn draw_strip(
             },
         );
         draw_text(dc, GLYPH_MORE, layout.overflow, centered);
+        if let Some(mode) = input.preview {
+            for (target, rect, glyph, active) in [
+                (
+                    HitTarget::PreviewSide,
+                    layout.preview_side,
+                    GLYPH_PREVIEW_SIDE,
+                    mode == crate::preview::PreviewMode::Split,
+                ),
+                (
+                    HitTarget::PreviewFull,
+                    layout.preview_full,
+                    GLYPH_PREVIEW_FULL,
+                    mode == crate::preview::PreviewMode::Full,
+                ),
+            ] {
+                let Some(rect) = rect else { continue };
+                let hovered = pointer.hovered == Some(target);
+                let background = if (hovered && pointer.is_pressed(target)) || active {
+                    Some(palette.pressed_background)
+                } else if hovered {
+                    Some(palette.hover_background)
+                } else {
+                    None
+                };
+                if let Some(background) = background {
+                    fill(dc, rect.centered_square(scale(32, dpi)), background);
+                }
+                SetTextColor(
+                    dc,
+                    if hovered || active {
+                        palette.hover_foreground
+                    } else {
+                        palette.muted_foreground
+                    },
+                );
+                draw_text(dc, glyph, rect, centered);
+            }
+        }
     }
 
     let maximize_glyph = if maximized {
@@ -884,6 +975,7 @@ pub(crate) unsafe fn nonclient_hit_test(
     lparam: LPARAM,
     tab_count: usize,
     scroll: i32,
+    preview_buttons: bool,
 ) -> LRESULT {
     let mut dwm_result = 0;
     if unsafe { DwmDefWindowProc(hwnd, WM_NCHITTEST, wparam, lparam, &mut dwm_result) } != 0 {
@@ -897,7 +989,7 @@ pub(crate) unsafe fn nonclient_hit_test(
     unsafe {
         ScreenToClient(hwnd, &mut point);
     }
-    let layout = layout_for_window(hwnd, tab_count, scroll);
+    let layout = layout_for_window(hwnd, tab_count, scroll, preview_buttons);
     if point.x < 0 || point.x >= layout.close.right || point.y < 0 || point.y >= layout.height {
         return unsafe { DefWindowProcW(hwnd, WM_NCHITTEST, wparam, lparam) };
     }
@@ -914,7 +1006,9 @@ pub(crate) unsafe fn nonclient_hit_test(
         | HitTarget::Tab(_)
         | HitTarget::CloseTab(_)
         | HitTarget::ScrollBar
-        | HitTarget::Overflow => HTCLIENT,
+        | HitTarget::Overflow
+        | HitTarget::PreviewSide
+        | HitTarget::PreviewFull => HTCLIENT,
     }) as LRESULT
 }
 
@@ -1317,5 +1411,30 @@ mod tests {
             layout.hit_test(super::Point::new(10, layout.height / 2)),
             HitTarget::Caption
         );
+    }
+
+    #[test]
+    fn preview_buttons_leave_the_layout_unchanged_when_absent() {
+        let client = Size::new(1200, 800);
+        assert_eq!(
+            TitleBarLayout::calculate_scrolled(client, 96, 3, 0),
+            TitleBarLayout::calculate_with_preview(client, 96, 3, 0, false)
+        );
+        assert!(TitleBarLayout::calculate_scrolled(client, 96, 3, 0).preview_side.is_none());
+    }
+
+    #[test]
+    fn preview_buttons_sit_left_of_the_overflow_button_without_overlap() {
+        let layout = TitleBarLayout::calculate_with_preview(Size::new(1200, 800), 144, 20, 0, true);
+        let side = layout.preview_side.unwrap();
+        let full = layout.preview_full.unwrap();
+        assert_eq!(side.right, full.left);
+        assert_eq!(full.right, layout.overflow.left);
+        assert!(layout.tabs.right <= side.left);
+        assert_eq!(layout.drag_region.right, side.left);
+        assert_eq!(layout.hit_test(side.center()), HitTarget::PreviewSide);
+        assert_eq!(layout.hit_test(full.center()), HitTarget::PreviewFull);
+        let without = TitleBarLayout::calculate_with_preview(Size::new(1200, 800), 144, 20, 0, false);
+        assert!(layout.tabs.right < without.tabs.right);
     }
 }

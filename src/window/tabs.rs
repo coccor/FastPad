@@ -49,6 +49,7 @@ pub(crate) struct TabView {
 pub(crate) struct TabViewSnapshot {
     pub(crate) revision: u64,
     pub(crate) tabs: Vec<TabViewTab>,
+    pub(crate) preview_buttons: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +62,7 @@ pub(crate) struct TabViewTab {
 struct TabViewState {
     revision: u64,
     tabs: Vec<TabViewTab>,
+    preview_buttons: bool,
 }
 
 impl TabView {
@@ -69,6 +71,7 @@ impl TabView {
             state: Arc::new(RwLock::new(TabViewState {
                 revision: 0,
                 tabs: view_tabs(documents),
+                preview_buttons: false,
             })),
         }
     }
@@ -78,6 +81,7 @@ impl TabView {
         TabViewSnapshot {
             revision: state.revision,
             tabs: state.tabs.clone(),
+            preview_buttons: state.preview_buttons,
         }
     }
 
@@ -88,6 +92,13 @@ impl TabView {
             .unwrap_or_else(|error| error.into_inner());
         state.revision = state.revision.saturating_add(1);
         state.tabs = view_tabs(documents);
+    }
+
+    pub(crate) fn set_preview_buttons(&self, visible: bool) {
+        self.state
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .preview_buttons = visible;
     }
 }
 
@@ -166,6 +177,10 @@ impl Tabs {
 
     pub(crate) fn view(&self) -> TabView {
         self.view.clone()
+    }
+
+    pub(crate) fn set_preview_buttons(&self, visible: bool) {
+        self.view.set_preview_buttons(visible);
     }
 
     /// The selected document, or `None` once every tab has been closed.
