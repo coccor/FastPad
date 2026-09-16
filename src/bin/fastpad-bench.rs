@@ -675,7 +675,11 @@ fn run_once(launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
     let scintilla = wait_for_scintilla(main_hwnd, &child)?;
     send_benchmark_char(scintilla, BENCHMARK_INPUT_CHAR)?;
     wait_for_event(event.as_raw(), &child)?;
-    verify_benchmark_char(scintilla)?;
+    // The rendered-input event is still required with a launch file, but the buffer check is not:
+    // the file's text replaces the empty document the benchmark character was typed into.
+    if launch_file.is_none() {
+        verify_benchmark_char(scintilla)?;
+    }
     let mut record = wait_for_fully_ready(view.Value.cast(), &child)?;
     std::thread::sleep(std::time::Duration::from_secs(2));
     record.idle_private_working_set_bytes = private_working_set(child.process.as_raw())?;
