@@ -1,0 +1,79 @@
+name: publish-manifests
+
+# Runs when a release is published (not while it is a draft, whose download URLs are private).
+# - Scoop: opens a pull request here updating bucket/fastpad.json.
+# - winget: submits the manifest to microsoft/winget-pkgs when the WINGET_TOKEN secret is set.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to render manifests for (for example v0.1.0)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  manifests:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Render Scoop and winget manifests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          gh release download $env:TAG --pattern SHA256SUMS.txt --dir dist --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not download SHA256SUMS.txt from release $env:TAG." }
+          $published = gh release view $env:TAG --json publishedAt --jq .publishedAt
+          ./tools/update-manifests.ps1 -Version $env:TAG -Sha256Sums dist/SHA256SUMS.txt -ReleaseDate ([datetime]$published).ToString("yyyy-MM-dd")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manifests-${{ env.TAG }}
+          path: |
+            bucket/fastpad.json
+            dist/winget/
+          if-no-files-found: error
+
+      - name: Open Scoop bucket pull request
+        shell: pwsh
+        run: |
+          # --porcelain also reports the manifest while it is still untracked (the first release).
+          if (-not (git status --porcelain -- bucket/fastpad.json)) { Write-Output "bucket/fastpad.json is already current."; return }
+          $branch = "scoop/fastpad-$env:TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c $branch
+          git add bucket/fastpad.json
+          git commit -m "chore(scoop): update fastpad to $env:TAG"
+          git push --force origin $branch
+          if ($LASTEXITCODE -ne 0) { throw "git push failed." }
+          gh pr create --base main --head $branch --title "chore(scoop): update fastpad to $env:TAG" --body "Updates the Scoop bucket manifest for release $env:TAG."
+          if ($LASTEXITCODE -ne 0) { throw "gh pr create failed (allow GitHub Actions to create pull requests in the repository settings)." }
+
+      - name: Submit to winget
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            Write-Output "WINGET_TOKEN is not set; submit the uploaded dist/winget manifests manually."
+            return
+          }
+          $version = $env:TAG.TrimStart("v")
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          ./wingetcreate.exe submit --token $env:WINGET_TOKEN --prtitle "New version: coccor.FastPad version $version" "dist/winget/$version"
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed." }
