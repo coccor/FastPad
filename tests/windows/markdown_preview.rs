@@ -235,3 +235,135 @@ fn escape_in_full_mode_returns_to_split() {
         main.mode() == PreviewMode::Split
     });
 }
+
+fn type_text(hwnd: HWND, text: &str) {
+    for unit in text.encode_utf16() {
+        unsafe {
+            SendMessageW(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR,
+                unit as usize,
+                0,
+            )
+        };
+    }
+}
+
+#[test]
+fn typing_updates_the_preview_only_after_the_pause() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown("# A\n");
+    main.command(CommandId::MarkdownPreviewSide);
+    let view = main.view().unwrap();
+    pump_until("initial render", Duration::from_secs(3), || {
+        view.stats().block_count == 1
+    });
+    unsafe {
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_DOCUMENTEND,
+            0,
+            0,
+        );
+    }
+    type_text(main.editor, "\n\npara");
+    assert_eq!(view.stats().block_count, 1, "SCN_MODIFIED must not parse");
+    pump_until("debounced update", Duration::from_secs(3), || {
+        view.stats().block_count == 2
+    });
+}
+
+#[test]
+fn theme_changes_recolor_the_preview() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown("# A\n");
+    main.command(CommandId::MarkdownPreviewSide);
+    main.command(CommandId::ThemeCatppuccinMocha);
+    let view = main.view().unwrap();
+    assert_eq!(view.colors().link, crate::catppuccin::MOCHA.blue);
+}
+
+#[test]
+fn relative_markdown_links_open_in_a_tab() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let dir = std::env::temp_dir().join(format!("fastpad-preview-links-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "[next](b.md)\n").unwrap();
+    std::fs::write(dir.join("b.md"), "# B\n").unwrap();
+    let main = TestMain::new();
+    window::open_path(main.hwnd, &dir.join("a.md")).unwrap();
+    pump_until("a.md loaded", Duration::from_secs(3), || {
+        !main.with_app(|app| app.populating_file)
+    });
+    main.with_app(|app| app.tabs.set_active_language(Language::Markdown));
+    main.command(CommandId::MarkdownPreviewSide);
+    let payload = Box::into_raw(Box::new(String::from("b.md")));
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+            main.hwnd,
+            window::WM_FASTPAD_PREVIEW_LINK,
+            0,
+            payload as isize,
+        );
+    }
+    pump_until("b.md tab", Duration::from_secs(3), || {
+        main.with_app(|app| app.tabs.active().and_then(|document| document.path.clone()))
+            == Some(dir.join("b.md"))
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unsupported_links_explain_themselves() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown("[x](ftp://x.dev)\n");
+    main.command(CommandId::MarkdownPreviewSide);
+    let payload = Box::into_raw(Box::new(String::from("ftp://x.dev")));
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+            main.hwnd,
+            window::WM_FASTPAD_PREVIEW_LINK,
+            0,
+            payload as isize,
+        );
+    }
+    pump_until("link notice", Duration::from_secs(2), || {
+        main.notices()
+            .iter()
+            .any(|notice| notice.contains("does not open this kind of link"))
+    });
+}
+
+#[test]
+fn large_documents_parse_on_a_worker_and_huge_ones_pause() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let paragraph = "Paragraph text for the worker parse.\n\n";
+    main.make_markdown(&paragraph.repeat(2_000_000 / paragraph.len()));
+    main.command(CommandId::MarkdownPreviewSide);
+    let view = main.view().unwrap();
+    pump_until("worker parse", Duration::from_secs(10), || {
+        view.stats().block_count > 1000
+    });
+    assert!(!view.is_paused());
+
+    main.command(CommandId::MarkdownPreviewClose);
+    main.make_markdown(&paragraph.repeat(11_000_000 / paragraph.len()));
+    main.command(CommandId::MarkdownPreviewSide);
+    let view = main.view().unwrap();
+    assert!(view.is_paused());
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+            main.hwnd,
+            window::WM_FASTPAD_PREVIEW_REFRESH,
+            0,
+            0,
+        );
+    }
+    pump_until("refresh parse", Duration::from_secs(20), || {
+        view.stats().block_count > 1000
+    });
+}

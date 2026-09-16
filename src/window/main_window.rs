@@ -210,12 +210,17 @@ unsafe extern "system" fn main_window_proc(
         WM_DESTROY => {
             unsafe {
                 KillTimer(hwnd, crate::recovery::RECOVERY_TIMER_ID);
+                KillTimer(hwnd, crate::window::preview_host::PREVIEW_TIMER_ID);
                 PostQuitMessage(0);
             }
             0
         }
         WM_TIMER if wparam == crate::recovery::RECOVERY_TIMER_ID => {
             snapshot_when_idle(hwnd);
+            0
+        }
+        WM_TIMER if wparam == crate::window::preview_host::PREVIEW_TIMER_ID => {
+            crate::window::preview_host::flush(hwnd);
             0
         }
         WM_PAINT => {
@@ -563,9 +568,34 @@ unsafe extern "system" fn main_window_proc(
             if message == crate::window::WM_FASTPAD_IPC_REQUEST {
                 return handle_ipc_requests(hwnd);
             }
-            if message == crate::window::WM_FASTPAD_PREVIEW_ESCAPE {
-                crate::window::preview_host::escape(hwnd);
-                return 0;
+            match message {
+                crate::window::WM_FASTPAD_PREVIEW_ESCAPE => {
+                    crate::window::preview_host::escape(hwnd);
+                    return 0;
+                }
+                crate::window::WM_FASTPAD_PREVIEW_PARSED => {
+                    crate::window::preview_host::parsed(hwnd, lparam);
+                    return 0;
+                }
+                crate::window::WM_FASTPAD_PREVIEW_LINK => {
+                    crate::window::preview_host::follow_link(hwnd, lparam);
+                    return 0;
+                }
+                crate::window::WM_FASTPAD_PREVIEW_HOVER => {
+                    crate::window::preview_host::hover_link(hwnd, lparam);
+                    return 0;
+                }
+                crate::window::WM_FASTPAD_PREVIEW_REFRESH => {
+                    crate::window::preview_host::refresh(hwnd);
+                    return 0;
+                }
+                _ => {}
+            }
+            if message == crate::window::WM_FASTPAD_DIAGNOSTIC_PREVIEW
+                && unsafe { app_ptr(hwnd) }
+                    .is_some_and(|app| unsafe { app.as_ref() }.launch.diagnostic)
+            {
+                return crate::window::preview_host::diagnostic(hwnd, wparam);
             }
             if message == crate::window::WM_FASTPAD_DIAGNOSTIC_JSON_COUNT
                 && unsafe { app_ptr(hwnd) }
@@ -2264,6 +2294,8 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
         let _ = record_milestone(hwnd, Milestone::FileLoaded);
         PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
     }
+    // Population suppressed SCN_MODIFIED, and a reused tab keeps its document id.
+    crate::window::preview_host::document_reloaded(hwnd);
     refresh_tabs(hwnd);
     Ok(())
 }
@@ -3226,9 +3258,8 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         let modification = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
         let text_changes = crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
             | crate::editor::scintilla_constants::SC_MOD_DELETETEXT;
-        if modification.modification_type & text_changes as i32 != 0
-            && let Some(mut app) = unsafe { app_ptr(hwnd) }
-        {
+        let text_change = modification.modification_type & text_changes as i32 != 0;
+        if text_change && let Some(mut app) = unsafe { app_ptr(hwnd) } {
             let app = unsafe { app.as_mut() };
             app.tabs.note_active_text_change();
             if modification.lines_added != 0
@@ -3236,6 +3267,9 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
             {
                 let _ = editor.refresh_line_numbers();
             }
+        }
+        if text_change {
+            crate::window::preview_host::record_edit(hwnd, modification);
         }
         return;
     }

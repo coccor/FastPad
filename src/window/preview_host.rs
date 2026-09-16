@@ -6,13 +6,19 @@
 
 use crate::Result;
 use crate::document::{DocumentId, Language};
-use crate::editor::Editor;
+use crate::editor::scintilla_constants::SC_MOD_INSERTTEXT;
+use crate::editor::{Editor, ScintillaNotification};
+use crate::platform::wide_null;
 use crate::preview::colors::{PreviewColors, preview_colors};
 use crate::preview::dwrite::Graphics;
-use crate::preview::incremental::{EditLog, PreviewDocument, SourceText};
+use crate::preview::incremental::{Edit, EditLog, Pending, PreviewDocument, SourceText};
 use crate::preview::layout::PreviewFonts;
+use crate::preview::links::{LinkAction, classify_link};
 use crate::preview::view::PreviewView;
-use crate::preview::{LIVE_UPDATE_LIMIT, PreviewMode, WORKER_PARSE_THRESHOLD};
+use crate::preview::{
+    LIVE_UPDATE_LIMIT, PREVIEW_UPDATE_DELAY_MS, PreviewMode, WORKER_PARSE_THRESHOLD,
+};
+use crate::window::WM_FASTPAD_PREVIEW_PARSED;
 use crate::window::commands::CommandId;
 use crate::window::main_window as host_window;
 use crate::window::palette::Palette;
@@ -23,14 +29,15 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetFocus, ReleaseCapture, SetCapture, SetFocus,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetMessageTime, KillTimer, MoveWindow, SW_HIDE, SW_SHOWNA, ShowWindow,
+    GetCursorPos, GetMessageTime, KillTimer, MoveWindow, PostMessageW, SW_HIDE, SW_SHOWNA,
+    SW_SHOWNORMAL, SetTimer, ShowWindow,
 };
 
 pub(crate) const PREVIEW_TIMER_ID: usize = 0x4650_5056;
@@ -59,6 +66,9 @@ pub(crate) struct PreviewHost {
     /// The document the preview currently shows; `None` forces a reload when next shown.
     pub(crate) document: Option<DocumentId>,
     pub(crate) parse_generation: u64,
+    /// Set while a worker parse for `parse_generation` is outstanding. The view's block model is
+    /// stale until it lands, so edits must not be applied incrementally on top of it.
+    pub(crate) full_parse_pending: bool,
     dragging: bool,
     last_divider_click: Option<u32>,
     area: Option<RECT>,
@@ -69,7 +79,7 @@ pub(crate) struct PreviewHost {
     button_hint: Option<&'static str>,
 }
 
-/// Written by hand: windows-sys `RECT` and `Graphics` implement no `Debug`.
+/// Written by hand: windows-sys `RECT` implements no `Debug`.
 impl std::fmt::Debug for PreviewHost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -81,6 +91,7 @@ impl std::fmt::Debug for PreviewHost {
             .field("edits", &self.edits)
             .field("document", &self.document)
             .field("parse_generation", &self.parse_generation)
+            .field("full_parse_pending", &self.full_parse_pending)
             .field("dragging", &self.dragging)
             .field("area", &self.area.map(rect_tuple))
             .field("divider", &self.divider.map(rect_tuple))
@@ -102,6 +113,7 @@ impl Default for PreviewHost {
             edits: EditLog::default(),
             document: None,
             parse_generation: 0,
+            full_parse_pending: false,
             dragging: false,
             last_divider_click: None,
             area: None,
@@ -332,6 +344,7 @@ fn close_view(hwnd: HWND) {
     let closed = with_host(hwnd, |host| {
         host.edits = EditLog::default();
         host.document = None;
+        host.full_parse_pending = false;
         host.divider = None;
         host.hover_text = None;
         host.view.take()
@@ -430,6 +443,7 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
             with_host(hwnd, |host| {
                 host.document = None;
                 host.edits = EditLog::default();
+                host.full_parse_pending = false;
                 host.hover_text = None;
             });
             unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
@@ -472,6 +486,9 @@ pub(crate) fn load_active_document(hwnd: HWND, force: bool) {
     with_host(hwnd, |host| {
         host.document = Some(id);
         host.edits = EditLog::default();
+        // Any worker parse still running describes older text.
+        host.parse_generation += 1;
+        host.full_parse_pending = false;
     });
     let length = editor.length().unwrap_or(0);
     let top_line = editor
@@ -493,10 +510,330 @@ pub(crate) fn load_active_document(hwnd: HWND, force: bool) {
     }
 }
 
-/// Task 15 replaces this body with the worker parse; until then large documents parse inline.
-fn spawn_parse(hwnd: HWND, editor: &Editor, _document: DocumentId, started: Instant) {
-    if let Some(view) = view(hwnd) {
-        view.reparse(&ScintillaSource(editor), started);
+/// A finished worker parse, posted to the main window as `WM_FASTPAD_PREVIEW_PARSED`.
+pub(crate) struct ParsedPreview {
+    document: DocumentId,
+    generation: u64,
+    parsed: PreviewDocument,
+    started: Instant,
+}
+
+/// Copies the text (the worker must not touch Scintilla's buffer) and parses it on a new thread.
+/// Bumping the generation retires any parse still running.
+fn spawn_parse(hwnd: HWND, editor: &Editor, document: DocumentId, started: Instant) {
+    let Ok(text) = editor.text() else {
+        return;
+    };
+    let generation = with_host(hwnd, |host| {
+        host.parse_generation += 1;
+        host.full_parse_pending = true;
+        host.parse_generation
+    })
+    .unwrap_or(0);
+    let target = hwnd as isize;
+    std::thread::spawn(move || {
+        let parsed = PreviewDocument::parse(&text);
+        drop(text);
+        let payload = Box::into_raw(Box::new(ParsedPreview {
+            document,
+            generation,
+            parsed,
+            started,
+        }));
+        if unsafe {
+            PostMessageW(
+                target as HWND,
+                WM_FASTPAD_PREVIEW_PARSED,
+                0,
+                payload as isize,
+            )
+        } == 0
+        {
+            drop(unsafe { Box::from_raw(payload) });
+        }
+    });
+}
+
+/// `WM_FASTPAD_PREVIEW_PARSED`: installs a worker parse unless newer text superseded it.
+pub(crate) fn parsed(hwnd: HWND, lparam: LPARAM) {
+    if lparam == 0 {
+        return;
+    }
+    let payload = unsafe { Box::from_raw(lparam as *mut ParsedPreview) };
+    let current = with_host(hwnd, |host| {
+        let current = host.view.is_some()
+            && host.document == Some(payload.document)
+            && host.parse_generation == payload.generation;
+        if current {
+            host.full_parse_pending = false;
+        }
+        current
+    })
+    .unwrap_or(false);
+    let (Some(view), true) = (view(hwnd), current) else {
+        return;
+    };
+    let folder = active_document(hwnd).and_then(|(_, _, folder)| folder);
+    let ParsedPreview {
+        parsed, started, ..
+    } = *payload;
+    view.replace_document(parsed, folder, started);
+    if let Some(editor) = editor(hwnd)
+        && let Ok(line) = editor
+            .first_visible_line()
+            .and_then(|line| editor.doc_line_from_visible(line))
+    {
+        view.scroll_to_line(line);
+    }
+}
+
+/// `SCN_MODIFIED`: O(1) bookkeeping only; the timer does the work.
+pub(crate) fn record_edit(hwnd: HWND, notification: &ScintillaNotification) {
+    let inserted = notification.modification_type as u32 & SC_MOD_INSERTTEXT != 0;
+    let length = notification.length.max(0) as usize;
+    let edit = Edit {
+        position: notification.position.max(0) as usize,
+        removed: if inserted { 0 } else { length },
+        inserted: if inserted { length } else { 0 },
+        lines_delta: notification.lines_added,
+    };
+    let recorded = with_host(hwnd, |host| {
+        if host.view.is_none() || host.document.is_none() {
+            return false;
+        }
+        host.edits.record(edit);
+        true
+    })
+    .unwrap_or(false);
+    if recorded {
+        unsafe { SetTimer(hwnd, PREVIEW_TIMER_ID, PREVIEW_UPDATE_DELAY_MS, None) };
+    }
+}
+
+/// What a debounced flush does with the pending edits.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FlushPlan {
+    Nothing,
+    /// The document is over `LIVE_UPDATE_LIMIT`: show the refresh bar and drop the edits.
+    Pause,
+    /// Reparse everything on the UI thread.
+    Reparse,
+    /// Reparse everything on a worker.
+    WorkerParse,
+    /// Reparse around the edits; `allow_full_parse` lets that fall back to a full parse inline.
+    Incremental {
+        edits: Vec<Edit>,
+        allow_full_parse: bool,
+    },
+}
+
+/// A paused preview, or one whose block model is stale behind an outstanding worker parse, cannot
+/// take incremental edits: both need the whole document parsed again.
+pub(crate) fn plan_flush(
+    pending: Pending,
+    length: usize,
+    paused: bool,
+    full_parse_pending: bool,
+) -> FlushPlan {
+    if length > LIVE_UPDATE_LIMIT {
+        return FlushPlan::Pause;
+    }
+    let pending = match pending {
+        Pending::Nothing if !paused => return FlushPlan::Nothing,
+        _ if paused || full_parse_pending => Pending::Full,
+        pending => pending,
+    };
+    let large = length > WORKER_PARSE_THRESHOLD;
+    match pending {
+        Pending::Nothing => FlushPlan::Nothing,
+        Pending::Full if large => FlushPlan::WorkerParse,
+        Pending::Full => FlushPlan::Reparse,
+        Pending::Edits(edits) => FlushPlan::Incremental {
+            edits,
+            allow_full_parse: !large,
+        },
+    }
+}
+
+/// `WM_TIMER` for `PREVIEW_TIMER_ID`: the typing pause has elapsed.
+pub(crate) fn flush(hwnd: HWND) {
+    unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
+    if host_window::input_pending() {
+        unsafe { SetTimer(hwnd, PREVIEW_TIMER_ID, PREVIEW_UPDATE_DELAY_MS, None) };
+        return;
+    }
+    let (Some(view), Some(editor), Some((id, ..))) =
+        (view(hwnd), editor(hwnd), active_document(hwnd))
+    else {
+        return;
+    };
+    let Some((pending, full_parse_pending)) = with_host(hwnd, |host| {
+        (host.document == Some(id)).then(|| (host.edits.take(), host.full_parse_pending))
+    })
+    .flatten() else {
+        return;
+    };
+    let length = editor.length().unwrap_or(0);
+    let started = Instant::now();
+    match plan_flush(pending, length, view.is_paused(), full_parse_pending) {
+        FlushPlan::Nothing => {}
+        FlushPlan::Pause => view.set_paused(true),
+        FlushPlan::Reparse => {
+            view.set_paused(false);
+            // Retire any worker parse still running: this parse is newer.
+            with_host(hwnd, |host| {
+                host.parse_generation += 1;
+                host.full_parse_pending = false;
+            });
+            view.reparse(&ScintillaSource(&editor), started);
+        }
+        FlushPlan::WorkerParse => {
+            view.set_paused(false);
+            spawn_parse(hwnd, &editor, id, started);
+        }
+        FlushPlan::Incremental {
+            edits,
+            allow_full_parse,
+        } => {
+            let applied =
+                view.apply_edits(&ScintillaSource(&editor), &edits, started, allow_full_parse);
+            if applied.is_none() {
+                spawn_parse(hwnd, &editor, id, started);
+            }
+        }
+    }
+}
+
+/// `WM_FASTPAD_PREVIEW_REFRESH`: the paused bar was clicked.
+pub(crate) fn refresh(hwnd: HWND) {
+    load_active_document(hwnd, true);
+}
+
+/// A file finished loading into the active tab: its text replaced whatever the preview showed.
+pub(crate) fn document_reloaded(hwnd: HWND) {
+    with_host(hwnd, |host| host.document = None);
+    sync_visibility(hwnd);
+}
+
+/// `WM_FASTPAD_PREVIEW_LINK`: a link was clicked or activated with Enter.
+pub(crate) fn follow_link(hwnd: HWND, lparam: LPARAM) {
+    if lparam == 0 {
+        return;
+    }
+    let dest = *unsafe { Box::from_raw(lparam as *mut String) };
+    let folder = active_document(hwnd).and_then(|(_, _, folder)| folder);
+    match classify_link(&dest, folder.as_deref()) {
+        LinkAction::External(url) => {
+            if !shell_open(hwnd, &url) {
+                host_window::push_notice(hwnd, format!("FastPad could not open {url}."));
+            }
+        }
+        LinkAction::Anchor(anchor) => {
+            if !view(hwnd).is_some_and(|view| view.scroll_to_anchor(&anchor)) {
+                host_window::push_notice(
+                    hwnd,
+                    format!("No heading in this document matches #{anchor}."),
+                );
+            }
+        }
+        LinkAction::LocalFile(path) => {
+            if let Err(error) = crate::window::open_path(hwnd, &path) {
+                host_window::report_open_failure(hwnd, &path, &error);
+            }
+        }
+        LinkAction::Ignored => {
+            host_window::push_notice(
+                hwnd,
+                format!("FastPad does not open this kind of link: {dest}"),
+            );
+        }
+    }
+}
+
+type ShellExecuteFn = unsafe extern "system" fn(
+    HWND,
+    *const u16,
+    *const u16,
+    *const u16,
+    *const u16,
+    i32,
+) -> *mut core::ffi::c_void;
+
+/// `ShellExecuteW`, resolved from shell32.dll on the first external link. A static import would
+/// load shell32 into every launch. The module stays loaded for the life of the process, since
+/// ShellExecute can leave work running inside it after returning.
+fn shell_execute() -> Option<ShellExecuteFn> {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    static RESOLVED: OnceLock<Option<usize>> = OnceLock::new();
+    let address = RESOLVED.get_or_init(|| {
+        let name = wide_null("shell32.dll");
+        let module = unsafe {
+            LoadLibraryExW(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            return None;
+        }
+        unsafe { GetProcAddress(module, c"ShellExecuteW".as_ptr().cast()) }
+            .map(|proc| proc as usize)
+    });
+    // SAFETY: the address is the `ShellExecuteW` export, whose signature `ShellExecuteFn` matches.
+    address.map(|address| unsafe { std::mem::transmute::<usize, ShellExecuteFn>(address) })
+}
+
+fn shell_open(hwnd: HWND, url: &str) -> bool {
+    let Some(execute) = shell_execute() else {
+        return false;
+    };
+    let operation = wide_null("open");
+    let target = wide_null(url);
+    let result = unsafe {
+        execute(
+            hwnd,
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result as isize > 32
+}
+
+/// `WM_FASTPAD_PREVIEW_HOVER`: the link under the pointer changed.
+pub(crate) fn hover_link(hwnd: HWND, lparam: LPARAM) {
+    if lparam == 0 {
+        return;
+    }
+    let dest = *unsafe { Box::from_raw(lparam as *mut Option<String>) };
+    with_host(hwnd, |host| host.hover_text = dest);
+    host_window::invalidate_status_bar(hwnd);
+}
+
+/// `WM_FASTPAD_DIAGNOSTIC_PREVIEW` (only under `--diagnostic`).
+pub(crate) fn diagnostic(hwnd: HWND, selector: usize) -> isize {
+    let view = view(hwnd);
+    let stats = view.map(|view| view.stats()).unwrap_or_default();
+    match selector {
+        0 => match mode(hwnd) {
+            PreviewMode::Off => 0,
+            PreviewMode::Split => 1,
+            PreviewMode::Full => 2,
+        },
+        1 => stats.block_count as isize,
+        2 => stats.revision as isize,
+        3 => stats.first_frame_micros as isize,
+        4 => stats.last_update_micros as isize,
+        5 => view.map_or(0, |view| view.top_line() as isize),
+        6 => with_host(hwnd, |host| host.sync_count as isize).unwrap_or(0),
+        7 => isize::from(preview_shown(hwnd)),
+        _ => -1,
     }
 }
 
@@ -671,6 +1008,73 @@ mod tests {
                 divider: None,
                 preview: Some(AREA)
             }
+        );
+    }
+
+    fn edit() -> Edit {
+        Edit {
+            position: 0,
+            removed: 0,
+            inserted: 1,
+            lines_delta: 0,
+        }
+    }
+
+    #[test]
+    fn edits_wait_for_an_outstanding_worker_parse_by_parsing_again() {
+        let small = 1_000;
+        let large = WORKER_PARSE_THRESHOLD + 1;
+        assert_eq!(
+            plan_flush(Pending::Edits(vec![edit()]), large, false, true),
+            FlushPlan::WorkerParse
+        );
+        assert_eq!(
+            plan_flush(Pending::Edits(vec![edit()]), small, false, true),
+            FlushPlan::Reparse
+        );
+        assert_eq!(
+            plan_flush(Pending::Nothing, large, false, true),
+            FlushPlan::Nothing
+        );
+        assert_eq!(
+            plan_flush(Pending::Edits(vec![edit()]), large, false, false),
+            FlushPlan::Incremental {
+                edits: vec![edit()],
+                allow_full_parse: false
+            }
+        );
+        assert_eq!(
+            plan_flush(Pending::Edits(vec![edit()]), small, false, false),
+            FlushPlan::Incremental {
+                edits: vec![edit()],
+                allow_full_parse: true
+            }
+        );
+    }
+
+    #[test]
+    fn huge_documents_pause_and_a_paused_preview_parses_everything_again() {
+        assert_eq!(
+            plan_flush(
+                Pending::Edits(vec![edit()]),
+                LIVE_UPDATE_LIMIT + 1,
+                false,
+                false
+            ),
+            FlushPlan::Pause
+        );
+        assert_eq!(
+            plan_flush(Pending::Nothing, 10, true, false),
+            FlushPlan::Reparse
+        );
+        assert_eq!(
+            plan_flush(
+                Pending::Edits(vec![edit()]),
+                WORKER_PARSE_THRESHOLD + 1,
+                true,
+                false
+            ),
+            FlushPlan::WorkerParse
         );
     }
 

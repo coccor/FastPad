@@ -285,6 +285,16 @@ impl PreviewView {
         invalidate(self.hwnd);
     }
 
+    pub fn is_paused(&self) -> bool {
+        self.with(|state| state.paused).unwrap_or(false)
+    }
+
+    pub fn colors(&self) -> PreviewColors {
+        self.with(|state| state.colors).unwrap_or_else(|| {
+            crate::preview::colors::preview_colors(crate::platform::theme::Theme::Light, false)
+        })
+    }
+
     pub fn set_live_resize(&self, live: bool) {
         self.with(|state| state.live_resize = live);
         invalidate(self.hwnd);
