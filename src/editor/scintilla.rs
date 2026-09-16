@@ -1448,17 +1448,46 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::System::LibraryLoader::{
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WS_POPUP};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
 
-    /// Creates a real Scintilla editor backed by the native DLL, for tests that need genuine
-    /// buffer memory (`SCI_GETRANGEPOINTER`) or genuine line/visible-line bookkeeping that the fake
-    /// `TestDirectHarness` below cannot provide. The loaded module and host window are
-    /// deliberately never freed/destroyed: each test binary run is a short-lived, single-threaded
-    /// (`--test-threads=1`) process, so leaking a handful of test-only handles is harmless.
-    fn test_editor() -> Editor {
+    /// Destroys the win32 host window created for [`test_editor`] once nothing needs it any more.
+    struct HostWindow(HWND);
+
+    impl Drop for HostWindow {
+        fn drop(&mut self) {
+            unsafe {
+                DestroyWindow(self.0);
+            }
+        }
+    }
+
+    /// Owns a real, native-backed Scintilla [`Editor`] for tests that need genuine buffer memory
+    /// (`SCI_GETRANGEPOINTER`) or genuine line/visible-line bookkeeping that the fake
+    /// `TestDirectHarness` below cannot provide. Mirrors how `main_window.rs`'s tests manage the
+    /// same two resources: `load_native_scintilla` returns an `OwnedModule` that calls
+    /// `FreeLibrary` on drop, and `ProductionWindow` destroys its window on drop. Dropping a
+    /// `TestEditor` runs its fields' drops top to bottom in declaration order: `editor` first
+    /// (Scintilla's own `Drop` destroys the child control window), then `_host` (destroys the
+    /// parent window), then `_module` (unloads the DLL) last.
+    struct TestEditor {
+        editor: Editor,
+        _host: HostWindow,
+        _module: crate::platform::OwnedModule,
+    }
+
+    impl std::ops::Deref for TestEditor {
+        type Target = Editor;
+
+        fn deref(&self) -> &Editor {
+            &self.editor
+        }
+    }
+
+    fn test_editor() -> TestEditor {
         let dll_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("native/out/x64/Scintilla.dll");
         let wide_path = crate::platform::wide_null(dll_path.to_str().unwrap());
@@ -1469,7 +1498,8 @@ mod tests {
                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
             )
         };
-        assert!(!module.is_null(), "failed to load native Scintilla.dll for tests");
+        let module = unsafe { crate::platform::OwnedModule::from_raw_owned(module) }
+            .expect("failed to load native Scintilla.dll for tests");
 
         let host_class = crate::platform::wide_null("STATIC");
         let parent = unsafe {
@@ -1490,7 +1520,13 @@ mod tests {
         };
         assert!(!parent.is_null(), "failed to create a host window for tests");
 
-        Editor::create(parent).expect("failed to create a native Scintilla editor for tests")
+        let editor =
+            Editor::create(parent).expect("failed to create a native Scintilla editor for tests");
+        TestEditor {
+            editor,
+            _host: HostWindow(parent),
+            _module: module,
+        }
     }
 
     #[test]
