@@ -18,8 +18,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 #[test]
-fn launch_json_waits_for_input_then_loads_clean_text() {
-    // Break caught: ignored launch paths, or population before the first editor input.
+fn launch_json_loads_clean_text_without_any_input() {
+    // Break caught: ignored launch paths, or a launch file that only loads once the user types.
     let fixture = Fixture::new(b"\xEF\xBB\xBF{\"ok\":true}");
     let mut process = FastPadProcess::spawn([
         OsString::from("--new-window"),
@@ -30,10 +30,6 @@ fn launch_json_waits_for_input_then_loads_clean_text() {
         .wait_for_main_window(Duration::from_secs(3))
         .unwrap();
     let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
-    assert_eq!(scintilla_text(editor).unwrap(), "");
-    unsafe {
-        assert_ne!(PostMessageW(editor, WM_CHAR, b'x' as usize, 0), 0);
-    }
     wait_text(editor, "{\"ok\":true}");
     assert_eq!(unsafe { SendMessageW(editor, SCI_GETMODIFY, 0, 0) }, 0);
     unsafe {
@@ -118,12 +114,7 @@ fn selected_canonical_duplicate_reuses_the_native_document() {
             file::encoding::Encoding::Utf8Bom
         );
         assert!(!app.tabs.active().dirty);
-        assert!(
-            app.startup
-                .micros(perf::Milestone::FirstInputAccepted)
-                .unwrap()
-                < app.startup.micros(perf::Milestone::FileLoaded).unwrap()
-        );
+        assert!(app.startup.micros(perf::Milestone::FileLoaded).is_some());
     });
     let alternate = fixture.path.parent().unwrap().join(".").join("config.json");
     select_file(main.hwnd, &alternate);

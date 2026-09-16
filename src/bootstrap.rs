@@ -353,8 +353,10 @@ mod tests {
     };
 
     #[test]
-    fn deferred_open_waits_for_first_input_and_preserves_loaded_metadata() {
-        // Break caught: deferred work loads before the first accepted editor input.
+    fn launch_open_loads_into_the_initial_tab_without_waiting_for_input() {
+        // Break caught: the launch file waits for a typed character before loading, which also
+        // stalls every later deferred unit, and opening it beside the untouched initial document
+        // leaves a stray "Untitled *" tab behind.
         let _scintilla = load_scintilla_module().unwrap();
         let fixture = OpenFixture::new(b"\xEF\xBB\xBF{\"ok\":true}");
         let mut app = make_app();
@@ -363,22 +365,12 @@ mod tests {
         let main = ProductionWindow::new(app);
         let editor =
             unsafe { initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap() };
+
         unsafe {
             PostMessageW(main.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
         }
         pump_thread_messages();
-        with_app(main.hwnd, |app| {
-            assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), "");
-            assert!(
-                app.startup
-                    .micros(crate::perf::Milestone::FileLoaded)
-                    .is_none()
-            );
-        });
-        unsafe {
-            SendMessageW(editor, WM_CHAR, b'x' as usize, 0);
-        }
-        pump_thread_messages();
+
         with_app(main.hwnd, |app| {
             assert_eq!(
                 app.editor.as_ref().unwrap().text().unwrap(),
@@ -393,15 +385,15 @@ mod tests {
                 crate::file::encoding::Encoding::Utf8Bom
             );
             assert!(!app.tabs.active().dirty);
-            assert_eq!(app.tabs.len(), 2);
+            assert_eq!(
+                app.tabs.len(),
+                1,
+                "the launch file must replace the initial empty tab"
+            );
             assert!(
                 app.startup
-                    .micros(crate::perf::Milestone::FirstInputAccepted)
-                    .unwrap()
-                    < app
-                        .startup
-                        .micros(crate::perf::Milestone::FileLoaded)
-                        .unwrap()
+                    .micros(crate::perf::Milestone::FileLoaded)
+                    .is_some()
             );
         });
         assert_eq!(
@@ -429,6 +421,51 @@ mod tests {
             },
             0
         );
+    }
+
+    #[test]
+    fn launch_open_reposts_itself_while_input_is_pending() {
+        // Break caught: the launch open runs ahead of queued input instead of yielding to it the
+        // way every other deferred startup unit does.
+        let _scintilla = load_scintilla_module().unwrap();
+        let fixture = OpenFixture::new(b"not yet");
+        let mut app = make_app();
+        app.launch.request =
+            crate::launch::LaunchRequest::Open(fixture.path.clone().into_os_string());
+        let main = ProductionWindow::new(app);
+        unsafe {
+            initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap();
+        }
+
+        with_test_input_queue_status(QS_POSTMESSAGE, || {
+            unsafe {
+                assert_ne!(PostMessageW(main.hwnd, WM_KEYDOWN, usize::from(b'X'), 0), 0);
+                SendMessageW(main.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
+            }
+
+            with_app(main.hwnd, |app| {
+                assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), "");
+                assert!(
+                    app.startup
+                        .micros(crate::perf::Milestone::FileLoaded)
+                        .is_none()
+                );
+            });
+            let mut queued = MSG::default();
+            assert_ne!(
+                unsafe {
+                    PeekMessageW(
+                        &mut queued,
+                        main.hwnd,
+                        crate::window::WM_FASTPAD_OPEN_REQUEST,
+                        crate::window::WM_FASTPAD_OPEN_REQUEST,
+                        PM_REMOVE,
+                    )
+                },
+                0,
+                "the launch open must repost itself while input is pending"
+            );
+        });
     }
 
     #[test]
@@ -498,7 +535,6 @@ mod tests {
         let editor =
             unsafe { initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap() };
         unsafe {
-            SendMessageW(editor, WM_CHAR, b'x' as usize, 0);
             SendMessageW(main.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
             SendMessageW(main.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
         }

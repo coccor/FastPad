@@ -392,9 +392,6 @@ unsafe extern "system" fn main_window_proc(
             {
                 return crate::languages::json_invocation_count() as LRESULT;
             }
-            if message == crate::window::WM_FASTPAD_OPEN_REQUEST && !input_pending() {
-                return handle_open_request(hwnd);
-            }
             if let Some(action) = classify_deferred_message(message, input_pending()) {
                 return handle_deferred(hwnd, action);
             }
@@ -438,6 +435,12 @@ unsafe fn on_nc_create(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 }
 
 fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
+    // Only `WM_FASTPAD_OPEN_REQUEST` processed with no input pending produces this action, so the
+    // launch file opens on exactly the same input-readiness gate as the rest of the chain. The
+    // open posts the language continuation (and records FileLoaded) itself.
+    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_APPLY_LANGUAGE) {
+        return handle_open_request(hwnd);
+    }
     // Each of these actions is produced only by its own deferred message with no input pending:
     // `PostNext(WM_FASTPAD_OPEN_REQUEST)` by `WM_FASTPAD_LOAD_SETTINGS`, `RecordFullyReady` by
     // `WM_FASTPAD_BUILD_CHROME`. Running them before the milestone keeps the milestone honest.
@@ -594,7 +597,6 @@ where
         install_editor(hwnd, editor, document)?;
         record_milestone(hwnd, Milestone::EditorCreated)?;
     }
-    install_open_input_hook(hwnd, editor_hwnd, identity.clone())?;
     Ok(editor_hwnd)
 }
 
@@ -1318,14 +1320,7 @@ fn handle_open_request(hwnd: HWND) -> LRESULT {
         if app.launch_open_completed {
             return None;
         }
-        if matches!(app.launch.request, crate::launch::LaunchRequest::Open(_))
-            && !app.first_input_accepted
-        {
-            app.deferred_open_waiting = true;
-            return None;
-        }
         app.launch_open_completed = true;
-        app.deferred_open_waiting = false;
         Some(app.launch.request.clone())
     });
     let Some(request) = request else {
@@ -1336,7 +1331,13 @@ fn handle_open_request(hwnd: HWND) -> LRESULT {
             let path = std::path::Path::new(&path);
             match App::open_path(hwnd, path) {
                 Ok(()) => return 0,
-                Err(error) => report_open_failure(hwnd, path, &error),
+                Err(error) => {
+                    report_open_failure(hwnd, path, &error);
+                    // The requested-file unit is finished either way; the milestone stays honest.
+                    unsafe {
+                        let _ = record_milestone(hwnd, Milestone::FileLoaded);
+                    }
+                }
             }
         }
         crate::launch::LaunchRequest::New => unsafe {
@@ -1463,73 +1464,6 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
     }
     invalidate_title_strip(hwnd);
     Ok(())
-}
-
-struct OpenInputHook {
-    parent: HWND,
-    identity: WindowIdentity,
-}
-const OPEN_INPUT_HOOK_ID: usize = 0x4650_4f49;
-
-fn install_open_input_hook(parent: HWND, editor: HWND, identity: WindowIdentity) -> Result<()> {
-    let data = std::rc::Rc::into_raw(std::rc::Rc::new(OpenInputHook { parent, identity })) as usize;
-    if unsafe {
-        windows_sys::Win32::UI::Shell::SetWindowSubclass(
-            editor,
-            Some(open_input_proc),
-            OPEN_INPUT_HOOK_ID,
-            data,
-        )
-    } == 0
-    {
-        unsafe {
-            drop(std::rc::Rc::from_raw(data as *const OpenInputHook));
-        }
-        return Err(last_error());
-    }
-    Ok(())
-}
-
-unsafe extern "system" fn open_input_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _: usize,
-    data: usize,
-) -> LRESULT {
-    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
-    let raw = data as *const OpenInputHook;
-    unsafe {
-        std::rc::Rc::increment_strong_count(raw);
-    }
-    let hook = unsafe { std::rc::Rc::from_raw(raw) };
-    if message == WM_NCDESTROY {
-        unsafe {
-            RemoveWindowSubclass(hwnd, Some(open_input_proc), OPEN_INPUT_HOOK_ID);
-            std::rc::Rc::decrement_strong_count(raw);
-        }
-    }
-    let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
-    if message == windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR
-        && (wparam >= 0x20 || wparam == 9 || wparam == 13)
-        && hook.identity.is_live_for(hook.parent)
-    {
-        let resume = unsafe { app_ptr(hook.parent) }.is_some_and(|mut app| {
-            let app = unsafe { app.as_mut() };
-            if !app.first_input_accepted {
-                app.first_input_accepted = true;
-                let _ = app.startup.record_now(Milestone::FirstInputAccepted);
-            }
-            std::mem::take(&mut app.deferred_open_waiting)
-        });
-        if resume {
-            unsafe {
-                PostMessageW(hook.parent, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
-            }
-        }
-    }
-    result
 }
 
 fn create_new_document(hwnd: HWND) -> Result<()> {

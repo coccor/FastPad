@@ -101,40 +101,62 @@ impl AcceptanceHarness {
         );
     }
 
+    /// A launch file loads after first paint, on its own, and never ahead of pending input.
     pub fn json_launch_order(&self) {
+        const ATTEMPTS: usize = 5;
         let file = self.fixture("launch.json", "{\"ok\": true}");
+
         let mut launch = MeasuredLaunch::start(&self.root, &[file.as_os_str()]).unwrap();
-
-        // The launch open waits for first input, so settings finish while the file is still unread.
-        let pending = launch
-            .wait_for_record(|record| record.settings_loaded_us != 0)
+        let loaded = launch
+            .wait_for_record(|record| record.file_loaded_us != 0)
             .unwrap();
-        assert!(pending.window_created_us != 0 && pending.first_paint_us != 0);
-        assert_eq!(pending.file_loaded_us, 0, "file loaded before first input");
-        assert_eq!(scintilla_text(launch.editor).unwrap(), "");
-        assert!(!process_has_module_loaded(launch.process.id(), LEXILLA_DLL).unwrap());
-
-        let record = launch.type_until_fully_ready().unwrap();
-        assert_startup_order(&record, launch.process.id());
+        assert!(loaded.window_created_us != 0 && loaded.first_paint_us != 0);
         assert!(
-            record.window_created_us < record.file_loaded_us
-                && record.first_paint_us < record.file_loaded_us
-                && record.first_input_accepted_us < record.file_loaded_us,
-            "window, paint, and input must precede the file load: {record:?}"
+            loaded.first_paint_us <= loaded.file_loaded_us,
+            "the launch file loaded before first paint: {loaded:?}"
         );
+        assert_eq!(
+            loaded.first_input_accepted_us, 0,
+            "the launch file only loaded once input arrived: {loaded:?}"
+        );
+        wait_until("the launch file in the editor", || {
+            scintilla_text(launch.editor).is_ok_and(|text| text == "{\"ok\": true}")
+        });
         wait_until("Lexilla activation for the JSON file", || {
             process_has_module_loaded(launch.process.id(), LEXILLA_DLL).unwrap_or(false)
         });
+        let record = launch.type_until_fully_ready().unwrap();
+        assert_startup_order(&record, launch.process.id());
         launch.close_discarding_changes();
+
+        // Input sent before first paint is still pending when the chain runs, so the file waits.
+        let mut observed = Vec::new();
+        for _ in 0..ATTEMPTS {
+            let mut launch = MeasuredLaunch::start(&self.root, &[file.as_os_str()]).unwrap();
+            let record = launch.type_until_fully_ready().unwrap();
+            assert_startup_order(&record, launch.process.id());
+            if record.first_input_accepted_us >= record.first_paint_us {
+                observed.push(record);
+                launch.close_discarding_changes();
+                continue;
+            }
+            assert!(
+                record.first_input_accepted_us <= record.file_loaded_us,
+                "the launch file loaded ahead of pending input: {record:?}"
+            );
+            launch.close_discarding_changes();
+            return;
+        }
+        panic!(
+            "input never reached the editor before first paint in {ATTEMPTS} launches: {observed:?}"
+        );
     }
 
     /// Evidence: FastPad's in-process serde_json invocation counter, read under `--diagnostic`, is
     /// zero after a JSON launch reaches FullyReady and one after an explicit Validate JSON.
     pub fn assert_no_startup_json_parse(&self) {
         let file = self.fixture("malformed.json", MALFORMED_JSON);
-        let mut launch = MeasuredLaunch::start(&self.root, &[file.as_os_str()]).unwrap();
-        let record = launch.type_until_fully_ready().unwrap();
-        assert_startup_order(&record, launch.process.id());
+        let launch = MeasuredLaunch::start(&self.root, &[file.as_os_str()]).unwrap();
         wait_until("the malformed JSON file in the editor", || {
             scintilla_text(launch.editor).is_ok_and(|text| text == MALFORMED_JSON)
         });
