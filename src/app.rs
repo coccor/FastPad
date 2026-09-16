@@ -61,10 +61,13 @@ pub struct App {
     menu_alt_pending: bool,
     pub(crate) recovery_root: Option<std::path::PathBuf>,
     pub(crate) recovery_owner: Option<crate::platform::OwnedHandle>,
-    pub(crate) instance_mutex: Option<crate::platform::OwnedHandle>,
+    // Declared before `instance_mutex` so an emergency drop closes the pipe before releasing the
+    // mutex: a new primary must never claim the session while this server still exists.
     pub(crate) ipc: Option<crate::ipc::IpcServer>,
+    pub(crate) instance_mutex: Option<crate::platform::OwnedHandle>,
     pub(crate) ipc_requests: Vec<crate::ipc::IpcRequest>,
     pub(crate) last_snapshot_duration: Option<std::time::Duration>,
+    pub(crate) last_snapshot_attempt: Option<DocumentId>,
     next_document_id: u64,
     process_start: u64,
 }
@@ -103,10 +106,11 @@ impl App {
             menu_alt_pending: false,
             recovery_root: None,
             recovery_owner: None,
-            instance_mutex: None,
             ipc: None,
+            instance_mutex: None,
             ipc_requests: Vec::new(),
             last_snapshot_duration: None,
+            last_snapshot_attempt: None,
             next_document_id: 2,
             process_start: startup.start_tick() as u64,
             startup,

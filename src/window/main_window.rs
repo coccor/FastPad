@@ -168,8 +168,11 @@ unsafe extern "system" fn main_window_proc(
             if file_population_active(hwnd) {
                 return 0;
             }
+            // A launch forwarded just before the review must be handled, not lost with the window.
+            drain_ipc_requests(hwnd);
             if let Some(discarded) = review_dirty_documents(hwnd) {
                 remove_session_snapshots(hwnd, &discarded);
+                shutdown_ipc(hwnd);
                 clear_documents_for_shutdown(hwnd);
                 unsafe {
                     DestroyWindow(hwnd);
@@ -1938,7 +1941,8 @@ fn snapshot_next_document(hwnd: HWND) {
     let job = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         let editor = app.editor.clone()?;
-        let document = crate::recovery::next_snapshot_document(app.tabs.documents())?;
+        let document =
+            crate::recovery::next_snapshot_document(app.tabs.documents(), app.last_snapshot_attempt)?;
         let origin = document.recovery_origin.as_ref();
         Some(SnapshotJob {
             editor,
@@ -1958,6 +1962,10 @@ fn snapshot_next_document(hwnd: HWND) {
     let Some(job) = job else {
         return;
     };
+    // Recorded before the write so a document that keeps failing still yields the next tick.
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.last_snapshot_attempt = Some(job.id);
+    }
     let started = std::time::Instant::now();
     let text = match &job.inactive {
         None => job.editor.text(),
@@ -2339,6 +2347,28 @@ fn remove_session_snapshots(hwnd: HWND, discarded: &[DocumentId]) {
     crate::recovery::remove_snapshot_files(&files.unwrap_or_default());
 }
 
+/// Services the pipe and handles everything already queued, before a close review begins.
+fn drain_ipc_requests(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    service_ipc(hwnd, &identity);
+    if identity.is_live_for(hwnd) {
+        handle_ipc_requests(hwnd);
+    }
+}
+
+/// Stops accepting forwarded launches before releasing the mutex that invites the next primary to
+/// bind the pipe; the reverse order would let it bind while this server still exists.
+fn shutdown_ipc(hwnd: HWND) {
+    let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
+    let app = unsafe { app.as_mut() };
+    drop(app.ipc.take());
+    drop(app.instance_mutex.take());
+}
+
 fn clear_documents_for_shutdown(hwnd: HWND) {
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
         unsafe { app.as_mut() }.tabs.clear_for_shutdown();
@@ -2558,6 +2588,64 @@ mod tests {
                 DispatchMessageW(&message);
             }
         }
+    }
+
+    #[test]
+    fn a_forwarded_request_is_handled_before_the_close_review_starts() {
+        // Break caught: a launch forwarded just before WM_CLOSE is dropped when the window closes,
+        // so the file the user double-clicked silently never opens.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("dirty").unwrap();
+        app_mut(window.hwnd)
+            .ipc_requests
+            .push(crate::ipc::IpcRequest::New);
+        let tabs_at_prompt = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&tabs_at_prompt);
+        answer_next_close_prompt(move |hwnd| {
+            observed.store(app_mut(hwnd).tabs.len(), Ordering::SeqCst);
+            CloseDecision::Cancel
+        });
+
+        unsafe {
+            SendMessageW(window.hwnd, WM_CLOSE, 0, 0);
+        }
+
+        assert_ne!(
+            unsafe { IsWindow(window.hwnd) },
+            0,
+            "Cancel must abort the close"
+        );
+        assert_eq!(
+            tabs_at_prompt.load(Ordering::SeqCst),
+            2,
+            "the queued request must be handled before the review starts"
+        );
+        assert!(app_mut(window.hwnd).ipc_requests.is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_close_releases_the_pipe_server_and_the_instance_mutex() {
+        // Break caught: dropping the instance mutex before the pipe server lets the next launch
+        // claim the session and fail to bind a name this process still owns.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let names = crate::ipc::server::tests::unique_names();
+        app_mut(window.hwnd).instance_mutex = Some(unnamed_mutex());
+        super::start_ipc_server_with(window.hwnd, || {
+            crate::ipc::IpcServer::bind(&names, &crate::ipc::CurrentUserAcl::current()?)
+        });
+        assert!(app_mut(window.hwnd).ipc.is_some());
+
+        unsafe {
+            SendMessageW(window.hwnd, WM_CLOSE, 0, 0);
+        }
+
+        assert_eq!(unsafe { IsWindow(window.hwnd) }, 0);
+        crate::ipc::IpcServer::bind(&names, &crate::ipc::CurrentUserAcl::current().unwrap())
+            .expect("the pipe name must be free once the window has closed");
     }
 
     #[test]

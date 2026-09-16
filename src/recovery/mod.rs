@@ -1,7 +1,7 @@
 pub mod snapshot;
 
 use crate::Result;
-use crate::document::{Document, RecoveryId};
+use crate::document::{Document, DocumentId, RecoveryId};
 use crate::platform::{OwnedHandle, wide_null};
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::System::Threading::{
@@ -32,11 +32,21 @@ pub fn needs_snapshot(document: &Document) -> bool {
     document.dirty && document.recovery_generation != Some(document.generation)
 }
 
+/// The next document needing a snapshot, starting after `previous` and wrapping around, so one
+/// document whose snapshot keeps failing to write cannot starve every other dirty document.
 pub fn next_snapshot_document<'a>(
     documents: impl IntoIterator<Item = &'a Document>,
+    previous: Option<DocumentId>,
 ) -> Option<&'a Document> {
-    documents
-        .into_iter()
+    let documents = documents.into_iter().collect::<Vec<_>>();
+    if documents.is_empty() {
+        return None;
+    }
+    let start = previous
+        .and_then(|previous| documents.iter().position(|document| document.id == previous))
+        .map_or(0, |index| index + 1);
+    (0..documents.len())
+        .map(|offset| documents[(start + offset) % documents.len()])
         .find(|document| needs_snapshot(document))
 }
 
@@ -146,8 +156,33 @@ mod tests {
         assert!(needs_snapshot(&fresh));
         let documents = [clean, recorded, changed, fresh];
         assert_eq!(
-            next_snapshot_document(&documents).map(|document| document.id),
+            next_snapshot_document(&documents, None).map(|document| document.id),
             Some(DocumentId(3))
+        );
+    }
+
+    #[test]
+    fn one_persistently_failing_document_does_not_starve_the_others() {
+        // Break caught: always scanning from the front lets a document whose snapshot never writes
+        // (so its generation is never recorded) absorb every tick, leaving other dirty documents
+        // with no recovery data at all.
+        let documents = [
+            Document::test_fixture(DocumentId(1), true),
+            Document::test_fixture(DocumentId(2), true),
+        ];
+
+        assert_eq!(
+            next_snapshot_document(&documents, None).map(|document| document.id),
+            Some(DocumentId(1))
+        );
+        assert_eq!(
+            next_snapshot_document(&documents, Some(DocumentId(1))).map(|document| document.id),
+            Some(DocumentId(2))
+        );
+        assert_eq!(
+            next_snapshot_document(&documents, Some(DocumentId(2))).map(|document| document.id),
+            Some(DocumentId(1)),
+            "the rotation wraps so neither document can starve the other"
         );
     }
 
