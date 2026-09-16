@@ -23,9 +23,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
-const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
-const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
-const IID_IACCESSIBLE: GUID = GUID::from_u128(0x618736e0_3c3d_11cf_810c_00aa00389b71);
+pub(crate) const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+pub(crate) const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
+pub(crate) const IID_IACCESSIBLE: GUID = GUID::from_u128(0x618736e0_3c3d_11cf_810c_00aa00389b71);
 const STATE_SYSTEM_FOCUSABLE: u32 = 0x0010_0000;
 pub(crate) const WM_FASTPAD_ACCESSIBLE_SELECT: u32 = WM_APP + 0x31;
 
@@ -135,14 +135,15 @@ struct AccessibleProvider {
 }
 
 #[repr(C)]
-struct AccessibleVtable {
-    query_interface:
+pub(crate) struct AccessibleVtable {
+    pub(crate) query_interface:
         unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
-    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
-    release: unsafe extern "system" fn(*mut c_void) -> u32,
-    get_type_info_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
-    get_type_info: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
-    get_ids_of_names: unsafe extern "system" fn(
+    pub(crate) add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub(crate) release: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub(crate) get_type_info_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
+    pub(crate) get_type_info:
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
+    pub(crate) get_ids_of_names: unsafe extern "system" fn(
         *mut c_void,
         *const GUID,
         *mut *mut u16,
@@ -150,7 +151,7 @@ struct AccessibleVtable {
         u32,
         *mut i32,
     ) -> HRESULT,
-    invoke: unsafe extern "system" fn(
+    pub(crate) invoke: unsafe extern "system" fn(
         *mut c_void,
         i32,
         *const GUID,
@@ -161,25 +162,33 @@ struct AccessibleVtable {
         *mut c_void,
         *mut u32,
     ) -> HRESULT,
-    get_acc_parent: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
-    get_acc_child_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
-    get_acc_child: unsafe extern "system" fn(*mut c_void, RawVariant, *mut *mut c_void) -> HRESULT,
-    get_acc_name: unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
-    get_acc_value: unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
-    get_acc_description: unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
-    get_acc_role: unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
-    get_acc_state: unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
-    get_acc_help: unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
-    get_acc_help_topic:
+    pub(crate) get_acc_parent: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    pub(crate) get_acc_child_count: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
+    pub(crate) get_acc_child:
+        unsafe extern "system" fn(*mut c_void, RawVariant, *mut *mut c_void) -> HRESULT,
+    pub(crate) get_acc_name:
+        unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
+    pub(crate) get_acc_value:
+        unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
+    pub(crate) get_acc_description:
+        unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
+    pub(crate) get_acc_role:
+        unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
+    pub(crate) get_acc_state:
+        unsafe extern "system" fn(*mut c_void, RawVariant, *mut RawVariant) -> HRESULT,
+    pub(crate) get_acc_help:
+        unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
+    pub(crate) get_acc_help_topic:
         unsafe extern "system" fn(*mut c_void, *mut BSTR, RawVariant, *mut i32) -> HRESULT,
-    get_acc_keyboard_shortcut:
+    pub(crate) get_acc_keyboard_shortcut:
         unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
-    get_acc_focus: unsafe extern "system" fn(*mut c_void, *mut RawVariant) -> HRESULT,
-    get_acc_selection: unsafe extern "system" fn(*mut c_void, *mut RawVariant) -> HRESULT,
-    get_acc_default_action:
+    pub(crate) get_acc_focus: unsafe extern "system" fn(*mut c_void, *mut RawVariant) -> HRESULT,
+    pub(crate) get_acc_selection:
+        unsafe extern "system" fn(*mut c_void, *mut RawVariant) -> HRESULT,
+    pub(crate) get_acc_default_action:
         unsafe extern "system" fn(*mut c_void, RawVariant, *mut BSTR) -> HRESULT,
-    acc_select: unsafe extern "system" fn(*mut c_void, i32, RawVariant) -> HRESULT,
-    acc_location: unsafe extern "system" fn(
+    pub(crate) acc_select: unsafe extern "system" fn(*mut c_void, i32, RawVariant) -> HRESULT,
+    pub(crate) acc_location: unsafe extern "system" fn(
         *mut c_void,
         *mut i32,
         *mut i32,
@@ -187,17 +196,18 @@ struct AccessibleVtable {
         *mut i32,
         RawVariant,
     ) -> HRESULT,
-    acc_navigate:
+    pub(crate) acc_navigate:
         unsafe extern "system" fn(*mut c_void, i32, RawVariant, *mut RawVariant) -> HRESULT,
-    acc_hit_test: unsafe extern "system" fn(*mut c_void, i32, i32, *mut RawVariant) -> HRESULT,
-    acc_do_default_action: unsafe extern "system" fn(*mut c_void, RawVariant) -> HRESULT,
-    put_acc_name: unsafe extern "system" fn(*mut c_void, RawVariant, BSTR) -> HRESULT,
-    put_acc_value: unsafe extern "system" fn(*mut c_void, RawVariant, BSTR) -> HRESULT,
+    pub(crate) acc_hit_test:
+        unsafe extern "system" fn(*mut c_void, i32, i32, *mut RawVariant) -> HRESULT,
+    pub(crate) acc_do_default_action: unsafe extern "system" fn(*mut c_void, RawVariant) -> HRESULT,
+    pub(crate) put_acc_name: unsafe extern "system" fn(*mut c_void, RawVariant, BSTR) -> HRESULT,
+    pub(crate) put_acc_value: unsafe extern "system" fn(*mut c_void, RawVariant, BSTR) -> HRESULT,
 }
 
-type RawVariant = VARIANT;
+pub(crate) type RawVariant = VARIANT;
 
-trait VariantValue {
+pub(crate) trait VariantValue {
     fn empty() -> Self;
     fn integer(value: i32) -> Self;
     fn child_id(&self) -> Option<i32>;
@@ -284,7 +294,7 @@ unsafe extern "system" fn accessible_query_interface(
     }
 }
 
-fn guid_eq(left: &GUID, right: &GUID) -> bool {
+pub(crate) fn guid_eq(left: &GUID, right: &GUID) -> bool {
     left.data1 == right.data1
         && left.data2 == right.data2
         && left.data3 == right.data3
@@ -312,7 +322,7 @@ unsafe extern "system" fn accessible_release(this: *mut c_void) -> u32 {
     remaining
 }
 
-unsafe extern "system" fn accessible_get_type_info_count(
+pub(crate) unsafe extern "system" fn accessible_get_type_info_count(
     _this: *mut c_void,
     count: *mut u32,
 ) -> HRESULT {
@@ -323,7 +333,7 @@ unsafe extern "system" fn accessible_get_type_info_count(
     S_OK
 }
 
-unsafe extern "system" fn accessible_get_type_info(
+pub(crate) unsafe extern "system" fn accessible_get_type_info(
     _this: *mut c_void,
     _index: u32,
     _locale: u32,
@@ -335,7 +345,7 @@ unsafe extern "system" fn accessible_get_type_info(
     E_NOTIMPL
 }
 
-unsafe extern "system" fn accessible_get_ids_of_names(
+pub(crate) unsafe extern "system" fn accessible_get_ids_of_names(
     _this: *mut c_void,
     _iid: *const GUID,
     _names: *mut *mut u16,
@@ -346,7 +356,7 @@ unsafe extern "system" fn accessible_get_ids_of_names(
     DISP_E_MEMBERNOTFOUND
 }
 
-unsafe extern "system" fn accessible_invoke(
+pub(crate) unsafe extern "system" fn accessible_invoke(
     _this: *mut c_void,
     _id: i32,
     _iid: *const GUID,
@@ -360,7 +370,7 @@ unsafe extern "system" fn accessible_invoke(
     DISP_E_MEMBERNOTFOUND
 }
 
-unsafe extern "system" fn accessible_get_parent(
+pub(crate) unsafe extern "system" fn accessible_get_parent(
     _this: *mut c_void,
     output: *mut *mut c_void,
 ) -> HRESULT {
@@ -509,7 +519,7 @@ unsafe extern "system" fn accessible_get_help(
     unsafe { allocate_bstr("", output) }
 }
 
-unsafe extern "system" fn accessible_get_help_topic(
+pub(crate) unsafe extern "system" fn accessible_get_help_topic(
     _this: *mut c_void,
     output: *mut BSTR,
     _child: RawVariant,
@@ -847,7 +857,7 @@ fn child_name<'a>(children: &'a [AccessibleChild], child: &RawVariant) -> Option
     }
 }
 
-unsafe fn allocate_bstr(value: &str, output: *mut BSTR) -> HRESULT {
+pub(crate) unsafe fn allocate_bstr(value: &str, output: *mut BSTR) -> HRESULT {
     if output.is_null() {
         return E_INVALIDARG;
     }

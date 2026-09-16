@@ -1224,6 +1224,15 @@ unsafe extern "system" fn preview_proc(
             });
             0
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_GETOBJECT
+            if lparam as i32 == windows_sys::Win32::UI::WindowsAndMessaging::OBJID_CLIENT =>
+        {
+            // Clone the snapshot inside the borrow; `LresultFromObject` runs after it ends.
+            match with_state(hwnd, |state| Arc::clone(&state.accessible)) {
+                Some(links) => crate::preview::accessible::object_result(hwnd, links, wparam),
+                None => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+            }
+        }
         WM_FASTPAD_PREVIEW_ACTIVATE => {
             let dest = with_state(hwnd, |state| {
                 state
