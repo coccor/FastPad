@@ -49,7 +49,7 @@ fn get_object_returns_a_marshaled_title_provider() -> TestResult<()> {
     let result = unsafe { SendMessageW(hwnd, WM_GETOBJECT, 0, OBJID_CLIENT as isize) };
     assert_ne!(result, 0, "WM_GETOBJECT did not return the title provider");
     let accessible = Accessible::from_lresult(result, 0)?;
-    assert_eq!(accessible.child_count()?, 6);
+    assert_eq!(accessible.child_count()?, 5);
 
     process.close()
 }
@@ -264,20 +264,18 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
 
     let accessible = Accessible::from_window(hwnd)?;
     assert_eq!(std::mem::size_of::<VARIANT>(), 24);
-    assert_eq!(accessible.child_count()?, 6);
+    assert_eq!(accessible.child_count()?, 5);
     assert_eq!(accessible.role(0)?, ROLE_SYSTEM_PAGETABLIST as i32);
     assert_eq!(accessible.role(1)?, ROLE_SYSTEM_PAGETAB as i32);
-    for child in 2..=6 {
+    for child in 2..=5 {
         assert_eq!(accessible.role(child)?, ROLE_SYSTEM_PUSHBUTTON as i32);
     }
-    let names = (1..=6)
+    let names = (1..=5)
         .map(|child| accessible.name(child))
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(
         names,
-        vec![
-            "Untitled", "New tab", "Overflow", "Minimize", "Maximize", "Close"
-        ]
+        vec!["Untitled", "Overflow", "Minimize", "Maximize", "Close"]
     );
     assert_ne!(accessible.state(1)? as u32 & STATE_SYSTEM_SELECTED, 0);
     assert_eq!(accessible.focus()?, None);
@@ -290,14 +288,15 @@ fn custom_titlebar_preserves_snap_hit_target_and_accessible_children() -> TestRe
     );
     assert_eq!(accessible.do_default_action(1), S_OK);
     assert_eq!(accessible.do_default_action(0), E_INVALIDARG);
-    assert_eq!(accessible.do_default_action(7), E_INVALIDARG);
-    assert_eq!(accessible.selection()?, Some(1));
+    assert_eq!(accessible.do_default_action(6), E_INVALIDARG);
     std::thread::sleep(Duration::from_millis(50));
     assert_ne!(
         unsafe { IsWindow(hwnd) },
         0,
-        "CloseTab default action must remain the Task 8 command no-op"
+        "closing the last tab must leave the window open"
     );
+    assert_eq!(accessible.child_count()?, 4, "the last tab closes");
+    assert_eq!(accessible.selection()?, None);
 
     process.close()
 }

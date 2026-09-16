@@ -12,15 +12,18 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use support::process::FastPadProcess;
 use support::win32::{find_child_by_class, scintilla_text, send_text};
-use windows_sys::Win32::Foundation::{E_INVALIDARG, HWND, LPARAM, SysFreeString, SysStringLen};
+use windows_sys::Win32::Foundation::{
+    E_INVALIDARG, HWND, LPARAM, POINT, SysFreeString, SysStringLen,
+};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::{AccessibleObjectFromWindow, SELFLAG_TAKESELECTION};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_CLICK, EnumWindows, GetClientRect, GetDlgItem, GetWindowThreadProcessId, IDCANCEL, IDNO,
-    IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CHAR, WM_CLOSE, WM_COMMAND,
-    WM_LBUTTONUP,
+    BM_CLICK, EnumWindows, GetClientRect, GetDlgItem, GetWindowThreadProcessId, HTCAPTION,
+    IDCANCEL, IDNO, IsWindow, OBJID_CLIENT, PostMessageW, SendMessageW, WM_CHAR, WM_CLOSE,
+    WM_COMMAND, WM_LBUTTONUP, WM_NCLBUTTONDBLCLK,
 };
 use windows_sys::core::{BOOL, BSTR, GUID, HRESULT};
 
@@ -37,7 +40,7 @@ fn native_tabs_preserve_text_and_clean_close_switches_documents() -> TestResult<
 
     send_text(editor, "first")?;
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
-    click_new_tab(hwnd, 1)?;
+    double_click_empty_strip(hwnd, 1)?;
     wait_for_editor_text(editor, "", Duration::from_secs(2))?;
     send_text(editor, "second")?;
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
@@ -82,17 +85,17 @@ fn retained_accessibility_provider_tracks_current_tabs_and_rejects_removed_tab()
     send_text(editor, "first")?;
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
     let accessible = Accessible::from_window(hwnd)?;
-    assert_eq!(accessible.child_count()?, 6);
+    assert_eq!(accessible.child_count()?, 5);
 
     unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };
     send_text(editor, "second")?;
-    assert_eq!(accessible.child_count()?, 7);
+    assert_eq!(accessible.child_count()?, 6);
     assert_eq!(accessible.name(2)?, "Untitled *");
 
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
     unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0) };
     wait_for_editor_text(editor, "first", Duration::from_secs(2))?;
-    assert_eq!(accessible.child_count()?, 6);
+    assert_eq!(accessible.child_count()?, 5);
     assert_eq!(accessible.select(2), E_INVALIDARG);
     assert_eq!(scintilla_text(editor)?, "first");
 
@@ -159,7 +162,7 @@ fn modal_close_does_not_close_a_reentrantly_created_active_tab() -> TestResult<(
     unsafe { SendMessageW(hwnd, WM_COMMAND, CommandId::New as usize, 0) };
     answer_dialog(dialog, IDNO)?;
     wait_for_dialog(process.id(), false, Duration::from_secs(2))?;
-    assert_eq!(accessible.child_count()?, 7);
+    assert_eq!(accessible.child_count()?, 6);
     assert_eq!(accessible.select(1), windows_sys::Win32::Foundation::S_OK);
     assert_eq!(scintilla_text(editor)?, "original");
     unsafe { SendMessageW(editor, SCI_SETSAVEPOINT, 0, 0) };
@@ -236,11 +239,16 @@ fn click_tab(hwnd: HWND, index: usize, tab_count: usize) -> TestResult<()> {
     Ok(())
 }
 
-fn click_new_tab(hwnd: HWND, tab_count: usize) -> TestResult<()> {
+fn double_click_empty_strip(hwnd: HWND, tab_count: usize) -> TestResult<()> {
     let layout = title_layout(hwnd, tab_count)?;
-    let point = layout.new_tab.center();
+    let center = layout.drag_region.center();
+    let mut point = POINT {
+        x: center.x,
+        y: center.y,
+    };
+    unsafe { ClientToScreen(hwnd, &mut point) };
     let packed = (point.x as u16 as u32 | ((point.y as u16 as u32) << 16)) as isize;
-    unsafe { SendMessageW(hwnd, WM_LBUTTONUP, 0, packed) };
+    unsafe { SendMessageW(hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, packed) };
     Ok(())
 }
 

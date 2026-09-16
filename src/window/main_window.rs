@@ -14,7 +14,7 @@ use crate::window::messages::{
 use crate::window::modal::prompt_close_decision;
 use crate::window::palette::Palette;
 use crate::window::tabs::CloseReviewKey;
-use crate::window::titlebar::{HitTarget, PointerState, TitleFontHandles};
+use crate::window::titlebar::{HitTarget, PointerState, TitleBarLayout, TitleFontHandles};
 #[cfg(test)]
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -24,20 +24,22 @@ use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::UI::Controls::{NMHDR, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetLastInputInfo, LASTINPUTINFO, SetFocus, VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
+    GetFocus, GetKeyState, GetLastInputInfo, LASTINPUTINFO, ReleaseCapture, SetCapture, SetFocus,
+    VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetWindowLongPtrW, IsZoomed, KillTimer, MoveWindow, OBJID_CLIENT, PostMessageW,
-    PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE,
-    SC_RESTORE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, UnregisterClassW, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP,
-    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GWLP_USERDATA,
+    GetClientRect, GetWindowLongPtrW, HTCAPTION, IsZoomed, KillTimer, MoveWindow, OBJID_CLIENT,
+    PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE,
+    SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    UnregisterClassW, WHEEL_DELTA, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED,
-    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY,
+    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -157,7 +159,10 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_SETFOCUS => {
-            if let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) } {
+            // With no tab open the editor is hidden and the frame itself keeps the focus.
+            if tab_count(hwnd) > 0
+                && let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) }
+            {
                 unsafe {
                     SetFocus(editor_hwnd);
                 }
@@ -193,7 +198,7 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_PAINT => {
             let paint_title_strip = |hwnd, _, _, _| {
-                let (titles, active) = tab_snapshot(hwnd);
+                let (titles, active, scroll, empty) = tab_snapshot(hwnd);
                 let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
                 let status = current_status_text(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
@@ -203,6 +208,8 @@ unsafe extern "system" fn main_window_proc(
                         &crate::window::titlebar::TitlePaint {
                             titles: &title_refs,
                             active,
+                            scroll,
+                            empty_hint: empty.then_some(EMPTY_TABS_HINT),
                             status: status.as_deref(),
                             palette,
                             fonts,
@@ -227,13 +234,20 @@ unsafe extern "system" fn main_window_proc(
             }
         }
         WM_NCHITTEST => unsafe {
-            crate::window::titlebar::nonclient_hit_test(hwnd, wparam, lparam, tab_count(hwnd))
+            crate::window::titlebar::nonclient_hit_test(
+                hwnd,
+                wparam,
+                lparam,
+                tab_count(hwnd),
+                tab_scroll(hwnd),
+            )
         },
         WM_NCCALCSIZE => unsafe { crate::window::titlebar::reclaim_caption(hwnd, wparam, lparam) },
         WM_GETMINMAXINFO => unsafe {
             crate::window::titlebar::constrain_maximized_window(hwnd, lparam)
         },
         WM_MOUSEMOVE => {
+            drag_tab_thumb(hwnd, lparam);
             crate::window::titlebar::track_pointer_leave(hwnd, false);
             let target = client_title_target(hwnd, lparam);
             update_title_pointer(hwnd, |pointer| pointer.hover(target));
@@ -258,7 +272,52 @@ unsafe extern "system" fn main_window_proc(
         WM_LBUTTONDOWN => {
             let target = client_title_target(hwnd, lparam);
             update_title_pointer(hwnd, |pointer| pointer.hover(target).press(target));
+            if target == Some(HitTarget::ScrollBar) {
+                begin_tab_thumb_drag(hwnd, (lparam as u32 & 0xffff) as u16 as i16 as i32);
+            }
             0
+        }
+        WM_CAPTURECHANGED => {
+            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                unsafe { app.as_mut() }.tab_thumb_grab = None;
+            }
+            0
+        }
+        // The empty tab-strip space is the only caption: double-clicking it opens a tab, VSCode
+        // style, instead of maximizing.
+        WM_NCLBUTTONDBLCLK if wparam == HTCAPTION as usize => {
+            execute_command(hwnd, CommandId::New);
+            0
+        }
+        // Its context menu replaces the system menu; Alt+Space still opens that.
+        WM_NCRBUTTONDOWN if wparam == HTCAPTION as usize => 0,
+        WM_NCRBUTTONUP if wparam == HTCAPTION as usize => {
+            let mut point = windows_sys::Win32::Foundation::POINT {
+                x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+                y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+            };
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+            }
+            let has_tabs = tab_count(hwnd) > 0;
+            if let Some(command) = menus::show_tab_strip_menu(hwnd, point.x, point.y, has_tabs) {
+                execute_command(hwnd, command);
+            }
+            0
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let delta = i32::from((wparam >> 16) as u16 as i16);
+            // Wheel up scrolls toward the first tab; a tilt to the right toward the last.
+            let delta = if message == WM_MOUSEWHEEL {
+                -delta
+            } else {
+                delta
+            };
+            if scroll_tabs(hwnd, lparam, delta) {
+                0
+            } else {
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
         }
         // DefWindowProc would run its own classic caption-button tracking loop over our strip.
         WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK
@@ -283,6 +342,9 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_LBUTTONUP => {
             update_title_pointer(hwnd, |pointer| pointer.release(None).0);
+            if end_tab_thumb_drag(hwnd) {
+                return 0;
+            }
             let point = crate::window::titlebar::Point::new(
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
@@ -291,14 +353,13 @@ unsafe extern "system" fn main_window_proc(
                 dismiss_notifications(hwnd);
                 return 0;
             }
-            let layout = crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd));
+            let layout = title_layout(hwnd);
             match layout.hit_test(point) {
                 crate::window::titlebar::HitTarget::Overflow => {
                     if let Some(command) = menus::show_overflow(hwnd, point.x, layout.height) {
                         execute_command(hwnd, command);
                     }
                 }
-                crate::window::titlebar::HitTarget::NewTab => execute_command(hwnd, CommandId::New),
                 crate::window::titlebar::HitTarget::CloseTab(index) => {
                     activate_tab(hwnd, index);
                     execute_command(hwnd, CommandId::CloseTab);
@@ -681,7 +742,7 @@ fn layout_editor_and_find_bar(hwnd: HWND) {
     let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
         return;
     };
-    let title_height = crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd)).height;
+    let title_height = title_layout(hwnd).height;
     let mut rect = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut rect);
@@ -857,23 +918,169 @@ pub(crate) fn replace_all_matches(hwnd: HWND) {
     }
 }
 
+const EMPTY_TABS_HINT: &str =
+    "No tabs are open.\nPress Ctrl+N or double-click the tab bar to start a new one.";
+
 fn tab_count(hwnd: HWND) -> usize {
     unsafe { app_ptr(hwnd) }
         .map(|app| unsafe { app.as_ref() }.tabs.len())
         .unwrap_or(1)
 }
 
-fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize) {
+fn tab_scroll(hwnd: HWND) -> i32 {
+    unsafe { app_ptr(hwnd) }
+        .map(|app| unsafe { app.as_ref() }.tabs.scroll_offset())
+        .unwrap_or(0)
+}
+
+fn title_layout(hwnd: HWND) -> TitleBarLayout {
+    crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd), tab_scroll(hwnd))
+}
+
+/// Titles, active index, scroll offset, and whether the editor is hidden because no tab is open.
+fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize, i32, bool) {
     unsafe { app_ptr(hwnd) }
         .map(|app| {
             let app = unsafe { app.as_ref() };
-            (app.tabs.titles().collect(), app.tabs.active_index())
+            (
+                app.tabs.titles().collect(),
+                app.tabs.active_index(),
+                app.tabs.scroll_offset(),
+                app.editor.is_some() && app.tabs.is_empty(),
+            )
         })
-        .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0))
+        .unwrap_or_else(|| (vec!["Untitled".to_owned()], 0, 0, false))
+}
+
+/// Scrolls the tabs when the wheel turns over the tab strip; reports whether it was over it.
+fn scroll_tabs(hwnd: HWND, lparam: LPARAM, delta: i32) -> bool {
+    let mut point = windows_sys::Win32::Foundation::POINT {
+        x: (lparam as u32 & 0xffff) as u16 as i16 as i32,
+        y: ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+    };
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+    }
+    let layout = title_layout(hwnd);
+    if point.y < 0 || point.y >= layout.height || point.x < 0 || point.x >= layout.overflow.left {
+        return false;
+    }
+    let scroll = layout.scroll_by_wheel(delta, WHEEL_DELTA as i32);
+    let changed = unsafe { app_ptr(hwnd) }
+        .is_some_and(|app| unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll));
+    if changed {
+        // The hovered tab moved out from under the pointer; the next mouse move finds the new one.
+        update_title_pointer(hwnd, |pointer| pointer.hover(None));
+        crate::window::titlebar::invalidate_strip(hwnd);
+    }
+    true
+}
+
+/// Starts dragging the tab scroll thumb. Pressing the track beside the thumb first jumps the
+/// thumb there, centred under the pointer, so the same press can keep dragging it.
+fn begin_tab_thumb_drag(hwnd: HWND, x: i32) {
+    let layout = title_layout(hwnd);
+    let Some(thumb) = layout.scroll_thumb() else {
+        return;
+    };
+    let grab = if (thumb.left..thumb.right).contains(&x) {
+        x - thumb.left
+    } else {
+        let grab = (thumb.right - thumb.left) / 2;
+        if let Some(app) = unsafe { app_ptr(hwnd) } {
+            unsafe { app.as_ref() }
+                .tabs
+                .set_scroll_offset(layout.scroll_for_thumb(x - grab));
+        }
+        grab
+    };
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }.tab_thumb_grab = Some(grab);
+    }
+    unsafe {
+        SetCapture(hwnd);
+    }
+    crate::window::titlebar::invalidate_strip(hwnd);
+}
+
+fn drag_tab_thumb(hwnd: HWND, lparam: LPARAM) {
+    let Some(grab) =
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tab_thumb_grab)
+    else {
+        return;
+    };
+    let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+    let scroll = title_layout(hwnd).scroll_for_thumb(x - grab);
+    if unsafe { app_ptr(hwnd) }
+        .is_some_and(|app| unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll))
+    {
+        crate::window::titlebar::invalidate_strip(hwnd);
+    }
+}
+
+/// Ends a thumb drag; reports whether one was in progress, so the release activates nothing.
+fn end_tab_thumb_drag(hwnd: HWND) -> bool {
+    let dragging = unsafe { app_ptr(hwnd) }
+        .and_then(|mut app| unsafe { app.as_mut() }.tab_thumb_grab.take())
+        .is_some();
+    if dragging {
+        unsafe {
+            ReleaseCapture();
+        }
+    }
+    dragging
+}
+
+/// Follows every change to the set of tabs or the active one: scrolls the active tab into view,
+/// shows the editor only while a tab is open, and repaints.
+fn refresh_tabs(hwnd: HWND) {
+    let Some((count, active, editor_hwnd)) = (unsafe { app_ptr(hwnd) }).map(|app| {
+        let app = unsafe { app.as_ref() };
+        (
+            app.tabs.len(),
+            app.tabs.active_index(),
+            app.editor.as_ref().map(Editor::hwnd),
+        )
+    }) else {
+        return;
+    };
+    let scroll = if count == 0 {
+        0
+    } else {
+        title_layout(hwnd).scroll_to_reveal(active)
+    };
+    if let Some(app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_ref() }.tabs.set_scroll_offset(scroll);
+    }
+    if let Some(editor_hwnd) = editor_hwnd {
+        let visible = unsafe { GetWindowLongPtrW(editor_hwnd, GWL_STYLE) } as u32 & WS_VISIBLE != 0;
+        if count == 0 && visible {
+            close_find_bar(hwnd);
+            unsafe {
+                ShowWindow(editor_hwnd, SW_HIDE);
+                if GetFocus() == editor_hwnd {
+                    SetFocus(hwnd);
+                }
+            }
+        } else if count > 0 && !visible {
+            unsafe {
+                ShowWindow(editor_hwnd, SW_SHOWNA);
+                if GetFocus() == hwnd {
+                    SetFocus(editor_hwnd);
+                }
+            }
+        }
+    }
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
 }
 
 fn execute_command(hwnd: HWND, command: CommandId) {
     if file_population_active(hwnd) {
+        return;
+    }
+    if command.needs_document() && tab_count(hwnd) == 0 {
         return;
     }
     match command {
@@ -905,6 +1112,7 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             }
         }
         CommandId::CloseTab => close_active_document(hwnd),
+        CommandId::CloseAllTabs => close_all_documents(hwnd),
         CommandId::Save => {
             let _ = save_active_document(hwnd);
         }
@@ -950,8 +1158,8 @@ fn file_population_active(hwnd: HWND) -> bool {
 /// is false for `WM_FASTPAD_APPLY_LANGUAGE` (see `handle_deferred`), so this never runs ahead of
 /// queued user input.
 fn apply_detected_language(hwnd: HWND) {
-    let path =
-        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tabs.active().path.clone());
+    let path = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
     let Some(path) = path else {
         return;
     };
@@ -1119,7 +1327,13 @@ fn apply_theme(hwnd: HWND) {
             let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
             let frame_change = app.dark_frame_applied != palette.dark_frame;
             app.dark_frame_applied = palette.dark_frame;
-            Some((editor, app.tabs.active().language, palette, frame_change))
+            let language = app
+                .tabs
+                .active()
+                .map_or(crate::document::Language::PlainText, |document| {
+                    document.language
+                });
+            Some((editor, language, palette, frame_change))
         })
     else {
         return;
@@ -1178,7 +1392,7 @@ fn client_title_target(hwnd: HWND, lparam: LPARAM) -> Option<HitTarget> {
         (lparam as u32 & 0xffff) as u16 as i16 as i32,
         ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
     );
-    Some(crate::window::titlebar::layout_for_window(hwnd, tab_count(hwnd)).hit_test(point))
+    Some(title_layout(hwnd).hit_test(point))
 }
 
 fn update_title_pointer(hwnd: HWND, update: impl FnOnce(PointerState) -> PointerState) {
@@ -1190,7 +1404,7 @@ fn update_title_pointer(hwnd: HWND, update: impl FnOnce(PointerState) -> Pointer
         changed
     });
     if changed {
-        crate::window::titlebar::invalidate_strip(hwnd, tab_count(hwnd));
+        crate::window::titlebar::invalidate_strip(hwnd);
     }
 }
 
@@ -1398,7 +1612,7 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
     // A NUL byte cannot round-trip through Scintilla's UTF-8 buffer: the file is unsupported.
     std::ffi::CString::new(loaded.text.as_str())
         .map_err(|_| crate::FastPadError::UnsupportedEncoding)?;
-    let (editor, previous, candidate, active_ids) = {
+    let (editor, candidate_ids) = {
         let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
         ))?;
@@ -1407,20 +1621,27 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
             .editor
             .clone()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
-        let active = app.tabs.active();
-        let previous = active.handle.clone();
-        let candidate = !active.dirty && active.path.is_none();
-        let active_ids = (active.id, active.recovery_id);
-        (editor, previous, candidate, active_ids)
+        let candidate_ids = app
+            .tabs
+            .active()
+            .filter(|active| !active.dirty && active.path.is_none())
+            .map(|active| (active.id, active.recovery_id));
+        (editor, candidate_ids)
     };
-    let reuse = candidate && editor.text()?.is_empty();
+    // With no tab open this is the hidden placeholder document.
+    let previous = editor.current_document()?;
+    let reused_ids = match candidate_ids {
+        Some(ids) if editor.text()?.is_empty() => Some(ids),
+        _ => None,
+    };
+    let reuse = reused_ids.is_some();
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
             "main window was destroyed during file open",
         ));
     }
-    let (id, recovery_id) = if reuse {
-        active_ids
+    let (id, recovery_id) = if let Some(ids) = reused_ids {
+        ids
     } else {
         let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
@@ -1456,7 +1677,14 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
         result?;
         if reuse {
             let retired = app.tabs.replace_active_untitled(document);
-            (Ok(()), Some(retired))
+            let commit = if retired.is_some() {
+                Ok(())
+            } else {
+                Err(crate::FastPadError::Invariant(
+                    "the reused tab closed during file open",
+                ))
+            };
+            (commit, retired)
         } else {
             (
                 app.tabs
@@ -1475,7 +1703,7 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
         let _ = record_milestone(hwnd, Milestone::FileLoaded);
         PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
     }
-    invalidate_title_strip(hwnd);
+    refresh_tabs(hwnd);
     Ok(())
 }
 
@@ -1514,7 +1742,7 @@ fn create_new_document(hwnd: HWND) -> Result<()> {
     app.tabs
         .push(document)
         .map_err(|_| crate::FastPadError::Invariant("duplicate document path"))?;
-    invalidate_title_strip(hwnd);
+    refresh_tabs(hwnd);
     Ok(())
 }
 
@@ -1542,7 +1770,7 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
         }
         let editor = app.editor.clone()?;
         app.tabs.activate(id).ok()?;
-        Some((editor, app.tabs.active_handle().clone()))
+        Some((editor, app.tabs.active_handle()?.clone()))
     });
     let Some((editor, handle)) = target else {
         return false;
@@ -1550,7 +1778,7 @@ fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
     if editor.use_document(&handle).is_err() || !identity.is_live_for(hwnd) {
         return false;
     }
-    invalidate_title_strip(hwnd);
+    refresh_tabs(hwnd);
     true
 }
 
@@ -1602,36 +1830,9 @@ fn close_active_document(hwnd: HWND) {
         review
     };
 
-    let current_len = unsafe { app_ptr(hwnd) }.and_then(|app| {
-        let app = unsafe { app.as_ref() };
-        (app.tabs.active_close_review() == Some(review)).then_some(app.tabs.len())
-    });
-    let Some(current_len) = current_len else {
-        return;
-    };
-    let replacement = if current_len == 1 {
-        let ids = unsafe { app_ptr(hwnd) }
-            .map(|mut app| unsafe { app.as_mut() }.allocate_document_identity());
-        let Some((id, recovery_id)) = ids else {
-            return;
-        };
-        let Ok(handle) = editor.create_document() else {
-            return;
-        };
-        Some(Document::untitled(id, recovery_id, handle))
-    } else {
-        None
-    };
-    if !identity.is_live_for(hwnd) {
-        return;
-    }
-
     let switched = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
-        let closed = app
-            .tabs
-            .close_reviewed(review, decision, replacement)
-            .ok()?;
+        let closed = app.tabs.close_reviewed(review, decision).ok()?;
         let snapshots = app
             .recovery_root
             .as_deref()
@@ -1643,17 +1844,38 @@ fn close_active_document(hwnd: HWND) {
                 )
             })
             .unwrap_or_default();
-        Some((closed, app.tabs.active_handle().clone(), snapshots))
+        Some((closed, app.tabs.active_handle().cloned(), snapshots))
     });
     let Some((closed, active, snapshots)) = switched else {
         return;
     };
-    let _ = editor.use_document(&active);
-    drop(active);
+    // The view keeps its own reference to whatever it shows, so the last closed document is
+    // swapped for an empty placeholder rather than lingering in the hidden editor.
+    let active = active.or_else(|| editor.create_document().ok());
+    if let Some(active) = active {
+        let _ = editor.use_document(&active);
+    }
     drop(closed);
     crate::recovery::remove_snapshot_files(&snapshots);
     if identity.is_live_for(hwnd) {
-        invalidate_title_strip(hwnd);
+        refresh_tabs(hwnd);
+    }
+}
+
+/// Closes tabs one at a time, reviewing each dirty one, until none remain or a close is refused.
+fn close_all_documents(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    loop {
+        let before = tab_count(hwnd);
+        if before == 0 {
+            return;
+        }
+        close_active_document(hwnd);
+        if !identity.is_live_for(hwnd) || tab_count(hwnd) >= before {
+            return;
+        }
     }
 }
 
@@ -1665,7 +1887,7 @@ fn save_reviewed_document(hwnd: HWND, id: DocumentId) -> bool {
     }
     unsafe { app_ptr(hwnd) }.is_some_and(|app| {
         let app = unsafe { app.as_ref() };
-        app.tabs.active().id == id
+        app.tabs.active().is_some_and(|active| active.id == id)
             && app
                 .tabs
                 .document(id)
@@ -1677,7 +1899,7 @@ fn save_reviewed_document(hwnd: HWND, id: DocumentId) -> bool {
 fn activate_document_by_id(hwnd: HWND, id: DocumentId) -> bool {
     let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
-        if app.tabs.active().id == id {
+        if app.tabs.active().is_some_and(|active| active.id == id) {
             return Some(None);
         }
         app.tabs.document(id)?;
@@ -1694,8 +1916,8 @@ fn save_active_document(hwnd: HWND) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
-    let has_path =
-        unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active().path.is_some());
+    let has_path = unsafe { app_ptr(hwnd) }
+        .and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.path.is_some()));
     match has_path {
         Some(true) => complete_save(hwnd, &identity, None),
         Some(false) => save_active_document_as(hwnd),
@@ -1707,10 +1929,10 @@ fn save_active_document_as(hwnd: HWND) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return false;
     };
-    let Some((target, suggested)) = (unsafe { app_ptr(hwnd) }).map(|app| {
+    let Some((target, suggested)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
-        let document = app.tabs.active();
-        (
+        let document = app.tabs.active()?;
+        Some((
             document.id,
             document
                 .path
@@ -1718,7 +1940,7 @@ fn save_active_document_as(hwnd: HWND) -> bool {
                 .and_then(std::path::Path::file_name)
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Untitled.txt".to_owned()),
-        )
+        ))
     }) else {
         return false;
     };
@@ -1781,7 +2003,7 @@ fn complete_save(
     let mut original_path: Option<std::path::PathBuf> = None;
     if let Some(path) = new_path {
         original_path = unsafe { app_ptr(hwnd) }
-            .and_then(|app| unsafe { app.as_ref() }.tabs.active().path.clone());
+            .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone());
         let outcome = unsafe { app_ptr(hwnd) }
             .map(|mut app| unsafe { app.as_mut() }.tabs.set_active_path(path));
         match outcome {
@@ -1802,7 +2024,7 @@ fn complete_save(
     let Some((editor, path, encoding)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
         let editor = app.editor.clone()?;
-        let document = app.tabs.active();
+        let document = app.tabs.active()?;
         Some((editor, document.path.clone()?, document.encoding))
     }) else {
         if is_save_as {
@@ -1958,6 +2180,7 @@ fn snapshot_next_document(hwnd: HWND) {
     let job = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         let editor = app.editor.clone()?;
+        let active = app.tabs.active()?;
         let document = crate::recovery::next_snapshot_document(
             app.tabs.documents(),
             app.last_snapshot_attempt,
@@ -1974,8 +2197,8 @@ fn snapshot_next_document(hwnd: HWND) {
                 .or_else(|| origin.and_then(|origin| origin.original_path.clone())),
             encoding: document.encoding,
             source_snapshot: origin.map(|origin| origin.snapshot_path.clone()),
-            inactive: (document.id != app.tabs.active().id)
-                .then(|| (document.handle.clone(), app.tabs.active_handle().clone())),
+            inactive: (document.id != active.id)
+                .then(|| (document.handle.clone(), active.handle.clone())),
         })
     });
     let Some(job) = job else {
@@ -2270,7 +2493,7 @@ fn open_recovered_snapshot(
         ));
     }
     let crate::recovery::SnapshotCandidate { path, snapshot } = candidate;
-    let (editor, previous, id, recovery_id) = {
+    let (editor, id, recovery_id) = {
         let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
         ))?;
@@ -2279,10 +2502,10 @@ fn open_recovered_snapshot(
             .editor
             .clone()
             .ok_or(crate::FastPadError::Invariant("editor was not initialized"))?;
-        let previous = app.tabs.active_handle().clone();
         let (id, recovery_id) = app.allocate_document_identity();
-        (editor, previous, id, recovery_id)
+        (editor, id, recovery_id)
     };
+    let previous = editor.current_document()?;
     let mut document = Document::untitled(id, recovery_id, editor.create_document()?);
     document.encoding = snapshot.encoding;
     document.dirty = true;
@@ -2326,7 +2549,7 @@ fn open_recovered_snapshot(
         let _ = editor.use_document(&previous);
     }
     pushed?;
-    invalidate_title_strip(hwnd);
+    refresh_tabs(hwnd);
     Ok(())
 }
 
@@ -2335,13 +2558,17 @@ fn remove_saved_document_snapshots(hwnd: HWND) {
     let files = unsafe { app_ptr(hwnd) }.map(|mut app| {
         let app = unsafe { app.as_mut() };
         let own = app.recovery_root.as_deref().map(|root| {
-            crate::recovery::snapshot::snapshot_path(root, app.tabs.active().recovery_id)
+            let active = app.tabs.active()?;
+            Some(crate::recovery::snapshot::snapshot_path(
+                root,
+                active.recovery_id,
+            ))
         });
         let source = app
             .tabs
             .take_active_recovery_origin()
             .map(|origin| origin.snapshot_path);
-        own.into_iter().chain(source).collect::<Vec<_>>()
+        own.flatten().into_iter().chain(source).collect::<Vec<_>>()
     });
     crate::recovery::remove_snapshot_files(&files.unwrap_or_default());
 }
@@ -2593,7 +2820,7 @@ mod tests {
     use crate::recovery::snapshot::snapshot_path;
     use crate::recovery::{Snapshot, write_snapshot};
     use crate::window::commands::CommandId;
-    use crate::window::menus::answer_next_overflow_menu;
+    use crate::window::menus::answer_next_popup_menu;
     use crate::window::modal::{answer_next_close_prompt, answer_next_save_dialog};
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -2736,7 +2963,7 @@ mod tests {
             .push(crate::ipc::IpcRequest::New);
         let before = app_mut(window.hwnd).tabs.len();
 
-        answer_next_overflow_menu(|hwnd| {
+        answer_next_popup_menu(|hwnd| {
             unsafe {
                 SendMessageW(hwnd, crate::window::WM_FASTPAD_IPC_REQUEST, 0, 0);
             }
@@ -2757,6 +2984,90 @@ mod tests {
             before + 1,
             "the held request must run once the overflow menu closes"
         );
+    }
+
+    #[test]
+    fn closing_every_tab_hides_the_editor_until_the_empty_strip_opens_a_new_one() {
+        // Break caught: the last tab being silently replaced (its close button looks inert), the
+        // hidden editor still taking edits, or the empty strip's double-click and context menu
+        // not reaching New and Close all tabs.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_STYLE, GetWindowLongPtrW, HTCAPTION, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONUP, WS_VISIBLE,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let editor_visible =
+            || unsafe { GetWindowLongPtrW(editor.hwnd(), GWL_STYLE) } as u32 & WS_VISIBLE != 0;
+        assert!(editor_visible());
+
+        execute_command(window.hwnd, CommandId::CloseTab);
+
+        assert!(app_mut(window.hwnd).tabs.is_empty());
+        assert!(!editor_visible());
+        execute_command(window.hwnd, CommandId::Paste);
+        execute_command(window.hwnd, CommandId::CloseTab);
+        assert_eq!(editor.text().unwrap(), "");
+
+        unsafe {
+            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, 0);
+            SendMessageW(window.hwnd, WM_NCLBUTTONDBLCLK, HTCAPTION as usize, 0);
+        }
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+        assert!(editor_visible());
+
+        answer_next_popup_menu(|_| Some(CommandId::CloseAllTabs));
+        unsafe {
+            SendMessageW(window.hwnd, WM_NCRBUTTONUP, HTCAPTION as usize, 0);
+        }
+        assert!(app_mut(window.hwnd).tabs.is_empty());
+        assert!(!editor_visible());
+    }
+
+    #[test]
+    fn dragging_the_tab_scroll_thumb_scrolls_the_tabs_without_activating_one() {
+        // Break caught: a scroll bar that is only painted, so overflowing tabs cannot be reached
+        // without a mouse wheel, or a drag release that also clicks the tab under the pointer.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        for _ in 0..40 {
+            execute_command(window.hwnd, CommandId::New);
+        }
+        super::activate_tab(window.hwnd, 0);
+        let layout = super::title_layout(window.hwnd);
+        assert_eq!(layout.scroll, 0);
+        let thumb = layout.scroll_thumb().expect("40 tabs overflow the strip");
+        let pack = |x: i32, y: i32| (x as u16 as u32 | ((y as u16 as u32) << 16)) as isize;
+        let y = thumb.center().y;
+        let far_right = layout.tabs.right + 500;
+
+        unsafe {
+            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, pack(thumb.center().x, y));
+            SendMessageW(window.hwnd, WM_MOUSEMOVE, 1, pack(far_right, y));
+        }
+        assert_eq!(super::tab_scroll(window.hwnd), layout.max_scroll);
+        unsafe {
+            SendMessageW(window.hwnd, WM_LBUTTONUP, 0, pack(far_right, y));
+            SendMessageW(window.hwnd, WM_MOUSEMOVE, 0, pack(layout.tabs.left, y));
+        }
+        assert_eq!(
+            super::tab_scroll(window.hwnd),
+            layout.max_scroll,
+            "moving after the release must not keep dragging"
+        );
+        assert_eq!(app_mut(window.hwnd).tabs.active_index(), 0);
+
+        // Pressing the track away from the thumb jumps there.
+        let track = super::title_layout(window.hwnd).scroll_bar.unwrap();
+        unsafe {
+            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 1, pack(track.left, y));
+            SendMessageW(window.hwnd, WM_LBUTTONUP, 0, pack(track.left, y));
+        }
+        assert_eq!(super::tab_scroll(window.hwnd), 0);
     }
 
     #[test]
@@ -2807,7 +3118,10 @@ mod tests {
         let root = RecoveryScratch::new("modal-snapshot");
         app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
         editor.set_text("typed").unwrap();
-        let snapshot = snapshot_path(root.path(), app_mut(window.hwnd).tabs.active().recovery_id);
+        let snapshot = snapshot_path(
+            root.path(),
+            app_mut(window.hwnd).tabs.active().unwrap().recovery_id,
+        );
 
         answer_next_close_prompt(|hwnd| {
             super::snapshot_next_document(hwnd);
@@ -2835,7 +3149,7 @@ mod tests {
         let root = RecoveryScratch::new("modal-save-as");
         let target = root.path().join("chosen.txt");
         editor.set_text("alpha").unwrap();
-        let chosen = app_mut(window.hwnd).tabs.active().id;
+        let chosen = app_mut(window.hwnd).tabs.active().unwrap().id;
         let destination = target.clone();
         answer_next_save_dialog(move |hwnd| {
             super::create_new_document(hwnd).unwrap();
@@ -2847,7 +3161,7 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"alpha");
         let app = app_mut(window.hwnd);
         assert_eq!(app.tabs.len(), 2);
-        assert_eq!(app.tabs.active().id, chosen);
+        assert_eq!(app.tabs.active().unwrap().id, chosen);
         assert_eq!(
             app.tabs.document(chosen).unwrap().path.as_deref(),
             Some(target.as_path())
@@ -2884,6 +3198,7 @@ mod tests {
         let language_before = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
             .tabs
             .active()
+            .unwrap()
             .language;
         assert_eq!(language_before, Language::PlainText);
 
@@ -2900,6 +3215,7 @@ mod tests {
         let language_after = unsafe { super::app_ptr(window.hwnd).unwrap().as_ref() }
             .tabs
             .active()
+            .unwrap()
             .language;
         assert_eq!(language_after, Language::PlainText);
     }
@@ -3190,7 +3506,7 @@ mod tests {
 
         let (tabs, title, dirty, path, encoding, origin, notices) = {
             let app = app_mut(window.hwnd);
-            let active = app.tabs.active();
+            let active = app.tabs.active().unwrap();
             (
                 app.tabs.len(),
                 active.title(),
@@ -3281,7 +3597,10 @@ mod tests {
         editor.set_text("recovered and edited").unwrap();
 
         super::snapshot_next_document(window.hwnd);
-        let own = snapshot_path(root.path(), app_mut(window.hwnd).tabs.active().recovery_id);
+        let own = snapshot_path(
+            root.path(),
+            app_mut(window.hwnd).tabs.active().unwrap().recovery_id,
+        );
         assert_eq!(read_snapshot_text(&own), "recovered and edited");
         assert!(
             !source.exists(),
@@ -3295,8 +3614,8 @@ mod tests {
         assert_eq!(std::fs::read(&original).unwrap(), b"original");
         assert!(!own.exists());
         let app = app_mut(window.hwnd);
-        assert_eq!(app.tabs.active().title(), "saved.txt");
-        assert_eq!(app.tabs.active().recovery_origin, None);
+        assert_eq!(app.tabs.active().unwrap().title(), "saved.txt");
+        assert_eq!(app.tabs.active().unwrap().recovery_origin, None);
     }
 
     #[test]
@@ -3309,7 +3628,10 @@ mod tests {
         app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
         editor.set_text("typed").unwrap();
         super::snapshot_next_document(window.hwnd);
-        let own = snapshot_path(root.path(), app_mut(window.hwnd).tabs.active().recovery_id);
+        let own = snapshot_path(
+            root.path(),
+            app_mut(window.hwnd).tabs.active().unwrap().recovery_id,
+        );
         assert!(own.exists());
         editor.set_save_point();
 
@@ -3353,8 +3675,8 @@ mod tests {
             "test setup: Scintilla reached its save point"
         );
         let app = app_mut(window.hwnd);
-        let active = app.tabs.active().id;
-        assert!(app.tabs.active().dirty);
+        let active = app.tabs.active().unwrap().id;
+        assert!(app.tabs.active().unwrap().dirty);
         assert_eq!(
             app.tabs.next_dirty_review(&[]).map(|review| review.id),
             Some(active),

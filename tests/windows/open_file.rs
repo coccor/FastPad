@@ -106,14 +106,14 @@ fn selected_canonical_duplicate_reuses_the_native_document() {
     main.with_app(|app| {
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(
-            app.tabs.active().path.as_deref(),
+            app.tabs.active().unwrap().path.as_deref(),
             Some(fixture.path.as_path())
         );
         assert_eq!(
-            app.tabs.active().encoding,
+            app.tabs.active().unwrap().encoding,
             file::encoding::Encoding::Utf8Bom
         );
-        assert!(!app.tabs.active().dirty);
+        assert!(!app.tabs.active().unwrap().dirty);
         assert!(app.startup.micros(perf::Milestone::FileLoaded).is_some());
     });
     let alternate = fixture.path.parent().unwrap().join(".").join("config.json");

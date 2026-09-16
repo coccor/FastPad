@@ -203,26 +203,48 @@ fn append_popup(root: HMENU, label: &str, popup: HMENU) -> Result<()> {
 }
 
 pub(crate) fn show_overflow(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
+    track_popup(
+        hwnd,
+        &[
+            MenuEntry::command("New", CommandId::New),
+            MenuEntry::command("Open...", CommandId::Open),
+            MenuEntry::command("Save", CommandId::Save),
+            MenuEntry::Separator,
+            MenuEntry::command("Find", CommandId::Find),
+            MenuEntry::command("Format JSON", CommandId::FormatJson),
+            MenuEntry::Separator,
+            MenuEntry::command("Exit", CommandId::Exit),
+        ],
+        POINT { x, y },
+    )
+}
+
+/// The context menu of the empty tab-strip space, at client coordinates `x`, `y`.
+pub(crate) fn show_tab_strip_menu(hwnd: HWND, x: i32, y: i32, has_tabs: bool) -> Option<CommandId> {
+    let mut entries = vec![
+        MenuEntry::command("New tab	Ctrl+N", CommandId::New),
+        MenuEntry::command("Open...	Ctrl+O", CommandId::Open),
+    ];
+    if has_tabs {
+        entries.extend([
+            MenuEntry::Separator,
+            MenuEntry::command("Close all tabs", CommandId::CloseAllTabs),
+        ]);
+    }
+    track_popup(hwnd, &entries, POINT { x, y })
+}
+
+fn track_popup(hwnd: HWND, entries: &[MenuEntry], client: POINT) -> Option<CommandId> {
     // TrackPopupMenuEx runs a nested modal loop that reenters the window procedure, exactly as the
     // file dialogs do. Hold deferred, IPC and snapshot work for its duration so the command the
     // user picks still acts on the document that was active when they opened the menu.
     let _modal = ModalScope::enter(hwnd);
     #[cfg(test)]
-    if let Some(answer) = OVERFLOW_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+    if let Some(answer) = POPUP_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
         return answer(hwnd);
     }
-    let menu = create_popup(&[
-        MenuEntry::command("New", CommandId::New),
-        MenuEntry::command("Open...", CommandId::Open),
-        MenuEntry::command("Save", CommandId::Save),
-        MenuEntry::Separator,
-        MenuEntry::command("Find", CommandId::Find),
-        MenuEntry::command("Format JSON", CommandId::FormatJson),
-        MenuEntry::Separator,
-        MenuEntry::command("Exit", CommandId::Exit),
-    ])
-    .ok()?;
-    let mut point = POINT { x, y };
+    let menu = create_popup(entries).ok()?;
+    let mut point = client;
     unsafe {
         ClientToScreen(hwnd, &mut point);
     }
@@ -245,18 +267,18 @@ pub(crate) fn show_overflow(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
 }
 
 #[cfg(test)]
-type OverflowAnswer = Box<dyn FnOnce(HWND) -> Option<CommandId>>;
+type PopupAnswer = Box<dyn FnOnce(HWND) -> Option<CommandId>>;
 
 #[cfg(test)]
 thread_local! {
-    static OVERFLOW_ANSWERS: std::cell::RefCell<std::collections::VecDeque<OverflowAnswer>> =
+    static POPUP_ANSWERS: std::cell::RefCell<std::collections::VecDeque<PopupAnswer>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
-/// Answers the next overflow menu from inside its modal scope instead of tracking a real popup.
+/// Answers the next popup menu from inside its modal scope instead of tracking a real popup.
 #[cfg(test)]
-pub(crate) fn answer_next_overflow_menu(answer: impl FnOnce(HWND) -> Option<CommandId> + 'static) {
-    OVERFLOW_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+pub(crate) fn answer_next_popup_menu(answer: impl FnOnce(HWND) -> Option<CommandId> + 'static) {
+    POPUP_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
 }
 
 #[cfg(test)]

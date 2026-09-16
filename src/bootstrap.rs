@@ -377,14 +377,14 @@ mod tests {
                 "{\"ok\":true}"
             );
             assert_eq!(
-                app.tabs.active().path.as_deref(),
+                app.tabs.active().unwrap().path.as_deref(),
                 Some(fixture.path.as_path())
             );
             assert_eq!(
-                app.tabs.active().encoding,
+                app.tabs.active().unwrap().encoding,
                 crate::file::encoding::Encoding::Utf8Bom
             );
-            assert!(!app.tabs.active().dirty);
+            assert!(!app.tabs.active().unwrap().dirty);
             assert_eq!(
                 app.tabs.len(),
                 1,
@@ -519,7 +519,7 @@ mod tests {
         with_app(main.hwnd, |app| {
             assert_eq!(app.tabs.len(), 1);
             assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), before);
-            assert!(app.tabs.active().dirty);
+            assert!(app.tabs.active().unwrap().dirty);
         });
     }
 
@@ -569,9 +569,9 @@ mod tests {
         }
         let before = with_app(main.hwnd, |app| {
             (
-                app.tabs.active().id,
-                app.tabs.active().generation,
-                app.tabs.active().dirty,
+                app.tabs.active().unwrap().id,
+                app.tabs.active().unwrap().generation,
+                app.tabs.active().unwrap().dirty,
             )
         });
         assert!(App::open_path(main.hwnd, &fixture.path).is_err());
@@ -582,14 +582,14 @@ mod tests {
             assert_eq!(app.tabs.len(), 1);
             assert_eq!(
                 (
-                    app.tabs.active().id,
-                    app.tabs.active().generation,
-                    app.tabs.active().dirty
+                    app.tabs.active().unwrap().id,
+                    app.tabs.active().unwrap().generation,
+                    app.tabs.active().unwrap().dirty
                 ),
                 before
             );
             assert_eq!(app.editor.as_ref().unwrap().text().unwrap(), "x");
-            assert!(app.tabs.active().path.is_none());
+            assert!(app.tabs.active().unwrap().path.is_none());
         });
     }
 

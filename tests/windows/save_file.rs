@@ -36,9 +36,9 @@ fn plain_save_writes_atomically_and_clears_the_dirty_indicator() {
     assert_eq!(std::fs::read(&fixture.path).unwrap(), expected.as_bytes());
     assert_eq!(unsafe { SendMessageW(editor, SCI_GETMODIFY, 0, 0) }, 0);
     main.with_app(|app| {
-        assert!(!app.tabs.active().dirty);
+        assert!(!app.tabs.active().unwrap().dirty);
         assert_eq!(
-            app.tabs.active().path.as_deref(),
+            app.tabs.active().unwrap().path.as_deref(),
             Some(fixture.path.as_path())
         );
     });
@@ -68,8 +68,11 @@ fn save_as_prompts_writes_the_new_path_and_updates_the_tab() {
     assert_eq!(std::fs::read(&target).unwrap(), b"hello");
     assert_eq!(unsafe { SendMessageW(editor, SCI_GETMODIFY, 0, 0) }, 0);
     main.with_app(|app| {
-        assert_eq!(app.tabs.active().path.as_deref(), Some(target.as_path()));
-        assert!(!app.tabs.active().dirty);
+        assert_eq!(
+            app.tabs.active().unwrap().path.as_deref(),
+            Some(target.as_path())
+        );
+        assert!(!app.tabs.active().unwrap().dirty);
     });
 }
 
@@ -89,8 +92,8 @@ fn save_command_with_no_path_behaves_like_save_as() {
 
     assert_ne!(unsafe { SendMessageW(editor, SCI_GETMODIFY, 0, 0) }, 0);
     main.with_app(|app| {
-        assert_eq!(app.tabs.active().path, None);
-        assert!(app.tabs.active().dirty);
+        assert_eq!(app.tabs.active().unwrap().path, None);
+        assert!(app.tabs.active().unwrap().dirty);
     });
 }
 
@@ -107,8 +110,8 @@ fn save_as_cancellation_leaves_the_document_untouched() {
 
     assert_ne!(unsafe { SendMessageW(editor, SCI_GETMODIFY, 0, 0) }, 0);
     main.with_app(|app| {
-        assert_eq!(app.tabs.active().path, None);
-        assert!(app.tabs.active().dirty);
+        assert_eq!(app.tabs.active().unwrap().path, None);
+        assert!(app.tabs.active().unwrap().dirty);
     });
 }
 
@@ -153,8 +156,8 @@ fn save_as_onto_another_open_tabs_path_shows_an_error_and_does_not_overwrite() {
     assert_eq!(std::fs::read(&fixture.path).unwrap(), b"owned by other tab");
     main.with_app(|app| {
         assert_eq!(app.tabs.len(), 2);
-        assert_eq!(app.tabs.active().path, None);
-        assert!(app.tabs.active().dirty);
+        assert_eq!(app.tabs.active().unwrap().path, None);
+        assert!(app.tabs.active().unwrap().dirty);
     });
 }
 
@@ -182,7 +185,7 @@ fn save_as_failure_reverts_the_tabs_path_to_its_original_value() {
     assert!(!target.exists());
     main.with_app(|app| {
         assert_eq!(
-            app.tabs.active().path.as_deref(),
+            app.tabs.active().unwrap().path.as_deref(),
             Some(fixture.path.as_path())
         );
     });
@@ -208,11 +211,7 @@ fn tab_close_yes_saves_a_pathed_document_then_closes_it() {
 
     assert_eq!(std::fs::read(&fixture.path).unwrap(), expected.as_bytes());
     assert_eq!(scintilla_text(main.editor).unwrap(), "");
-    main.with_app(|app| {
-        assert_eq!(app.tabs.len(), 1);
-        assert_eq!(app.tabs.active().path, None);
-        assert!(!app.tabs.active().dirty);
-    });
+    main.with_app(|app| assert!(app.tabs.is_empty()));
 }
 
 #[test]
@@ -233,10 +232,7 @@ fn tab_close_yes_on_an_untitled_document_saves_as_the_chosen_path_then_closes_it
 
     assert_eq!(std::fs::read(&target).unwrap(), b"draft");
     assert_eq!(scintilla_text(main.editor).unwrap(), "");
-    main.with_app(|app| {
-        assert_eq!(app.tabs.len(), 1);
-        assert_eq!(app.tabs.active().path, None);
-    });
+    main.with_app(|app| assert!(app.tabs.is_empty()));
 }
 
 #[test]
@@ -255,8 +251,8 @@ fn tab_close_yes_on_an_untitled_document_keeps_it_open_when_save_as_is_cancelled
     assert_eq!(scintilla_text(main.editor).unwrap(), "draft");
     main.with_app(|app| {
         assert_eq!(app.tabs.len(), 1);
-        assert_eq!(app.tabs.active().path, None);
-        assert!(app.tabs.active().dirty);
+        assert_eq!(app.tabs.active().unwrap().path, None);
+        assert!(app.tabs.active().unwrap().dirty);
     });
 }
 
@@ -288,10 +284,10 @@ fn tab_close_yes_keeps_the_tab_open_when_the_write_fails() {
     );
     main.with_app(|app| {
         assert_eq!(
-            app.tabs.active().path.as_deref(),
+            app.tabs.active().unwrap().path.as_deref(),
             Some(fixture.path.as_path())
         );
-        assert!(app.tabs.active().dirty);
+        assert!(app.tabs.active().unwrap().dirty);
     });
 }
 
@@ -308,7 +304,7 @@ fn tab_close_no_discards_and_cancel_keeps_the_document() {
     }
 
     assert_eq!(scintilla_text(main.editor).unwrap(), "kept");
-    main.with_app(|app| assert!(app.tabs.active().dirty));
+    main.with_app(|app| assert!(app.tabs.active().unwrap().dirty));
 
     window::answer_next_close_prompt(|_| document::CloseDecision::Discard);
     unsafe {
@@ -316,10 +312,7 @@ fn tab_close_no_discards_and_cancel_keeps_the_document() {
     }
 
     assert_eq!(scintilla_text(main.editor).unwrap(), "");
-    main.with_app(|app| {
-        assert_eq!(app.tabs.len(), 1);
-        assert!(!app.tabs.active().dirty);
-    });
+    main.with_app(|app| assert!(app.tabs.is_empty()));
 }
 
 #[test]
@@ -377,7 +370,7 @@ fn window_close_yes_with_save_as_cancelled_aborts_the_close() {
 
     assert_ne!(unsafe { IsWindow(main.hwnd) }, 0);
     assert_eq!(scintilla_text(main.editor).unwrap(), "draft");
-    main.with_app(|app| assert!(app.tabs.active().dirty));
+    main.with_app(|app| assert!(app.tabs.active().unwrap().dirty));
 }
 
 #[test]
@@ -401,7 +394,7 @@ fn window_close_cancel_aborts_and_no_discards_without_writing() {
     }
 
     assert_ne!(unsafe { IsWindow(main.hwnd) }, 0);
-    main.with_app(|app| assert!(app.tabs.active().dirty));
+    main.with_app(|app| assert!(app.tabs.active().unwrap().dirty));
 
     window::answer_next_close_prompt(|_| document::CloseDecision::Discard);
     unsafe {

@@ -58,7 +58,6 @@ pub fn accessible_children(tab_titles: &[&str]) -> Vec<AccessibleChild> {
         .map(|title| AccessibleChild::Tab((*title).to_owned()))
         .collect::<Vec<_>>();
     children.extend([
-        AccessibleChild::Button("New tab"),
         AccessibleChild::Button("Overflow"),
         AccessibleChild::Button("Minimize"),
         AccessibleChild::Button("Maximize"),
@@ -637,11 +636,10 @@ fn accessible_default_action(
         AccessibleChild::Button(_) => {
             let button = index.checked_sub(tab_count(children))?;
             match button {
-                0 => Some(AccessibleDefaultAction::Command(CommandId::New)),
-                1 => Some(AccessibleDefaultAction::Overflow),
-                2 => Some(AccessibleDefaultAction::SystemCommand(SC_MINIMIZE as usize)),
-                3 => Some(AccessibleDefaultAction::SystemCommand(SC_MAXIMIZE as usize)),
-                4 => Some(AccessibleDefaultAction::SystemCommand(SC_CLOSE as usize)),
+                0 => Some(AccessibleDefaultAction::Overflow),
+                1 => Some(AccessibleDefaultAction::SystemCommand(SC_MINIMIZE as usize)),
+                2 => Some(AccessibleDefaultAction::SystemCommand(SC_MAXIMIZE as usize)),
+                3 => Some(AccessibleDefaultAction::SystemCommand(SC_CLOSE as usize)),
                 _ => None,
             }
         }
@@ -759,11 +757,10 @@ unsafe extern "system" fn accessible_hit_test(
     let id = match target {
         crate::window::titlebar::HitTarget::Tab(index)
         | crate::window::titlebar::HitTarget::CloseTab(index) => Some(index as i32 + 1),
-        crate::window::titlebar::HitTarget::NewTab => Some(tab_count as i32 + 1),
-        crate::window::titlebar::HitTarget::Overflow => Some(tab_count as i32 + 2),
-        crate::window::titlebar::HitTarget::Minimize => Some(tab_count as i32 + 3),
-        crate::window::titlebar::HitTarget::Maximize => Some(tab_count as i32 + 4),
-        crate::window::titlebar::HitTarget::Close => Some(tab_count as i32 + 5),
+        crate::window::titlebar::HitTarget::Overflow => Some(tab_count as i32 + 1),
+        crate::window::titlebar::HitTarget::Minimize => Some(tab_count as i32 + 2),
+        crate::window::titlebar::HitTarget::Maximize => Some(tab_count as i32 + 3),
+        crate::window::titlebar::HitTarget::Close => Some(tab_count as i32 + 4),
         _ => None,
     };
     unsafe { *output = id.map_or_else(RawVariant::empty, RawVariant::integer) };
@@ -857,11 +854,10 @@ unsafe fn child_screen_rect(
         layout.tab(id as usize - 1)
     } else {
         match id as usize - tab_count {
-            1 => layout.new_tab,
-            2 => layout.overflow,
-            3 => layout.minimize,
-            4 => layout.maximize,
-            5 => layout.close,
+            1 => layout.overflow,
+            2 => layout.minimize,
+            3 => layout.maximize,
+            4 => layout.close,
             _ => return None,
         }
     };
@@ -882,10 +878,11 @@ fn native_layout(item: &AccessibleProvider, tabs: usize) -> TitleBarLayout {
     unsafe {
         GetClientRect(item.hwnd, &mut client);
     }
-    TitleBarLayout::calculate(
+    TitleBarLayout::calculate_scrolled(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(item.hwnd) }.max(96),
         tabs,
+        item.selection.scroll_offset(),
     )
 }
 
@@ -946,17 +943,14 @@ mod tests {
     }
 
     #[test]
-    fn title_strip_accessibility_contains_tab_and_five_named_buttons() {
+    fn title_strip_accessibility_contains_tab_and_four_named_buttons() {
         let children = accessible_children(&["Untitled"]);
         assert_eq!(children[0], AccessibleChild::Tab("Untitled".into()));
         let names = children
             .iter()
             .filter_map(AccessibleChild::button_name)
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["New tab", "Overflow", "Minimize", "Maximize", "Close"]
-        );
+        assert_eq!(names, vec!["Overflow", "Minimize", "Maximize", "Close"]);
     }
 
     #[test]
@@ -1072,11 +1066,11 @@ mod tests {
             ))
         );
         assert_eq!(
-            accessible_default_action(&children, 3),
+            accessible_default_action(&children, 2),
             Some(super::AccessibleDefaultAction::Overflow)
         );
         assert_eq!(accessible_default_action(&children, 0), None);
-        assert_eq!(accessible_default_action(&children, 7), None);
+        assert_eq!(accessible_default_action(&children, 6), None);
     }
 
     fn fixture_tabs(count: u64) -> Tabs {

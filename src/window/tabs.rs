@@ -1,18 +1,30 @@
 use crate::document::{CloseCancelled, CloseDecision, Document, DocumentId};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+/// Title-strip state shared with the accessibility provider: the selected tab and how far the
+/// tab strip is scrolled, so both painting and accessibility locate the same tab rectangles.
 #[derive(Clone, Debug)]
 pub(crate) struct TabSelection {
     active: Arc<AtomicUsize>,
+    scroll: Arc<AtomicI32>,
 }
 
 impl TabSelection {
     pub(crate) fn new(active: usize) -> Self {
         Self {
             active: Arc::new(AtomicUsize::new(active)),
+            scroll: Arc::new(AtomicI32::new(0)),
         }
+    }
+
+    pub(crate) fn scroll_offset(&self) -> i32 {
+        self.scroll.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_scroll_offset(&self, offset: i32) -> bool {
+        self.scroll.swap(offset.max(0), Ordering::AcqRel) != offset.max(0)
     }
 
     pub(crate) fn active_index(&self) -> usize {
@@ -139,6 +151,15 @@ impl Tabs {
         self.selection.active_index()
     }
 
+    pub(crate) fn scroll_offset(&self) -> i32 {
+        self.selection.scroll_offset()
+    }
+
+    /// Returns whether the offset changed.
+    pub(crate) fn set_scroll_offset(&self, offset: i32) -> bool {
+        self.selection.set_scroll_offset(offset)
+    }
+
     pub(crate) fn selection(&self) -> TabSelection {
         self.selection.clone()
     }
@@ -147,8 +168,9 @@ impl Tabs {
         self.view.clone()
     }
 
-    pub fn active(&self) -> &Document {
-        &self.documents[self.active_index()]
+    /// The selected document, or `None` once every tab has been closed.
+    pub fn active(&self) -> Option<&Document> {
+        self.documents.get(self.active_index())
     }
 
     pub fn document(&self, id: DocumentId) -> Option<&Document> {
@@ -169,11 +191,12 @@ impl Tabs {
             .map(|document| document.id)
     }
 
-    pub(crate) fn replace_active_untitled(&mut self, document: Document) -> Document {
+    pub(crate) fn replace_active_untitled(&mut self, document: Document) -> Option<Document> {
         let index = self.active_index();
-        let old = std::mem::replace(&mut self.documents[index], document);
+        let active = self.documents.get_mut(index)?;
+        let old = std::mem::replace(active, document);
         self.view.update(&self.documents);
-        old
+        Some(old)
     }
 
     #[cfg(test)]
@@ -224,29 +247,21 @@ impl Tabs {
         Ok(())
     }
 
-    pub fn close_active<F>(
-        &mut self,
-        decision: CloseDecision,
-        replacement: F,
-    ) -> Result<Document, CloseCancelled>
-    where
-        F: FnOnce() -> Document,
-    {
-        if decision == CloseDecision::Cancel {
+    pub fn close_active(&mut self, decision: CloseDecision) -> Result<Document, CloseCancelled> {
+        if decision == CloseDecision::Cancel || self.documents.is_empty() {
             return Err(CloseCancelled);
         }
         let index = self.active_index();
-        if self.documents.len() == 1 {
-            let closed = std::mem::replace(&mut self.documents[0], replacement());
-            self.selection.select(0, 1);
-            self.view.update(&self.documents);
-            return Ok(closed);
-        }
         let closed = self.documents.remove(index);
-        self.selection
-            .select(index.min(self.documents.len() - 1), self.documents.len());
-        self.view.update(&self.documents);
+        self.select_after_removal(index);
         Ok(closed)
+    }
+
+    /// Keeps the successor of a removed tab selected (or its predecessor at the end of the strip).
+    fn select_after_removal(&mut self, removed: usize) {
+        let active = removed.min(self.documents.len().saturating_sub(1));
+        self.selection.active.store(active, Ordering::Release);
+        self.view.update(&self.documents);
     }
 
     pub fn active_close_review(&self) -> Option<CloseReview> {
@@ -261,7 +276,6 @@ impl Tabs {
         &mut self,
         review: CloseReview,
         decision: CloseDecision,
-        replacement: Option<Document>,
     ) -> Result<Document, CloseReviewError> {
         if decision == CloseDecision::Cancel {
             return Err(CloseReviewError::Cancelled);
@@ -280,15 +294,8 @@ impl Tabs {
         if decision == CloseDecision::Save && self.documents[index].dirty {
             return Err(CloseReviewError::Unsaved);
         }
-        let closed = if self.documents.len() == 1 {
-            let replacement = replacement.ok_or(CloseReviewError::MissingReplacement)?;
-            std::mem::replace(&mut self.documents[0], replacement)
-        } else {
-            self.documents.remove(index)
-        };
-        let active = index.min(self.documents.len() - 1);
-        self.selection.select(active, self.documents.len());
-        self.view.update(&self.documents);
+        let closed = self.documents.remove(index);
+        self.select_after_removal(index);
         Ok(closed)
     }
 
@@ -373,8 +380,8 @@ impl Tabs {
         self.view.update(&self.documents);
     }
 
-    pub(crate) fn active_handle(&self) -> &crate::editor::EditorDocument {
-        &self.active().handle
+    pub(crate) fn active_handle(&self) -> Option<&crate::editor::EditorDocument> {
+        self.active().map(|document| &document.handle)
     }
 
     /// Renames the active document's path, e.g. after a successful Save As write. Rejects the
@@ -384,6 +391,9 @@ impl Tabs {
     /// document, so it is accepted without a canonicalization check.
     pub(crate) fn set_active_path(&mut self, path: PathBuf) -> Result<(), DuplicateDocumentPath> {
         let active = self.active_index();
+        if active >= self.documents.len() {
+            return Err(DuplicateDocumentPath(path));
+        }
         if let Ok(candidate) = canonical_key(&path) {
             let collides = self.documents.iter().enumerate().any(|(index, existing)| {
                 index != active
@@ -409,8 +419,10 @@ impl Tabs {
     /// document, so restoring it cannot newly collide with any other tab.
     pub(crate) fn revert_active_path(&mut self, original: Option<PathBuf>) {
         let active = self.active_index();
-        self.documents[active].path = original;
-        self.view.update(&self.documents);
+        if let Some(document) = self.documents.get_mut(active) {
+            document.path = original;
+            self.view.update(&self.documents);
+        }
     }
 }
 
@@ -439,7 +451,6 @@ pub struct CloseReviewKey {
 pub enum CloseReviewError {
     Cancelled,
     Stale,
-    MissingReplacement,
     Unsaved,
 }
 
@@ -514,7 +525,7 @@ mod tests {
         let mut tabs = Tabs::with_document(recovered);
 
         assert!(!tabs.set_active_dirty(false));
-        assert!(tabs.active().dirty);
+        assert!(tabs.active().unwrap().dirty);
         assert!(tabs.take_active_recovery_origin().is_some());
         assert!(tabs.set_active_dirty(false));
     }
@@ -585,7 +596,10 @@ mod tests {
 
         tabs.set_active_path(target.clone()).unwrap();
 
-        assert_eq!(tabs.active().path.as_deref(), Some(target.as_path()));
+        assert_eq!(
+            tabs.active().unwrap().path.as_deref(),
+            Some(target.as_path())
+        );
         assert!(view.snapshot().revision > before);
         fs::remove_dir_all(root).unwrap();
     }
@@ -607,7 +621,10 @@ mod tests {
         let mut tabs = Tabs::with_document(document(1));
 
         assert!(tabs.set_active_path(target.clone()).is_ok());
-        assert_eq!(tabs.active().path.as_deref(), Some(target.as_path()));
+        assert_eq!(
+            tabs.active().unwrap().path.as_deref(),
+            Some(target.as_path())
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -633,7 +650,7 @@ mod tests {
 
         let alternate = root.join(".").join("other.txt");
         assert!(tabs.set_active_path(alternate).is_err());
-        assert_eq!(tabs.active().path, None);
+        assert_eq!(tabs.active().unwrap().path, None);
         fs::remove_dir_all(root).unwrap();
     }
 }

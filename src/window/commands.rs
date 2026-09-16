@@ -19,13 +19,24 @@ pub enum CommandId {
     LanguageJson,
     LanguageMarkdown,
     Exit,
+    CloseAllTabs,
+}
+
+impl CommandId {
+    /// Commands that act on the active document, and so do nothing while no tab is open.
+    pub const fn needs_document(self) -> bool {
+        !matches!(
+            self,
+            Self::New | Self::Open | Self::Exit | Self::CloseAllTabs
+        )
+    }
 }
 
 impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 18] = [
+        const COMMANDS: [CommandId; 19] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -44,6 +55,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::LanguageJson,
             CommandId::LanguageMarkdown,
             CommandId::Exit,
+            CommandId::CloseAllTabs,
         ];
         COMMANDS
             .into_iter()
@@ -75,5 +87,8 @@ mod tests {
         assert_eq!(CommandId::Exit as u16, 117);
         assert_eq!(CommandId::try_from(103), Ok(CommandId::SaveAs));
         assert!(CommandId::try_from(99).is_err());
+        assert_eq!(CommandId::try_from(118), Ok(CommandId::CloseAllTabs));
+        assert!(!CommandId::New.needs_document());
+        assert!(CommandId::Paste.needs_document());
     }
 }

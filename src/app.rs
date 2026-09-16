@@ -48,6 +48,8 @@ pub struct App {
     pub(crate) status: Option<StatusModel>,
     pub(crate) title_fonts: Option<TitleFonts>,
     pub(crate) title_pointer: PointerState,
+    /// While the tab scroll thumb is dragged: where along the thumb the pointer grabbed it.
+    pub(crate) tab_thumb_grab: Option<i32>,
     pub(crate) dark_frame_applied: bool,
     pub(crate) notifications: NotificationCenter,
     pub(crate) launch_open_completed: bool,
@@ -91,6 +93,7 @@ impl App {
             status: None,
             title_fonts: None,
             title_pointer: PointerState::default(),
+            tab_thumb_grab: None,
             dark_frame_applied: false,
             notifications: NotificationCenter::new(),
             launch_open_completed: false,
