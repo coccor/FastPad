@@ -227,6 +227,7 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_PAINT => {
+            sync_window_title(hwnd);
             let paint_title_strip = |hwnd, _, _, _| {
                 let (titles, active, scroll, empty) = tab_snapshot(hwnd);
                 let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
@@ -1325,6 +1326,41 @@ fn preview_buttons_visible(hwnd: HWND) -> bool {
 }
 
 /// Titles, active index, scroll offset, and whether the editor is hidden because no tab is open.
+/// The frame's window text, which the taskbar button and Alt+Tab show: the active tab's title as
+/// the tab strip paints it, followed by the app name.
+fn window_title(active_tab: Option<&str>) -> String {
+    active_tab.map_or_else(
+        || "FastPad".to_owned(),
+        |title| format!("{title} - FastPad"),
+    )
+}
+
+/// Brings the window text in line with the active tab. Runs on every frame paint, since every tab
+/// change (switch, open, close, save, dirty state) repaints the title strip.
+fn sync_window_title(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextW, SetWindowTextW};
+    let Some(title) = (unsafe { app_ptr(hwnd) }).map(|app| {
+        window_title(
+            unsafe { app.as_ref() }
+                .tabs
+                .active()
+                .map(Document::title)
+                .as_deref(),
+        )
+    }) else {
+        return;
+    };
+    let wanted = title.encode_utf16().collect::<Vec<_>>();
+    // One spare unit so a longer current title never reads as equal after truncation.
+    let mut current = vec![0u16; wanted.len() + 2];
+    let len = unsafe { GetWindowTextW(hwnd, current.as_mut_ptr(), current.len() as i32) };
+    if current[..len.max(0) as usize] != wanted[..] {
+        unsafe {
+            SetWindowTextW(hwnd, wide_null(&title).as_ptr());
+        }
+    }
+}
+
 fn tab_snapshot(hwnd: HWND) -> (Vec<String>, usize, i32, bool) {
     unsafe { app_ptr(hwnd) }
         .map(|app| {
@@ -3667,6 +3703,34 @@ mod tests {
             )
         };
         assert_eq!(String::from_utf16_lossy(&text[..len as usize]), "FastPad");
+    }
+
+    #[test]
+    fn the_window_title_follows_the_active_tab_and_its_dirty_state() {
+        // Break caught: the taskbar button keeps showing a stale or bare title while the tab strip
+        // shows which file is open and whether it has unsaved changes.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let window_text = || {
+            unsafe {
+                SendMessageW(window.hwnd, WM_PAINT, 0, 0);
+            }
+            let mut text = [0u16; 64];
+            let len = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                    window.hwnd,
+                    text.as_mut_ptr(),
+                    text.len() as i32,
+                )
+            };
+            String::from_utf16_lossy(&text[..len as usize])
+        };
+
+        assert_eq!(window_text(), "Untitled - FastPad");
+        editor.set_text("dirty").unwrap();
+        assert_eq!(window_text(), "Untitled * - FastPad");
+        assert_eq!(super::window_title(None), "FastPad");
     }
 
     #[test]
