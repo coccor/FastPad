@@ -2,6 +2,7 @@
 //! Nothing here runs until the user opens a preview.
 
 pub mod colors;
+pub mod dwrite;
 pub mod heights;
 pub mod incremental;
 pub mod links;
