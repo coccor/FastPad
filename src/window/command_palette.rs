@@ -44,7 +44,7 @@ const fn entry(label: &'static str, command: CommandId) -> PaletteEntry {
 
 /// Every command reachable from the palette, in the order an empty query lists them. `SelectTabN`
 /// is positional and the palette itself is already open, so neither is listed.
-pub(crate) const ENTRIES: [PaletteEntry; 42] = [
+pub(crate) const ENTRIES: [PaletteEntry; 45] = [
     entry("File: New tab", CommandId::New),
     entry("File: Open...", CommandId::Open),
     entry("File: Save", CommandId::Save),
@@ -63,6 +63,9 @@ pub(crate) const ENTRIES: [PaletteEntry; 42] = [
     entry("Language: Plain text", CommandId::LanguagePlainText),
     entry("Language: JSON", CommandId::LanguageJson),
     entry("Language: Markdown", CommandId::LanguageMarkdown),
+    entry("Markdown Preview: Side by Side", CommandId::MarkdownPreviewSide),
+    entry("Markdown Preview: Full", CommandId::MarkdownPreviewFull),
+    entry("Markdown Preview: Close", CommandId::MarkdownPreviewClose),
     entry("View: Next tab", CommandId::NextTab),
     entry("View: Previous tab", CommandId::PreviousTab),
     entry("View: Zoom in", CommandId::ZoomIn),
@@ -770,8 +773,11 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.command == command)
                 .count();
-            let expected =
-                usize::from(command.tab_index().is_none() && command != CommandId::CommandPalette);
+            let expected = usize::from(
+                command.tab_index().is_none()
+                    && command != CommandId::CommandPalette
+                    && command != CommandId::MarkdownPreviewCycle,
+            );
             assert_eq!(listed, expected, "{command:?}");
         }
     }
@@ -852,5 +858,27 @@ mod tests {
             Some("Ctrl+Shift+P")
         );
         assert_eq!(shortcut_text(CommandId::Copy), None);
+    }
+
+    #[test]
+    fn markdown_preview_cycles_with_ctrl_shift_v_and_lists_three_palette_entries() {
+        assert_eq!(
+            shortcut_text(CommandId::MarkdownPreviewCycle).as_deref(),
+            Some("Ctrl+Shift+V")
+        );
+        let labels = filter_entries("markdown preview", |_| true)
+            .into_iter()
+            .map(|entry| entry.command)
+            .collect::<Vec<_>>();
+        for command in [
+            CommandId::MarkdownPreviewSide,
+            CommandId::MarkdownPreviewFull,
+            CommandId::MarkdownPreviewClose,
+        ] {
+            assert!(labels.contains(&command), "{command:?}");
+        }
+        assert!(
+            filter_entries("markdown preview", |command| !command.is_markdown_preview()).is_empty()
+        );
     }
 }

@@ -53,6 +53,10 @@ pub enum CommandId {
     ThemeCatppuccinFrappe,
     ThemeCatppuccinMacchiato,
     ThemeCatppuccinMocha,
+    MarkdownPreviewCycle,
+    MarkdownPreviewSide,
+    MarkdownPreviewFull,
+    MarkdownPreviewClose,
 }
 
 impl CommandId {
@@ -84,6 +88,16 @@ impl CommandId {
         )
     }
 
+    pub const fn is_markdown_preview(self) -> bool {
+        matches!(
+            self,
+            Self::MarkdownPreviewCycle
+                | Self::MarkdownPreviewSide
+                | Self::MarkdownPreviewFull
+                | Self::MarkdownPreviewClose
+        )
+    }
+
     /// The zero-based tab a `SelectTabN` command activates.
     pub const fn tab_index(self) -> Option<usize> {
         let first = Self::SelectTab1 as u16;
@@ -100,7 +114,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 52] = [
+        const COMMANDS: [CommandId; 56] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -153,6 +167,10 @@ impl TryFrom<u16> for CommandId {
             CommandId::ThemeCatppuccinFrappe,
             CommandId::ThemeCatppuccinMacchiato,
             CommandId::ThemeCatppuccinMocha,
+            CommandId::MarkdownPreviewCycle,
+            CommandId::MarkdownPreviewSide,
+            CommandId::MarkdownPreviewFull,
+            CommandId::MarkdownPreviewClose,
         ];
         COMMANDS
             .into_iter()
@@ -204,5 +222,16 @@ mod tests {
         assert_eq!(CommandId::SelectTab9.tab_index(), Some(8));
         assert_eq!(CommandId::NextTab.tab_index(), None);
         assert_eq!(CommandId::ZoomIn.tab_index(), None);
+    }
+
+    #[test]
+    fn markdown_preview_commands_have_stable_values() {
+        assert_eq!(CommandId::try_from(152), Ok(CommandId::MarkdownPreviewCycle));
+        assert_eq!(CommandId::try_from(153), Ok(CommandId::MarkdownPreviewSide));
+        assert_eq!(CommandId::try_from(154), Ok(CommandId::MarkdownPreviewFull));
+        assert_eq!(CommandId::try_from(155), Ok(CommandId::MarkdownPreviewClose));
+        assert!(CommandId::MarkdownPreviewSide.needs_document());
+        assert!(CommandId::MarkdownPreviewClose.is_markdown_preview());
+        assert!(!CommandId::Save.is_markdown_preview());
     }
 }
