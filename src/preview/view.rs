@@ -67,6 +67,8 @@ pub struct PreviewStats {
     pub revision: u64,
     pub first_frame_micros: u64,
     pub last_update_micros: u64,
+    /// Updates whose frame has been painted; `last_update_micros` belongs to the latest one.
+    pub painted_updates: u64,
 }
 
 /// `Debug`, `PartialEq`, and `Eq` are written by hand: windows-sys `RECT` derives none of them.
@@ -139,7 +141,9 @@ struct ViewState {
     live_resize: bool,
     /// Set after a failed paint schedules its one retry; cleared by the next successful paint.
     paint_retried: bool,
-    anchors: Vec<(String, usize)>,
+    /// Heading slugs and their block indices; `None` until an anchor lookup needs them after the
+    /// document changed.
+    anchors: Option<Vec<(String, usize)>>,
     stats: PreviewStats,
     opened_at: Option<Instant>,
     update_started: Option<Instant>,
@@ -187,7 +191,7 @@ impl PreviewView {
             paused: false,
             live_resize: false,
             paint_retried: false,
-            anchors: Vec::new(),
+            anchors: None,
             stats: PreviewStats::default(),
             opened_at: None,
             update_started: None,
@@ -331,8 +335,7 @@ impl PreviewView {
 
     pub fn scroll_to_anchor(&self, anchor: &str) -> bool {
         self.with(|state| {
-            let Some(index) = state
-                .anchors
+            let Some(index) = anchors(state)
                 .iter()
                 .find(|(slug, _)| slug == anchor)
                 .map(|(_, index)| *index)
@@ -433,21 +436,36 @@ fn bar_height(state: &ViewState) -> f32 {
     if state.paused { PAUSED_BAR_HEIGHT } else { 0.0 }
 }
 
-fn estimates(state: &ViewState) -> Vec<f32> {
+/// Estimated heights for `range` of the document's blocks.
+fn estimates(state: &ViewState, range: std::ops::Range<usize>) -> Vec<f32> {
     let line_height = state.fonts.body_size * 1.5;
     let gap = 16.0 * state.fonts.unit();
-    state
-        .document
-        .blocks
+    state.document.blocks[range]
         .iter()
         .map(|block| estimate_height(block.lines.len(), line_height, gap))
         .collect()
 }
 
+fn anchors(state: &mut ViewState) -> &[(String, usize)] {
+    state.anchors.get_or_insert_with(|| {
+        let mut slugs = SlugSet::default();
+        state
+            .document
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| match &block.kind {
+                BlockKind::Heading { text, .. } => Some((slugs.unique(text.plain_text()), index)),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
 /// Forgets every layout for a new document: heights fall back to estimates.
 fn reset_layouts(state: &mut ViewState) {
     state.layouts = (0..state.document.blocks.len()).map(|_| None).collect();
-    let estimates = estimates(state);
+    let estimates = estimates(state, 0..state.document.blocks.len());
     state.heights.reset(estimates);
     state.hover = None;
     state.pressed = None;
@@ -486,12 +504,18 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
             let (_, view_height) = view_size(state.hwnd);
             let view_top = state.scroll_y;
             let view_bottom = view_top + view_height;
+            // Only the replaced range is visited: running sums past it stay stale until paint
+            // needs them, so an edit costs its own size, not the document's.
             let old_top = state.heights.top(old.start);
-            let old_bottom = state.heights.top(old.end);
-            let old_total = state.heights.total();
+            let old_height = old
+                .clone()
+                .map(|index| state.heights.height(index))
+                .sum::<f32>();
+            let old_bottom = old_top + old_height;
             state.layouts.splice(old.clone(), new.clone().map(|_| None));
-            let all = estimates(state);
-            state.heights.splice(old.clone(), &all[new.clone()]);
+            let new_estimates = estimates(state, new.clone());
+            let new_height = new_estimates.iter().sum::<f32>();
+            state.heights.splice(old.clone(), &new_estimates);
             let delta = new.len() as isize - old.len() as isize;
             state.h_scroll = state
                 .h_scroll
@@ -510,21 +534,13 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
             state.pressed = None;
             state.focus = None;
             let on_screen = old_top < view_bottom && old_bottom >= view_top;
-            let total_changed = (state.heights.total() - old_total).abs() > 0.01;
+            let total_changed = (new_height - old_height).abs() > 0.01;
             on_screen || old.len() != new.len() || total_changed
         }
     };
-    let mut slugs = SlugSet::default();
-    state.anchors = state
-        .document
-        .blocks
-        .iter()
-        .enumerate()
-        .filter_map(|(index, block)| match &block.kind {
-            BlockKind::Heading { text, .. } => Some((slugs.unique(text.plain_text()), index)),
-            _ => None,
-        })
-        .collect();
+    // Rebuilt on the next anchor lookup: slugging every heading on every keystroke's update is
+    // O(document).
+    state.anchors = None;
     state.stats.block_count = state.document.blocks.len();
     state.stats.revision = state.document.revision;
     if repaint {
@@ -774,6 +790,7 @@ fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             }
             if let Some(started) = state.update_started.take() {
                 state.stats.last_update_micros = started.elapsed().as_micros().max(1) as u64;
+                state.stats.painted_updates += 1;
             }
             let links = visible_links(state);
             *state
@@ -1447,6 +1464,44 @@ mod tests {
         );
         repaint(&view);
         assert_eq!(view.stats().last_update_micros, before);
+        view.destroy();
+    }
+
+    #[test]
+    fn anchors_follow_incremental_edits() {
+        // Break caught: anchors are rebuilt lazily; a stale list would miss a heading typed into
+        // the document or point a moved heading at its old block.
+        let parent = TestWindow::new(800, 600);
+        let mut source = (0..100)
+            .map(|index| format!("para {index}\n\n"))
+            .collect::<String>();
+        source.push_str("## Deep Heading\n");
+        let view = view_with(&parent, &source);
+        assert!(view.scroll_to_anchor("deep-heading"));
+        let position = source.find("para 50").unwrap();
+        let inserted = "## Added Heading\n\n";
+        source.insert_str(position, inserted);
+        let update = view.apply_edits(
+            source.as_str(),
+            &[Edit {
+                position,
+                removed: 0,
+                inserted: inserted.len(),
+                lines_delta: 2,
+            }],
+            Instant::now(),
+            false,
+        );
+        assert!(
+            matches!(update, Some(Update::Replaced { .. })),
+            "{update:?}"
+        );
+        view.scroll_to_line(0);
+        repaint(&view);
+        assert!(view.scroll_to_anchor("added-heading"));
+        assert_eq!(view.top_line(), 100);
+        assert!(view.scroll_to_anchor("deep-heading"));
+        assert!(view.top_line() >= 152);
         view.destroy();
     }
 }

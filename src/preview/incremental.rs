@@ -194,17 +194,30 @@ impl PreviewDocument {
             if text.contains("]:") {
                 return None;
             }
-            let parsed = parse_blocks(&text, start, source.line_of(start), &self.refdefs);
+            let mut parsed = parse_blocks(&text, start, source.line_of(start), &self.refdefs);
             let start_ok = low == 0 || parsed.first() == Some(&self.blocks[low]);
             let end_ok = high == count || parsed.last() == Some(&self.blocks[high - 1]);
             if start_ok && end_ok {
-                let new = low..low + parsed.len();
-                self.blocks.splice(low..high, parsed);
+                // Report only the blocks that differ: the sentinels (and any other block the edit
+                // left identical) keep their layouts in the view.
+                let previous = &self.blocks[low..high];
+                let same_start = previous
+                    .iter()
+                    .zip(&parsed)
+                    .take_while(|(old, new)| old == new)
+                    .count();
+                let same_end = previous[same_start..]
+                    .iter()
+                    .rev()
+                    .zip(parsed[same_start..].iter().rev())
+                    .take_while(|(old, new)| old == new)
+                    .count();
+                let changed = same_start..parsed.len() - same_end;
+                let old = low + same_start..high - same_end;
+                let new = low + same_start..low + changed.end;
+                self.blocks.splice(old.clone(), parsed.drain(changed));
                 self.revision += 1;
-                return Some(Update::Replaced {
-                    old: low..high,
-                    new,
-                });
+                return Some(Update::Replaced { old, new });
             }
             if !start_ok {
                 low = low.saturating_sub(1);
@@ -228,7 +241,12 @@ impl PreviewDocument {
             }) {
                 return None;
             }
-            for block in &mut self.blocks {
+            // Blocks ending before the edit keep their bytes and lines; skipping them by binary
+            // search halves the work for an edit in the middle of a large document.
+            let first = self
+                .blocks
+                .partition_point(|block| block.bytes.end < edit.position);
+            for block in &mut self.blocks[first..] {
                 block.bytes = shift_range(block.bytes.clone(), edit);
                 if block.bytes.start >= edit.position + edit.inserted {
                     block.lines = shift_lines(block.lines.clone(), edit.lines_delta);
@@ -401,7 +419,11 @@ mod tests {
         let Update::Replaced { old, new } = update else {
             panic!("expected a partial update, got {update:?}");
         };
-        assert!(old.len() <= 5 && new.len() <= 5, "{old:?} {new:?}");
+        assert_eq!(
+            (old, new),
+            (4..5, 4..5),
+            "only the edited paragraph is reported"
+        );
         assert_eq!(document.blocks, parse_document(&text).0);
     }
 

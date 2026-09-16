@@ -33,8 +33,11 @@ cargo test --release --test markdown_preview -- --ignored --test-threads=1 --noc
 ```
 
 Targets: preview open on 100 KB < 50 ms p95; one-paragraph update in a 1 MB document < 2 ms p95;
-keystroke cost with the side-by-side preview open within 10% (+100 µs) of no preview; private
-memory within 2 MB of never having opened the preview after closing it.
+keystroke cost with the side-by-side preview open within 10% (+100 µs) of no preview; no private
+memory growth across repeated open/close cycles (median of five closes within 2 MB of a reference
+close taken after two warm-up cycles). The first open loads Direct2D, DirectWrite, Direct3D, and
+the GPU driver for the rest of the session, about 45 MB of private bytes that closing does not
+return.
 
 Startup with a Markdown file is compared against the pre-preview baseline with
 `./tools/benchmark.ps1 -LaunchFile benchmarks/fixtures/sample.md` on both builds and
