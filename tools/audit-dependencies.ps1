@@ -7,7 +7,18 @@ $ErrorActionPreference = "Stop"
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 $AllowedRoots = @(
     [pscustomobject]@{ Name = "windows-sys"; Version = "0.61.2" },
-    [pscustomobject]@{ Name = "serde_json"; Version = "1.0.151" }
+    [pscustomobject]@{ Name = "serde_json"; Version = "1.0.151" },
+    [pscustomobject]@{ Name = "pulldown-cmark"; Version = "0.13.4" },
+    [pscustomobject]@{ Name = "windows"; Version = "0.62.2" },
+    [pscustomobject]@{ Name = "windows-numerics"; Version = "0.3.1" }
+)
+# The `windows` crate is allowed only as the pinned direct dependency, with exactly these features.
+# Win32/Win32_Graphics/Win32_Graphics_Dxgi/Win32_System are namespace features that cargo metadata
+# reports as implied by the leaf features below; they add no API surface of their own.
+$AllowedWindowsFeatures = @(
+    "Win32", "Win32_Foundation", "Win32_Graphics", "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Imaging", "Win32_System", "Win32_System_Com"
 )
 $RegistrySource = "registry+https://github.com/rust-lang/crates.io-index"
 
@@ -19,7 +30,7 @@ $RejectedPatterns = @(
     '^(self_update|self-replace|update-informer|velopack|tauri-plugin-updater|squirrel.*)$',
     '^(sentry|sentry-.*|opentelemetry|opentelemetry-.*|posthog.*|segment|datadog.*|rudderstack|telemetry.*|metrics-exporter-.*)$',
     '^(tokio|tokio-.*|async-std|smol|async-executor|async-io|async-global-executor|futures|futures-executor|actix|actix-.*|glommio|monoio)$',
-    '^(winit|egui|eframe|iced|iced_.*|gtk|gtk4|relm.*|tauri|tauri-.*|wry|tao|druid|slint|slint-.*|fltk|fltk-.*|native-windows-gui|winsafe|windows|webview2|webview2-com|dioxus.*|makepad.*|floem|xilem|vizia|imgui.*|sdl2|glutin)$'
+    '^(winit|egui|eframe|iced|iced_.*|gtk|gtk4|relm.*|tauri|tauri-.*|wry|tao|druid|slint|slint-.*|fltk|fltk-.*|native-windows-gui|winsafe|webview2|webview2-com|dioxus.*|makepad.*|floem|xilem|vizia|imgui.*|sdl2|glutin)$'
 )
 
 Push-Location $RepositoryRoot
@@ -84,10 +95,21 @@ foreach ($node in $metadata.resolve.nodes) {
     $package = $packagesById[$node.id]
     $label = "$($package.name) $($package.version)"
     if (-not $closure.Contains($node.id)) {
-        $failures.Add("$label is outside the windows-sys/serde_json closure")
+        $failures.Add("$label is outside the allowed dependency closure")
     }
     if ($package.source -ne $RegistrySource) {
         $failures.Add("$label does not come from crates.io ($($package.source))")
+    }
+    if ($package.name -eq "windows") {
+        $isRoot = $directDependencies | Where-Object { $_.id -eq $node.id }
+        if ($null -eq $isRoot) {
+            $failures.Add("$label may only appear as FastPad's direct dependency")
+        }
+        foreach ($feature in $node.features) {
+            if ($AllowedWindowsFeatures -notcontains $feature) {
+                $failures.Add("$label enables feature $feature, which is not allowed")
+            }
+        }
     }
     foreach ($pattern in $RejectedPatterns) {
         if ($package.name -match $pattern) {
@@ -103,4 +125,4 @@ if ($failures.Count -gt 0) {
 
 $closure | ForEach-Object { $packagesById[$_] } | Sort-Object name |
     ForEach-Object { Write-Output "allowed: $($_.name) $($_.version) ($($_.license))" }
-Write-Output "Dependency audit passed: $($closure.Count) crates in the windows-sys $($AllowedRoots[0].Version) / serde_json $($AllowedRoots[1].Version) closure."
+Write-Output "Dependency audit passed: $($closure.Count) crates in the allowed dependency closure."

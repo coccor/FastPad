@@ -15,8 +15,9 @@ license.
 
 ## Rust crates
 
-FastPad depends directly on `windows-sys 0.61.2` and `serde_json 1.0.151`. The complete locked
-dependency closure, with the license expressions reported by `cargo metadata --locked`, is:
+FastPad depends directly on windows-sys 0.61.2, serde_json 1.0.151, pulldown-cmark 0.13.4, windows
+0.62.2, and windows-numerics 0.3.1. The complete locked dependency closure, with the license
+expressions reported by `cargo metadata --locked`, is:
 
 | Crate | Version | License | Role |
 |---|---|---|---|
@@ -33,6 +34,20 @@ dependency closure, with the license expressions reported by `cargo metadata --l
 | `quote` | 1.0.47 | MIT OR Apache-2.0 | Build-time procedural macro support |
 | `syn` | 3.0.4 | MIT OR Apache-2.0 | Build-time procedural macro support |
 | `unicode-ident` | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | Build-time procedural macro support |
+| `pulldown-cmark` | 0.13.4 | MIT | Markdown preview parser (linked) |
+| `bitflags` | 2.13.2 | MIT OR Apache-2.0 | `pulldown-cmark` dependency (linked) |
+| `unicase` | 2.9.0 | MIT OR Apache-2.0 | `pulldown-cmark` dependency (linked) |
+| `windows` | 0.62.2 | MIT OR Apache-2.0 | Direct2D/DirectWrite/WIC interface bindings (linked) |
+| `windows-core` | 0.62.2 | MIT OR Apache-2.0 | Direct2D/DirectWrite/WIC interface bindings (linked) |
+| `windows-result` | 0.4.1 | MIT OR Apache-2.0 | Direct2D/DirectWrite/WIC interface bindings (linked) |
+| `windows-strings` | 0.5.1 | MIT OR Apache-2.0 | Direct2D/DirectWrite/WIC interface bindings (linked) |
+| `windows-numerics` | 0.3.1 | MIT OR Apache-2.0 | Direct2D/DirectWrite/WIC interface bindings (linked) |
+| `windows-future` | 0.3.2 | MIT OR Apache-2.0 | `windows` dependency (linked only if referenced) |
+| `windows-threading` | 0.2.1 | MIT OR Apache-2.0 | `windows` dependency (linked only if referenced) |
+| `windows-collections` | 0.3.2 | MIT OR Apache-2.0 | `windows` dependency (linked only if referenced) |
+| `windows-implement` | 0.60.2 | MIT OR Apache-2.0 | Build-time procedural macro |
+| `windows-interface` | 0.59.3 | MIT OR Apache-2.0 | Build-time procedural macro |
+| `syn` | 2.0.119 | MIT OR Apache-2.0 | Build-time procedural macro |
 
 FastPad uses these crates under the MIT license option where a choice is offered; `unicode-ident`
 additionally carries the Unicode-3.0 license for its Unicode data tables. Build-time procedural

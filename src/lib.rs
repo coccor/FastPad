@@ -11,6 +11,7 @@ pub mod languages;
 pub mod launch;
 pub mod perf;
 pub mod platform;
+pub mod preview;
 pub mod recovery;
 pub mod window;
 

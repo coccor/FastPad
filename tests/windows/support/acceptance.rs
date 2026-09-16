@@ -35,6 +35,7 @@ use windows_sys::core::BOOL;
 
 const LEXILLA_DLL: &str = "Lexilla.dll";
 const NETWORK_IMPORTS: [&str; 4] = ["ws2_32.dll", "winhttp.dll", "wininet.dll", "urlmon.dll"];
+const PREVIEW_IMPORTS: [&str; 3] = ["d2d1.dll", "dwrite.dll", "windowscodecs.dll"];
 const BROWSER_MODULES: [&str; 10] = [
     "WebView2Loader.dll",
     "EmbeddedBrowserWebView.dll",
@@ -267,6 +268,31 @@ impl AcceptanceHarness {
             assert!(
                 !imports.iter().any(|name| name == forbidden),
                 "{} imports network library {forbidden}: {imports:?}",
+                binary.display()
+            );
+        }
+    }
+
+    pub fn assert_no_preview_imports(&self) {
+        let dumpbin = locate_dumpbin();
+        let binary = Path::new(env!("CARGO_BIN_EXE_fastpad"));
+        let output = run_bounded(
+            Command::new(&dumpbin)
+                .arg("/nologo")
+                .arg("/imports")
+                .arg(binary),
+            Duration::from_secs(120),
+        )
+        .unwrap_or_else(|error| panic!("dumpbin /imports {} failed: {error}", binary.display()));
+        let imports = imported_dlls(&output);
+        assert!(
+            imports.iter().any(|name| name == "kernel32.dll"),
+            "dumpbin output had no KERNEL32 import; parsing failed:\n{output}"
+        );
+        for forbidden in PREVIEW_IMPORTS {
+            assert!(
+                !imports.iter().any(|name| name == forbidden),
+                "{} statically imports preview library {forbidden}: {imports:?}",
                 binary.display()
             );
         }

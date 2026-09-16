@@ -5,6 +5,17 @@ edition = "2024"
 
 [dependencies]
 serde_json = "=1.0.151"
+pulldown-cmark = { version = "=0.13.4", default-features = false }
+windows = { version = "=0.62.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+] }
+windows-numerics = { version = "=0.3.1", default-features = false }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
@@ -102,3 +113,7 @@ path = "tests/windows/recovery.rs"
 [[test]]
 name = "single_instance"
 path = "tests/windows/single_instance.rs"
+
+[[test]]
+name = "markdown_preview"
+path = "tests/windows/markdown_preview.rs"
