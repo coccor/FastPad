@@ -1,6 +1,7 @@
 //! Markdown preview: a block model, incremental reparsing, and a lazily created Direct2D view.
 //! Nothing here runs until the user opens a preview.
 
+pub mod heights;
 pub mod incremental;
 pub mod links;
 pub mod model;
