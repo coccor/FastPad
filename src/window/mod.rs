@@ -10,6 +10,7 @@ mod modal;
 pub mod notification;
 pub mod palette;
 pub(crate) mod panel;
+pub(crate) mod preview_host;
 pub mod status;
 pub mod tabs;
 pub mod titlebar;

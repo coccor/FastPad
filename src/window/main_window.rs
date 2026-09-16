@@ -162,6 +162,10 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_SETFOCUS => {
+            if let Some(preview) = crate::window::preview_host::full_view_hwnd(hwnd) {
+                unsafe { SetFocus(preview) };
+                return 0;
+            }
             // With no tab open the editor is hidden and the frame itself keeps the focus, as it
             // does in menu mode to take the menu keys.
             if menu_mode(hwnd).is_none()
@@ -234,7 +238,9 @@ unsafe extern "system" fn main_window_proc(
                             fonts,
                             pointer,
                             menu: menu_mode(hwnd).map(|mode| (mode, headings.as_slice())),
-                            preview: None,
+                            preview: preview_buttons_visible(hwnd)
+                                .then(|| crate::window::preview_host::mode(hwnd)),
+                            divider: crate::window::preview_host::divider_rect(hwnd),
                         },
                     )
                 };
@@ -269,15 +275,23 @@ unsafe extern "system" fn main_window_proc(
             crate::window::titlebar::constrain_maximized_window(hwnd, lparam)
         },
         WM_MOUSEMOVE => {
+            if crate::window::preview_host::drag_divider(
+                hwnd,
+                (lparam as u32 & 0xffff) as u16 as i16 as i32,
+            ) {
+                return 0;
+            }
             hover_menu_heading(hwnd, lparam);
             drag_tab_thumb(hwnd, lparam);
             crate::window::titlebar::track_pointer_leave(hwnd, false);
             let target = client_title_target(hwnd, lparam);
             update_title_pointer(hwnd, |pointer| pointer.hover(target));
+            crate::window::preview_host::button_hover(hwnd, target);
             0
         }
         WM_MOUSELEAVE => {
             update_title_pointer(hwnd, |pointer| pointer.leave(false));
+            crate::window::preview_host::button_hover(hwnd, None);
             0
         }
         WM_NCMOUSEMOVE => {
@@ -290,14 +304,18 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_NCMOUSELEAVE => {
             update_title_pointer(hwnd, |pointer| pointer.leave(true));
+            crate::window::preview_host::button_hover(hwnd, None);
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_LBUTTONDOWN => {
+            let (x, y) = (
+                (lparam as u32 & 0xffff) as u16 as i16 as i32,
+                ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+            );
+            if crate::window::preview_host::begin_divider_drag(hwnd, x, y) {
+                return 0;
+            }
             if menu_mode(hwnd).is_some() {
-                let (x, y) = (
-                    (lparam as u32 & 0xffff) as u16 as i16 as i32,
-                    ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
-                );
                 match menu_band::heading_at(&menu_headings(hwnd), x, y) {
                     Some(index) => {
                         open_menu(hwnd, index);
@@ -377,6 +395,9 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_LBUTTONUP => {
+            if crate::window::preview_host::end_divider_drag(hwnd) {
+                return 0;
+            }
             update_title_pointer(hwnd, |pointer| pointer.release(None).0);
             if end_tab_thumb_drag(hwnd) {
                 return 0;
@@ -401,6 +422,10 @@ unsafe extern "system" fn main_window_proc(
                     execute_command(hwnd, CommandId::CloseTab);
                 }
                 crate::window::titlebar::HitTarget::Tab(index) => activate_tab(hwnd, index),
+                target @ (crate::window::titlebar::HitTarget::PreviewSide
+                | crate::window::titlebar::HitTarget::PreviewFull) => {
+                    crate::window::preview_host::click_button(hwnd, target)
+                }
                 _ => {}
             }
             0
@@ -504,6 +529,19 @@ unsafe extern "system" fn main_window_proc(
             }
             0
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR
+            if crate::window::preview_host::cursor_over_divider(hwnd) =>
+        {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(
+                    windows_sys::Win32::UI::WindowsAndMessaging::LoadCursorW(
+                        std::ptr::null_mut(),
+                        windows_sys::Win32::UI::WindowsAndMessaging::IDC_SIZEWE,
+                    ),
+                )
+            };
+            1
+        }
         WM_NCDESTROY => {
             let app = unsafe { take_app(hwnd) };
             if let Some(app) = app.as_ref() {
@@ -524,6 +562,10 @@ unsafe extern "system" fn main_window_proc(
             }
             if message == crate::window::WM_FASTPAD_IPC_REQUEST {
                 return handle_ipc_requests(hwnd);
+            }
+            if message == crate::window::WM_FASTPAD_PREVIEW_ESCAPE {
+                crate::window::preview_host::escape(hwnd);
+                return 0;
             }
             if message == crate::window::WM_FASTPAD_DIAGNOSTIC_JSON_COUNT
                 && unsafe { app_ptr(hwnd) }
@@ -628,7 +670,7 @@ fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
     }
 }
 
-fn input_pending() -> bool {
+pub(crate) fn input_pending() -> bool {
     const STATUS_SHIFT: u32 = 16;
     let queue_status = input_queue_status_mask();
     let pending = unsafe {
@@ -793,7 +835,7 @@ unsafe fn request_input_priority(hwnd: HWND) {
     }
 }
 
-unsafe fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
+pub(crate) unsafe fn editor_hwnd(hwnd: HWND) -> Option<HWND> {
     // SAFETY: The App pointer is used only to copy out the child HWND; no reference crosses into
     // any subsequent Win32 call.
     let app = unsafe { app_ptr(hwnd) }?;
@@ -813,7 +855,7 @@ fn with_editor(hwnd: HWND, action: impl FnOnce(&Editor)) {
 /// Repositions the editor (and the find bar, if visible) to account for the title strip and an
 /// optional find/replace bar reserved above it. The sole layout choke point for both; extends the
 /// pre-Task-12 `WM_SIZE` editor-only positioning rather than duplicating it.
-fn layout_editor_and_find_bar(hwnd: HWND) {
+pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     layout_command_palette(hwnd);
     let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
         return;
@@ -835,15 +877,24 @@ fn layout_editor_and_find_bar(hwnd: HWND) {
         .unwrap_or(0);
     let content_top = title_height + find_bar_height;
     let status_height = status_bar_height(hwnd);
-    unsafe {
-        MoveWindow(
-            editor_hwnd,
-            0,
-            content_top,
-            width,
-            (rect.bottom - rect.top - content_top - status_height).max(0),
-            1,
-        );
+    let area = RECT {
+        left: 0,
+        top: content_top,
+        right: width,
+        bottom: (rect.bottom - rect.top - status_height).max(content_top),
+    };
+    let rects = crate::window::preview_host::layout(hwnd, area, dpi);
+    if let Some(editor_rect) = rects.editor {
+        unsafe {
+            MoveWindow(
+                editor_hwnd,
+                editor_rect.left,
+                editor_rect.top,
+                editor_rect.right - editor_rect.left,
+                editor_rect.bottom - editor_rect.top,
+                1,
+            );
+        }
     }
 }
 
@@ -1011,8 +1062,10 @@ fn refilter_command_palette(hwnd: HWND) {
         return;
     };
     let has_tabs = tab_count(hwnd) > 0;
-    let entries =
-        command_palette::filter_entries(&query, |command| has_tabs || !command.needs_document());
+    let markdown = crate::window::preview_host::buttons_visible(hwnd);
+    let entries = command_palette::filter_entries(&query, |command| {
+        (has_tabs || !command.needs_document()) && (markdown || !command.is_markdown_preview())
+    });
     if let Some(mut app) = unsafe { app_ptr(hwnd) }
         && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
     {
@@ -1200,7 +1253,7 @@ pub(crate) fn replace_all_matches(hwnd: HWND) {
 const EMPTY_TABS_HINT: &str =
     "No tabs are open.\nPress Ctrl+N or double-click the tab bar to start a new one.";
 
-fn tab_count(hwnd: HWND) -> usize {
+pub(crate) fn tab_count(hwnd: HWND) -> usize {
     unsafe { app_ptr(hwnd) }
         .map(|app| unsafe { app.as_ref() }.tabs.len())
         .unwrap_or(1)
@@ -1212,7 +1265,7 @@ fn tab_scroll(hwnd: HWND) -> i32 {
         .unwrap_or(0)
 }
 
-fn title_layout(hwnd: HWND) -> TitleBarLayout {
+pub(crate) fn title_layout(hwnd: HWND) -> TitleBarLayout {
     crate::window::titlebar::layout_for_window(
         hwnd,
         tab_count(hwnd),
@@ -1222,8 +1275,8 @@ fn title_layout(hwnd: HWND) -> TitleBarLayout {
 }
 
 /// Whether the title strip shows the Markdown preview buttons (the active tab is Markdown).
-fn preview_buttons_visible(_hwnd: HWND) -> bool {
-    false
+fn preview_buttons_visible(hwnd: HWND) -> bool {
+    crate::window::preview_host::buttons_visible(hwnd)
 }
 
 /// Titles, active index, scroll offset, and whether the editor is hidden because no tab is open.
@@ -1363,6 +1416,7 @@ fn refresh_tabs(hwnd: HWND) {
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
+    crate::window::preview_host::sync_visibility(hwnd);
 }
 
 fn execute_command(hwnd: HWND, command: CommandId) {
@@ -1495,6 +1549,12 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         CommandId::TextRightToLeft => with_editor(hwnd, |editor| {
             let _ = editor.set_text_direction(TextDirection::RightToLeft);
         }),
+        CommandId::MarkdownPreviewCycle
+        | CommandId::MarkdownPreviewSide
+        | CommandId::MarkdownPreviewFull
+        | CommandId::MarkdownPreviewClose => {
+            crate::window::preview_host::run_command(hwnd, command)
+        }
         _ => {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.execute(command);
@@ -1641,6 +1701,7 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
             invalidate_status_bar(hwnd);
             // Lexer style tables reset every style's font face; restore the configured one.
             apply_editor_settings(hwnd);
+            crate::window::preview_host::sync_visibility(hwnd);
         }
         Some(Err(_)) => push_notice(
             hwnd,
@@ -1706,6 +1767,7 @@ fn apply_editor_settings(hwnd: HWND) {
     );
     let _ =
         editor.set_line_number_colors(palette.line_number_foreground, palette.editor_background);
+    crate::window::preview_host::refresh_appearance(hwnd);
 }
 
 /// Runs only inside `WM_FASTPAD_BUILD_CHROME`: the first system theme query, the status model,
@@ -1748,7 +1810,7 @@ fn refresh_theme(hwnd: HWND) {
 
 /// Before chrome exists there is no cached theme, so system-following preferences fall back to the
 /// one-shot registry read `apply_language` has always used; fixed themes skip it.
-fn effective_theme(hwnd: HWND) -> crate::platform::theme::Theme {
+pub(crate) fn effective_theme(hwnd: HWND) -> crate::platform::theme::Theme {
     let (theme, preference) = unsafe { app_ptr(hwnd) }
         .map(|app| {
             let app = unsafe { app.as_ref() };
@@ -1813,6 +1875,7 @@ fn apply_theme(hwnd: HWND) {
     if language != crate::document::Language::PlainText {
         apply_language(hwnd, language);
     }
+    crate::window::preview_host::refresh_appearance(hwnd);
 }
 
 /// Copies what a title-strip paint needs out of App, creating the per-DPI fonts on first use.
@@ -1902,10 +1965,13 @@ fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::StatusBarText
             encoding: document.encoding,
         })
     });
-    Some(crate::window::status::status_bar_text(
-        &app.notifications,
-        active,
-    ))
+    let mut bar = crate::window::status::status_bar_text(&app.notifications, active);
+    if app.notifications.pending().is_empty()
+        && let Some(hint) = app.preview.status_hint()
+    {
+        bar.left = hint;
+    }
+    Some(bar)
 }
 
 fn status_bar_height(hwnd: HWND) -> i32 {
@@ -1938,7 +2004,7 @@ fn notice_contains(hwnd: HWND, y: i32) -> bool {
 }
 
 /// Repaints just the bottom bar, for caret, selection and language changes.
-fn invalidate_status_bar(hwnd: HWND) {
+pub(crate) fn invalidate_status_bar(hwnd: HWND) {
     if let Some(rect) = status_bar_rect(hwnd) {
         unsafe {
             InvalidateRect(hwnd, &rect, 0);
@@ -2971,14 +3037,14 @@ fn bring_to_foreground(hwnd: HWND) {
 }
 
 /// Reports a rejected Open (missing file, unsupported encoding, NUL bytes) by naming the file.
-fn report_open_failure(hwnd: HWND, path: &std::path::Path, error: &crate::FastPadError) {
+pub(crate) fn report_open_failure(hwnd: HWND, path: &std::path::Path, error: &crate::FastPadError) {
     push_notice(
         hwnd,
         format!("FastPad could not open {}: {error}", path.display()),
     );
 }
 
-fn push_notice(hwnd: HWND, message: String) {
+pub(crate) fn push_notice(hwnd: HWND, message: String) {
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
         unsafe { app.as_mut() }.notifications.push(message);
     }
@@ -3189,7 +3255,7 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     }
 }
 
-fn invalidate_title_strip(hwnd: HWND) {
+pub(crate) fn invalidate_title_strip(hwnd: HWND) {
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
@@ -3308,6 +3374,12 @@ fn open_menu(hwnd: HWND, mut index: usize) {
         }) else {
             return;
         };
+        if index == 3 {
+            menus::set_markdown_preview_enabled(
+                menu,
+                crate::window::preview_host::buttons_visible(hwnd),
+            );
+        }
         set_menu_mode(
             hwnd,
             Some(MenuMode {
@@ -3457,7 +3529,7 @@ unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Resu
     Ok(())
 }
 
-pub(super) unsafe fn app_ptr(hwnd: HWND) -> Option<NonNull<App>> {
+pub(crate) unsafe fn app_ptr(hwnd: HWND) -> Option<NonNull<App>> {
     // SAFETY: `GWLP_USERDATA` is written exactly once from `WM_NCCREATE` with a `Box<App>` owned
     // by the window and cleared in `WM_NCDESTROY`. Callers must not keep references alive across
     // reentrant Win32 calls; they may only copy values or perform immediate mutation.

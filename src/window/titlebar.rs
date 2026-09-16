@@ -606,6 +606,8 @@ pub(crate) struct TitlePaint<'a> {
     pub menu: Option<(crate::window::menu_band::MenuMode, &'a [RECT])>,
     /// The current preview mode while the preview buttons are shown; `None` hides them.
     pub preview: Option<crate::preview::PreviewMode>,
+    /// The Markdown preview divider, painted between the editor and the preview.
+    pub divider: Option<RECT>,
 }
 
 pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
@@ -720,6 +722,10 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
                 input.fonts.text,
             );
         }
+    }
+
+    if let Some(divider) = input.divider {
+        unsafe { fill(dc, from_native(divider), input.palette.hover_background) };
     }
 
     unsafe {
