@@ -79,17 +79,23 @@ const fn virtual_key(modifiers: u8, key: VIRTUAL_KEY, command: CommandId) -> Acc
     }
 }
 
+/// `ACCEL` alone aligns to 2 bytes, but `CreateAcceleratorTableW` rejects a buffer that is not on a
+/// 4-byte boundary with `ERROR_NOACCESS`. Where a plain stack array lands differs between debug and
+/// optimized builds, so the alignment is pinned rather than left to chance.
+#[repr(C, align(4))]
+struct AlignedAccelerators<const N: usize>([ACCEL; N]);
+
 #[derive(Debug)]
 pub(crate) struct AcceleratorTable(HACCEL);
 
 impl AcceleratorTable {
     pub(crate) fn create() -> Result<Self> {
-        let native = accelerator_specs().map(|spec| ACCEL {
+        let native = AlignedAccelerators(accelerator_specs().map(|spec| ACCEL {
             fVirt: FVIRTKEY | spec.modifiers,
             key: spec.key,
             cmd: spec.command as u16,
-        });
-        let handle = unsafe { CreateAcceleratorTableW(native.as_ptr(), native.len() as i32) };
+        }));
+        let handle = unsafe { CreateAcceleratorTableW(native.0.as_ptr(), native.0.len() as i32) };
         if handle.is_null() {
             Err(last_error())
         } else {
@@ -343,6 +349,14 @@ mod tests {
                 .any(|item| item.command == CommandId::FormatJson)
         );
         assert_eq!(specs.len(), 39);
+    }
+
+    #[test]
+    fn the_native_accelerator_table_is_created_from_a_four_byte_aligned_buffer() {
+        // Break caught: release builds where the table buffer landed off a 4-byte boundary, so
+        // table creation failed with ERROR_NOACCESS and every keyboard shortcut was silently dead.
+        assert_eq!(std::mem::align_of::<super::AlignedAccelerators<1>>() % 4, 0);
+        super::AcceleratorTable::create().expect("accelerator table");
     }
 
     #[test]

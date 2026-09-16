@@ -3073,6 +3073,36 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_shortcuts_reach_their_commands_through_the_accelerator_table() {
+        // Break caught: every shortcut dead in the running app while command-level tests pass,
+        // because nothing exercised the accelerator translation the message loop depends on.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_CONTROL,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(keys.as_mut_ptr()) };
+        let original = keys;
+        keys[VK_CONTROL as usize] = 0x80;
+        unsafe { SetKeyboardState(keys.as_ptr()) };
+        let message = MSG {
+            hwnd: editor.hwnd(),
+            message: WM_KEYDOWN,
+            wParam: usize::from(b'T'),
+            ..Default::default()
+        };
+        let translated = unsafe { super::translate_accelerator(window.hwnd, &identity, &message) };
+        unsafe { SetKeyboardState(original.as_ptr()) };
+
+        assert!(translated, "Ctrl+T was not translated");
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+    }
+
+    #[test]
     fn tab_shortcuts_cycle_with_wrap_around_and_select_by_position() {
         // Break caught: Ctrl+Tab stopping at the last tab, or Ctrl+9 with fewer than nine tabs
         // activating some other tab instead of doing nothing.
