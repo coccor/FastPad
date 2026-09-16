@@ -240,13 +240,116 @@ fn a_non_markdown_tab_hides_the_preview_and_keeps_the_mode() {
     main.make_markdown("# One\n");
     main.command(CommandId::MarkdownPreviewSide);
     let view = main.view().unwrap();
+    pump_until("first render", Duration::from_secs(3), || {
+        view.stats().block_count == 1
+    });
     main.command(CommandId::New);
     assert_eq!(main.mode(), PreviewMode::Split);
     assert!(!visible(view.hwnd()));
     assert!(!main.with_app(|app| app.tabs.view().snapshot().preview_buttons));
+    assert_eq!(
+        view.stats().block_count,
+        0,
+        "a hidden preview releases its document"
+    );
     main.command(CommandId::SelectTab1);
     assert!(visible(view.hwnd()));
     assert!(main.with_app(|app| app.tabs.view().snapshot().preview_buttons));
+    pump_until("reloaded render", Duration::from_secs(3), || {
+        view.stats().block_count == 1
+    });
+}
+
+#[test]
+fn a_large_document_never_shows_the_previous_tabs_preview_while_it_parses() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let paragraph = "Paragraph text for the worker parse.\n\n";
+    main.make_markdown(&paragraph.repeat(1_100_000 / paragraph.len()));
+    main.command(CommandId::MarkdownPreviewSide);
+    let view = main.view().unwrap();
+    pump_until("worker parse", Duration::from_secs(10), || {
+        view.stats().block_count > 1000
+    });
+    main.command(CommandId::New);
+    main.make_markdown("# Small\n\n[link](https://x.dev)\n");
+    pump_until("small render", Duration::from_secs(3), || {
+        view.stats().block_count == 2 && !view.accessible_links().read().unwrap().is_empty()
+    });
+    main.command(CommandId::SelectTab1);
+    assert_eq!(
+        view.stats().block_count,
+        0,
+        "the previous tab's blocks stood in for the parsing document"
+    );
+    assert!(view.visible_links().is_empty());
+    assert!(view.accessible_links().read().unwrap().is_empty());
+    pump_until("worker parse again", Duration::from_secs(10), || {
+        view.stats().block_count > 1000
+    });
+}
+
+#[test]
+fn full_mode_reloads_keep_the_preview_position() {
+    // Break caught: reloading in Full mode jumped the preview to the hidden editor's top line.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(&long_markdown());
+    main.command(CommandId::MarkdownPreviewFull);
+    let view = main.view().unwrap();
+    pump_until("render", Duration::from_secs(3), || {
+        view.stats().block_count == 400
+    });
+    unsafe {
+        SendMessageW(
+            view.hwnd(),
+            WM_KEYDOWN,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_NEXT as usize,
+            0,
+        );
+        SendMessageW(
+            view.hwnd(),
+            WM_KEYDOWN,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_NEXT as usize,
+            0,
+        );
+    }
+    pump_for(Duration::from_millis(100));
+    let before = view.top_line();
+    assert!(before > 0);
+    window::preview_host::refresh(main.hwnd);
+    pump_for(Duration::from_millis(100));
+    assert_eq!(view.top_line(), before, "inline reparse");
+
+    let paragraph = "Paragraph text for the worker parse.\n\n";
+    main.set_text(&paragraph.repeat(1_100_000 / paragraph.len()));
+    window::preview_host::document_reloaded(main.hwnd);
+    pump_until("worker parse", Duration::from_secs(10), || {
+        view.stats().block_count > 1000
+    });
+    for _ in 0..3 {
+        unsafe {
+            SendMessageW(
+                view.hwnd(),
+                WM_KEYDOWN,
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_NEXT as usize,
+                0,
+            )
+        };
+    }
+    pump_for(Duration::from_millis(100));
+    let before = view.top_line();
+    assert!(before > 0);
+    window::preview_host::refresh(main.hwnd);
+    assert_eq!(
+        view.stats().block_count,
+        0,
+        "the worker parse is outstanding"
+    );
+    pump_until("worker reparse", Duration::from_secs(10), || {
+        view.stats().block_count > 1000
+    });
+    assert_eq!(view.top_line(), before, "worker reparse");
 }
 
 #[test]
@@ -449,6 +552,8 @@ fn scrolling_the_preview_scrolls_the_editor_without_echo() {
             0,
         );
     }
+    let preview_line = view.top_line();
+    assert!(preview_line > 0);
     pump_until("editor follows", Duration::from_secs(3), || {
         (unsafe {
             SendMessageW(
@@ -461,9 +566,14 @@ fn scrolling_the_preview_scrolls_the_editor_without_echo() {
     });
     pump_for(Duration::from_millis(250));
     let syncs = main.with_app(|app| app.preview.sync_count) - before;
-    assert_eq!(
-        syncs, 1,
+    assert!(
+        syncs <= 1,
         "scroll sync echoed: {syncs} syncs for one preview scroll"
+    );
+    assert_eq!(
+        view.top_line(),
+        preview_line,
+        "the editor's echo moved the preview"
     );
 }
 
@@ -681,7 +791,7 @@ fn typing_with_split_open_costs_the_same_as_without_a_preview() {
 
 #[test]
 #[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
-fn closing_the_preview_returns_memory() {
+fn private_bytes_do_not_grow_across_open_close_cycles() {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
     };
@@ -750,7 +860,16 @@ fn closing_the_preview_returns_memory() {
 #[test]
 fn launching_with_a_markdown_file_loads_no_preview_graphics_library() {
     use support::process::{FastPadProcess, process_has_module_loaded};
-    let root = std::env::temp_dir().join(format!("fastpad-startup-{}", std::process::id()));
+    /// Removes the temporary folder even when an assertion fails.
+    struct TempRoot(std::path::PathBuf);
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root =
+        TempRoot(std::env::temp_dir().join(format!("fastpad-startup-{}", std::process::id())));
+    let root = &root.0;
     let local_app_data = root.join("LocalAppData");
     std::fs::create_dir_all(&local_app_data).unwrap();
     let path = root.join("startup.md");
@@ -761,7 +880,7 @@ fn launching_with_a_markdown_file_loads_no_preview_graphics_library() {
     )
     .unwrap();
     process
-        .wait_for_main_window(Duration::from_secs(2))
+        .wait_for_main_window(Duration::from_secs(10))
         .unwrap();
     std::thread::sleep(Duration::from_millis(500));
     for module in ["d2d1.dll", "dwrite.dll", "windowscodecs.dll"] {

@@ -157,7 +157,10 @@ impl PreviewDocument {
         }
     }
 
-    /// Like `apply`, but returns `None` where `apply` would parse the whole document.
+    /// Like `apply`, but returns `None` where `apply` would parse the whole document. `None` does
+    /// not leave the model untouched: block and definition ranges may already be shifted for the
+    /// edits without the blocks being reparsed, so the caller must parse the whole document before
+    /// any further incremental apply.
     pub fn try_apply(
         &mut self,
         source: &(impl SourceText + ?Sized),
@@ -304,7 +307,7 @@ mod tests {
         "<!-- comment\n\nstill comment -->\n\nParagraph\n\n<div>\nhtml\n</div>\n",
     ];
 
-    const INSERTS: [&str; 18] = [
+    const INSERTS: [&str; 20] = [
         "x",
         "\n",
         "\n\n",
@@ -323,6 +326,8 @@ mod tests {
         "`",
         " ",
         "===\n",
+        "é",
+        "😀",
     ];
 
     /// xorshift64*: deterministic and dependency-free.

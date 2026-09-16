@@ -14,14 +14,17 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use windows_sys::Win32::Foundation::{
-    E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HWND, LRESULT, POINT, RECT, S_FALSE, S_OK, WPARAM,
+    E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HWND, LRESULT, POINT, RECT, S_FALSE, S_OK,
+    WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows_sys::Win32::UI::Accessibility::{
     LresultFromObject, ROLE_SYSTEM_DOCUMENT, ROLE_SYSTEM_LINK,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, PostMessageW};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GUITHREADINFO, GetClientRect, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId,
+    PostMessageW,
+};
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
 const STATE_SYSTEM_FOCUSED: u32 = 0x0000_0004;
@@ -113,8 +116,20 @@ fn target(item: &PreviewAccessible, child: &RawVariant) -> Option<Option<Visible
     }
 }
 
+/// Asks the preview window's own thread: MSAA clients call in on RPC threads, where `GetFocus`
+/// reports that thread's (empty) focus.
 fn has_focus(item: &PreviewAccessible) -> bool {
-    !item.hwnd.is_null() && unsafe { GetFocus() } == item.hwnd
+    if item.hwnd.is_null() {
+        return false;
+    }
+    let thread = unsafe { GetWindowThreadProcessId(item.hwnd, std::ptr::null_mut()) };
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    thread != 0
+        && unsafe { GetGUIThreadInfo(thread, &mut info) } != 0
+        && info.hwndFocus == item.hwnd
 }
 
 unsafe extern "system" fn query_interface(
@@ -389,9 +404,17 @@ unsafe extern "system" fn hit_test(
 
 unsafe extern "system" fn do_default_action(this: *mut c_void, child: RawVariant) -> HRESULT {
     let item = unsafe { item(this) };
-    match (child.child_id(), target(item, &child)) {
-        (Some(id), Some(Some(_))) => {
-            unsafe { PostMessageW(item.hwnd, WM_FASTPAD_PREVIEW_ACTIVATE, id as usize - 1, 0) };
+    match target(item, &child) {
+        Some(Some(link)) => {
+            // Post the destination itself: the window's snapshot may change before the message is
+            // handled, and an index would then name another link.
+            let payload = Box::into_raw(Box::new(link.dest));
+            if unsafe { PostMessageW(item.hwnd, WM_FASTPAD_PREVIEW_ACTIVATE, 0, payload as isize) }
+                == 0
+            {
+                drop(unsafe { Box::from_raw(payload) });
+                return E_FAIL;
+            }
             S_OK
         }
         _ => E_INVALIDARG,
@@ -441,6 +464,63 @@ mod tests {
         let result = String::from_utf16_lossy(text);
         unsafe { SysFreeString(value) };
         result
+    }
+
+    #[test]
+    fn default_action_posts_the_link_destination() {
+        use crate::preview::render::TestWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW};
+        let window = TestWindow::new(100, 100);
+        let provider = create_provider(window.0, links());
+        let mut msg = MSG::default();
+        unsafe {
+            assert_eq!(
+                (PREVIEW_VTABLE.acc_do_default_action)(provider, RawVariant::integer(2)),
+                S_OK
+            );
+            assert_ne!(
+                PeekMessageW(
+                    &mut msg,
+                    window.0,
+                    WM_FASTPAD_PREVIEW_ACTIVATE,
+                    WM_FASTPAD_PREVIEW_ACTIVATE,
+                    PM_REMOVE,
+                ),
+                0
+            );
+            assert_eq!(*Box::from_raw(msg.lParam as *mut String), "notes.md");
+            assert_eq!(
+                (PREVIEW_VTABLE.acc_do_default_action)(provider, RawVariant::integer(3)),
+                E_INVALIDARG
+            );
+            (PREVIEW_VTABLE.release)(provider);
+        }
+    }
+
+    #[test]
+    fn focus_is_reported_to_clients_on_other_threads() {
+        // Break caught: `GetFocus` is per thread, so a screen reader calling in on an RPC thread
+        // always saw the focused preview as unfocused.
+        use crate::preview::render::TestWindow;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOW, ShowWindow};
+        let window = TestWindow::new(100, 100);
+        unsafe {
+            ShowWindow(window.0, SW_SHOW);
+            SetFocus(window.0);
+        }
+        let focused_here = unsafe { GetFocus() } == window.0;
+        let hwnd = window.0 as isize;
+        let seen_elsewhere = std::thread::spawn(move || {
+            let provider = create_provider(hwnd as HWND, Arc::default());
+            let focused = has_focus(unsafe { item(provider) });
+            unsafe { release(provider) };
+            focused
+        })
+        .join()
+        .unwrap();
+        assert!(focused_here, "the test window must take the focus");
+        assert!(seen_elsewhere);
     }
 
     #[test]

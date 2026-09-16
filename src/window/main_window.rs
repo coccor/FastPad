@@ -3419,7 +3419,7 @@ fn open_menu(hwnd: HWND, mut index: usize) {
         }) else {
             return;
         };
-        if index == 3 {
+        if index == crate::window::menu_band::VIEW_MENU_INDEX {
             menus::set_markdown_preview_enabled(
                 menu,
                 crate::window::preview_host::buttons_visible(hwnd),

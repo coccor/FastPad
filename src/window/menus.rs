@@ -187,7 +187,7 @@ impl MenuBar {
                     CommandId::CommandPalette,
                 ),
             ])?;
-            append_popup(root, MENU_TITLES[3], view)
+            append_popup(root, MENU_TITLES[menu_band::VIEW_MENU_INDEX], view)
         })();
         match result {
             Ok(()) => Ok(Self(root)),
@@ -612,7 +612,7 @@ mod tests {
         use super::{MenuBar, set_markdown_preview_enabled};
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND, MF_GRAYED};
         let bar = MenuBar::create().unwrap();
-        let view = bar.dropdown(3);
+        let view = bar.dropdown(crate::window::menu_band::VIEW_MENU_INDEX);
         set_markdown_preview_enabled(view, false);
         let state =
             unsafe { GetMenuState(view, CommandId::MarkdownPreviewSide as u32, MF_BYCOMMAND) };

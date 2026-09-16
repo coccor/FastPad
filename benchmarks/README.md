@@ -41,4 +41,16 @@ return.
 
 Startup with a Markdown file is compared against the pre-preview baseline with
 `./tools/benchmark.ps1 -LaunchFile benchmarks/fixtures/sample.md` on both builds and
-`fastpad-bench compare`.
+`fastpad-bench compare`. A `--launch-file` run types its benchmark character into the initial
+Untitled tab, not into the launch file, which opens in a tab of its own; the rendered-input event
+is still required, but the buffer check is skipped, and the harness marks the Untitled tab saved
+before closing so no save prompt blocks the exit.
+
+Release binary size (`FastPad.exe`, release profile with `release-package`, as `tools/package.ps1`
+builds it): 511,488 bytes before the preview, 957,440 bytes with it (+445,952 bytes). A plain
+`cargo build --release` binary with the preview is 960,512 bytes.
+
+Deviations from the design spec, recorded without a ruling:
+
+- The image cache is keyed by path only, not by path and modification time. An image edited while
+  its document is shown keeps the decoded pixels; it refreshes when the preview is reopened.

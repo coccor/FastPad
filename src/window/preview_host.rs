@@ -446,6 +446,9 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
                 host.hover_text = None;
             });
             unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
+            // A hidden preview keeps only its window and the factories; the document (up to
+            // LIVE_UPDATE_LIMIT of text) is parsed again when the preview shows.
+            view.release();
         }
     }
     if shown {
@@ -482,25 +485,32 @@ pub(crate) fn load_active_document(hwnd: HWND, force: bool) {
     };
     let started = Instant::now();
     unsafe { KillTimer(hwnd, PREVIEW_TIMER_ID) };
-    with_host(hwnd, |host| {
-        host.document = Some(id);
+    let (previous, mode) = with_host(hwnd, |host| {
+        let previous = host.document.replace(id);
         host.edits = EditLog::default();
         // Any worker parse still running describes older text.
         host.parse_generation += 1;
         host.full_parse_pending = false;
-    });
+        (previous, host.mode)
+    })
+    .unwrap_or((None, PreviewMode::Off));
     let length = editor.length().unwrap_or(0);
-    let top_line = editor
-        .first_visible_line()
-        .and_then(|line| editor.doc_line_from_visible(line))
-        .unwrap_or(0);
+    // Full mode hides the editor, so its top line is stale: reloading the document the preview
+    // already shows keeps the preview's own position there.
+    let top_line = if mode == PreviewMode::Full && previous == Some(id) {
+        view.top_line()
+    } else {
+        editor_top_line(&editor)
+    };
     if length > LIVE_UPDATE_LIMIT && !force {
         view.set_paused(true);
         view.replace_document(PreviewDocument::default(), folder, started);
     } else if length > WORKER_PARSE_THRESHOLD {
         view.set_paused(length > LIVE_UPDATE_LIMIT);
-        view.set_document_dir(folder);
-        spawn_parse(hwnd, &editor, id, started);
+        // Until the worker lands, show nothing rather than the previous document: its blocks,
+        // links, and accessibility snapshot must never stand in for this one.
+        view.replace_document(PreviewDocument::default(), folder, started);
+        spawn_parse(hwnd, &editor, id, started, Some(top_line));
     } else {
         view.set_paused(false);
         view.replace_document(PreviewDocument::default(), folder, started);
@@ -509,17 +519,32 @@ pub(crate) fn load_active_document(hwnd: HWND, force: bool) {
     }
 }
 
+fn editor_top_line(editor: &Editor) -> usize {
+    editor
+        .first_visible_line()
+        .and_then(|line| editor.doc_line_from_visible(line))
+        .unwrap_or(0)
+}
+
 /// A finished worker parse, posted to the main window as `WM_FASTPAD_PREVIEW_PARSED`.
 pub(crate) struct ParsedPreview {
     document: DocumentId,
     generation: u64,
     parsed: PreviewDocument,
     started: Instant,
+    /// Where a Full-mode preview goes when this parse lands; `None` keeps its current position.
+    full_mode_line: Option<usize>,
 }
 
 /// Copies the text (the worker must not touch Scintilla's buffer) and parses it on a new thread.
 /// Bumping the generation retires any parse still running.
-fn spawn_parse(hwnd: HWND, editor: &Editor, document: DocumentId, started: Instant) -> bool {
+fn spawn_parse(
+    hwnd: HWND,
+    editor: &Editor,
+    document: DocumentId,
+    started: Instant,
+    full_mode_line: Option<usize>,
+) -> bool {
     let Ok(text) = editor.text() else {
         return false;
     };
@@ -538,6 +563,7 @@ fn spawn_parse(hwnd: HWND, editor: &Editor, document: DocumentId, started: Insta
             generation,
             parsed,
             started,
+            full_mode_line,
         }));
         if unsafe {
             PostMessageW(
@@ -579,14 +605,19 @@ pub(crate) fn parsed(hwnd: HWND, lparam: LPARAM) {
     }
     let folder = active_document(hwnd).and_then(|(_, _, folder)| folder);
     let ParsedPreview {
-        parsed, started, ..
+        parsed,
+        started,
+        full_mode_line,
+        ..
     } = *payload;
+    // Split follows the editor; Full mode hides the editor, so the preview keeps its own position.
+    let line = if mode(hwnd) == PreviewMode::Full {
+        Some(full_mode_line.unwrap_or_else(|| view.top_line()))
+    } else {
+        editor(hwnd).map(|editor| editor_top_line(&editor))
+    };
     view.replace_document(parsed, folder, started);
-    if let Some(editor) = editor(hwnd)
-        && let Ok(line) = editor
-            .first_visible_line()
-            .and_then(|line| editor.doc_line_from_visible(line))
-    {
+    if let Some(line) = line {
         view.scroll_to_line(line);
     }
 }
@@ -701,7 +732,7 @@ pub(crate) fn flush(hwnd: HWND) {
         }
         FlushPlan::WorkerParse => {
             view.set_paused(false);
-            if !spawn_parse(hwnd, &editor, id, started) {
+            if !spawn_parse(hwnd, &editor, id, started, None) {
                 // Keep the work for the next flush instead of dropping it.
                 with_host(hwnd, |host| host.edits.request_full());
             }
@@ -712,9 +743,11 @@ pub(crate) fn flush(hwnd: HWND) {
         } => {
             let applied =
                 view.apply_edits(&ScintillaSource(&editor), &edits, started, allow_full_parse);
-            // `try_apply` declining leaves the model untouched; if the worker cannot start either,
-            // the edits must survive as a full reparse request.
-            if applied.is_none() && !spawn_parse(hwnd, &editor, id, started) {
+            // `try_apply` declining has already shifted the model's ranges for the edits without
+            // reparsing, so nothing may be applied incrementally on top of it: a full parse must
+            // come first. The worker parse marks one pending (later edits wait for it); if it
+            // cannot start, the edits survive as a full reparse request.
+            if applied.is_none() && !spawn_parse(hwnd, &editor, id, started, None) {
                 with_host(hwnd, |host| host.edits.request_full());
             }
         }

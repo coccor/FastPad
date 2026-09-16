@@ -46,10 +46,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetParent, GetScrollInfo, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_HAND, LoadCursorW,
     PostMessageW, RegisterClassW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
     SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_ALL, SIF_TRACKPOS, SetCursor,
-    SetWindowLongPtrW, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_TABSTOP, WS_VSCROLL,
+    SetWindowLongPtrW, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_VSCROLL, WNDCLASSW, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_TABSTOP, WS_VSCROLL,
 };
 
 const CLASS_NAME: &str = "FastPadPreview";
@@ -223,6 +223,13 @@ impl PreviewView {
             state.document = document;
             state.document_dir = document_dir;
             state.scroll_y = 0.0;
+            // The snapshot describes the old document until the next paint; accessibility clients
+            // must not see its links in the meantime.
+            state
+                .accessible
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
             accept_update(state, Update::Full, started);
         });
     }
@@ -347,6 +354,31 @@ impl PreviewView {
             true
         })
         .unwrap_or(false)
+    }
+
+    /// Frees what a hidden preview does not need: the block model, layouts, image cache, and the
+    /// render target. Showing the preview again loads the document afresh.
+    pub fn release(&self) {
+        self.with(|state| {
+            state.document = PreviewDocument::default();
+            state.document_dir = None;
+            state.layouts = Vec::new();
+            state.heights = HeightIndex::default();
+            state.scroll_y = 0.0;
+            state.h_scroll = HashMap::new();
+            state.hover = None;
+            state.pressed = None;
+            state.focus = None;
+            state.anchors = None;
+            state.update_started = None;
+            state.stats.block_count = 0;
+            state.images.clear();
+            drop_device_resources(state);
+            *state
+                .accessible
+                .write()
+                .unwrap_or_else(|error| error.into_inner()) = Vec::new();
+        });
     }
 
     pub fn stats(&self) -> PreviewStats {
@@ -657,6 +689,18 @@ fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         let target = create_hwnd_target(&state.graphics, hwnd, pixel_width, pixel_height, dpi)?;
         state.brushes = None;
         state.target = Some(target);
+    } else if let Some(target) = &state.target {
+        // The target takes its DPI only at creation. After a move to a monitor with another DPI it
+        // would draw at the old scale while hit-testing, scroll info, and image decodes use the
+        // window's live DPI, so adopt the new one before drawing.
+        let (mut dpi_x, mut dpi_y) = (0.0, 0.0);
+        unsafe { target.GetDpi(&mut dpi_x, &mut dpi_y) };
+        let dpi = dpi as f32;
+        if (dpi_x - dpi).abs() > 0.5 || (dpi_y - dpi).abs() > 0.5 {
+            unsafe { target.SetDpi(dpi, dpi) };
+            // Layouts are in DIPs, but pixel snapping and image decode sizes follow the DPI.
+            relayout(state);
+        }
     }
     if state.brushes.is_none() {
         let target = state.target.as_ref().expect("created above");
@@ -1078,7 +1122,7 @@ unsafe extern "system" fn preview_proc(
             0
         }
         WM_GETDLGCODE => DLGC_WANTALLKEYS as LRESULT,
-        WM_SETFOCUS | WM_KILLFOCUS => {
+        WM_SETFOCUS | WM_KILLFOCUS | WM_DPICHANGED_AFTERPARENT => {
             invalidate(hwnd);
             0
         }
@@ -1251,16 +1295,10 @@ unsafe extern "system" fn preview_proc(
             }
         }
         WM_FASTPAD_PREVIEW_ACTIVATE => {
-            let dest = with_state(hwnd, |state| {
-                state
-                    .accessible
-                    .read()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .get(wparam)
-                    .map(|link| link.dest.clone())
-            })
-            .flatten();
-            if let Some(dest) = dest {
+            // The accessibility provider resolved the destination against the snapshot the client
+            // saw; resolving an index here could land on another link after a repaint.
+            if lparam != 0 {
+                let dest = *unsafe { Box::from_raw(lparam as *mut String) };
                 post_link(hwnd, dest);
             }
             0
@@ -1394,6 +1432,91 @@ mod tests {
         let message = take_posted(&parent, WM_FASTPAD_PREVIEW_LINK).expect("link message");
         let dest = unsafe { Box::from_raw(message.lParam as *mut String) };
         assert_eq!(*dest, "https://x.dev");
+        view.destroy();
+    }
+
+    fn target_dpi(view: &PreviewView) -> Option<f32> {
+        with_state(view.hwnd(), |state| {
+            state.target.as_ref().map(|target| {
+                let (mut dpi_x, mut dpi_y) = (0.0, 0.0);
+                unsafe { target.GetDpi(&mut dpi_x, &mut dpi_y) };
+                assert_eq!(dpi_x, dpi_y);
+                dpi_x
+            })
+        })
+        .flatten()
+    }
+
+    #[test]
+    fn a_target_left_at_another_dpi_adopts_the_window_dpi_before_drawing() {
+        // Break caught: the render target took its DPI only at creation, so after a monitor move it
+        // drew at the old scale while clicks were hit-tested at the new one.
+        let parent = TestWindow::new(800, 600);
+        let view = view_with(&parent, "[site](https://x.dev)\n");
+        let window_dpi = unsafe { GetDpiForWindow(view.hwnd()) }.max(96) as f32;
+        let stale = if window_dpi == 192.0 { 96.0 } else { 192.0 };
+        with_state(view.hwnd(), |state| {
+            let target = state.target.as_ref().expect("painted");
+            unsafe { target.SetDpi(stale, stale) };
+        });
+        assert_eq!(target_dpi(&view), Some(stale));
+        repaint(&view);
+        assert_eq!(target_dpi(&view), Some(window_dpi));
+        let (view_width, _) = view_size(view.hwnd());
+        let layout_width = with_state(view.hwnd(), |state| state.layout_width).unwrap();
+        assert_eq!(layout_width, content_frame(view_width, false).1);
+        let rect = view.visible_links().first().expect("a laid-out link").rect;
+        let point =
+            (((rect.top + rect.bottom) / 2) << 16 | ((rect.left + rect.right) / 2)) as isize;
+        unsafe {
+            SendMessageW(view.hwnd(), WM_LBUTTONDOWN, 0, point);
+            SendMessageW(view.hwnd(), WM_LBUTTONUP, 0, point);
+        }
+        let message = take_posted(&parent, WM_FASTPAD_PREVIEW_LINK).expect("link message");
+        let dest = unsafe { Box::from_raw(message.lParam as *mut String) };
+        assert_eq!(*dest, "https://x.dev");
+        view.destroy();
+    }
+
+    #[test]
+    fn accessible_activation_follows_the_posted_destination() {
+        let parent = TestWindow::new(800, 600);
+        let view = view_with(&parent, "[site](https://x.dev)\n");
+        let payload = Box::into_raw(Box::new(String::from("notes.md")));
+        unsafe {
+            SendMessageW(
+                view.hwnd(),
+                WM_FASTPAD_PREVIEW_ACTIVATE,
+                0,
+                payload as isize,
+            )
+        };
+        let message = take_posted(&parent, WM_FASTPAD_PREVIEW_LINK).expect("link message");
+        let dest = unsafe { Box::from_raw(message.lParam as *mut String) };
+        assert_eq!(*dest, "notes.md");
+        view.destroy();
+    }
+
+    #[test]
+    fn releasing_frees_the_model_layouts_and_render_target() {
+        let parent = TestWindow::new(800, 600);
+        let view = view_with(&parent, "# A\n\n[site](https://x.dev)\n");
+        assert!(target_dpi(&view).is_some());
+        view.release();
+        assert_eq!(view.stats().block_count, 0);
+        assert!(view.accessible_links().read().unwrap().is_empty());
+        let released = with_state(view.hwnd(), |state| {
+            state.target.is_none()
+                && state.brushes.is_none()
+                && state.layouts.is_empty()
+                && state.heights.is_empty()
+                && state.document.blocks.is_empty()
+        });
+        assert_eq!(released, Some(true));
+        view.replace_document(PreviewDocument::parse("# B\n"), None, Instant::now());
+        repaint(&view);
+        assert_eq!(view.stats().block_count, 1);
+        assert!(target_dpi(&view).is_some());
         view.destroy();
     }
 

@@ -68,7 +68,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 45] = [
         CommandId::MarkdownPreviewSide,
     ),
     entry("Markdown Preview: Full", CommandId::MarkdownPreviewFull),
-    entry("Markdown Preview: Close", CommandId::MarkdownPreviewClose),
+    entry("Close Markdown Preview", CommandId::MarkdownPreviewClose),
     entry("View: Next tab", CommandId::NextTab),
     entry("View: Previous tab", CommandId::PreviousTab),
     entry("View: Zoom in", CommandId::ZoomIn),
