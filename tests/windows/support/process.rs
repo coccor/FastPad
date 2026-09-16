@@ -13,13 +13,16 @@ use std::process::Command;
 #[cfg(windows)]
 use std::time::Duration;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{HANDLE, HMODULE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, GetLastError, HANDLE, HMODULE, HWND, LPARAM, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleBaseNameW};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_VM_READ, WaitForInputIdle, WaitForSingleObject,
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_VM_READ, WaitForInputIdle, WaitForSingleObject,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -87,6 +90,16 @@ impl FastPadProcess {
 
     pub fn has_dialog(&self) -> TestResult<bool> {
         Ok(find_unsaved_changes_dialog(self.process.id())?.is_some())
+    }
+
+    /// The child's exit code straight from `GetExitCodeProcess`, or `None` while it still runs.
+    pub fn exit_code(&self) -> TestResult<Option<u32>> {
+        const STILL_ACTIVE: u32 = 259;
+        let mut code = 0_u32;
+        if unsafe { GetExitCodeProcess(process_raw_handle(&self.process), &mut code) } == 0 {
+            return Err(Box::new(fastpad::platform::last_error()));
+        }
+        Ok((code != STILL_ACTIVE).then_some(code))
     }
 
     fn spawn_command(mut command: Command) -> TestResult<Self> {
@@ -244,7 +257,7 @@ pub fn wait_for_process_exit(process_id: u32, timeout: Duration) -> TestResult<(
         )
     };
     if raw.is_null() {
-        return Ok(());
+        return open_failure_is_exit(unsafe { GetLastError() }, process_id);
     }
     let handle = unsafe { OwnedHandle::from_raw_owned(raw) }?;
     let deadline = Deadline::after(timeout);
@@ -258,6 +271,16 @@ pub fn wait_for_process_exit(process_id: u32, timeout: Duration) -> TestResult<(
         }
         return Err("timed out waiting for process exit".into());
     }
+}
+
+/// Only "no such process" proves the process is gone. Any other OpenProcess failure (access
+/// denied, for instance) leaves it possibly still running, which must never read as a clean exit.
+#[cfg(windows)]
+fn open_failure_is_exit(error: u32, process_id: u32) -> TestResult<()> {
+    if error == ERROR_INVALID_PARAMETER {
+        return Ok(());
+    }
+    Err(format!("could not open process {process_id} to wait for its exit: Win32 error {error}").into())
 }
 
 #[cfg(windows)]
@@ -429,6 +452,20 @@ mod tests {
     use super::{Deadline, cleanup_process, wait_for_exit};
     use std::process::Command;
     use std::time::Duration;
+
+    #[test]
+    fn only_a_missing_process_counts_as_an_exit_when_open_process_fails() {
+        // Break caught: treating every OpenProcess failure as "already exited" turns a live but
+        // inaccessible process into a passing exit assertion, hiding a secondary that never exited.
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+        assert!(super::open_failure_is_exit(ERROR_INVALID_PARAMETER, 4321).is_ok());
+
+        let error = super::open_failure_is_exit(ERROR_ACCESS_DENIED, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("could not open process 4"), "{error}");
+    }
 
     #[test]
     fn wait_for_exit_rejects_nonzero_process_status() {

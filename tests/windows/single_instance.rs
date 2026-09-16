@@ -43,6 +43,11 @@ fn second_launch_forwards_its_file_to_the_primary_and_exits_zero() -> TestResult
         let mut secondary = FastPadProcess::spawn_with_local_app_data([&file], &scratch.root)?;
         wait_for_process_exit(secondary.id(), WAIT)?;
         assert!(secondary.wait_for_main_window(Duration::ZERO).is_err());
+        assert_eq!(
+            secondary.exit_code()?,
+            Some(0),
+            "a secondary that forwarded its file must exit zero"
+        );
         secondary.close()?;
         wait_until("the forwarded tab", || {
             tab_count(primary.hwnd).is_ok_and(|count| count == tabs + 1)

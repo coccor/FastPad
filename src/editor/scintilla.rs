@@ -103,12 +103,8 @@ impl Editor {
         endpoint.install_lifecycle_guard()?;
 
         let editor = Self { endpoint };
-        editor
-            .endpoint
-            .send_direct_checked(SCI_SETCODEPAGE, SC_CP_UTF8 as usize, 0)?;
-        editor.apply_chrome_defaults(unsafe {
-            windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd)
-        })?;
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+        editor.initialize_view(|editor| editor.apply_chrome_defaults(dpi))?;
         Ok(editor)
     }
 
@@ -117,6 +113,16 @@ impl Editor {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))
+    }
+
+    /// Sets the code page, which the UTF-8 contract depends on, and then applies the purely
+    /// cosmetic chrome defaults. Spec 228 keeps non-fatal failures non-fatal: a failed margin or
+    /// scroll-width call must never stop FastPad from opening an editable window.
+    fn initialize_view(&self, apply_chrome: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
+        self.endpoint
+            .send_direct_checked(SCI_SETCODEPAGE, SC_CP_UTF8 as usize, 0)?;
+        let _ = apply_chrome(self);
+        Ok(())
     }
 
     pub fn hwnd(&self) -> HWND {
@@ -1382,6 +1388,24 @@ mod tests {
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
         assert!(editor.set_style(0, 0, 0, false, "bad\0face").is_err());
+    }
+
+    #[test]
+    fn a_failed_cosmetic_chrome_default_still_yields_a_usable_editor() {
+        // Break caught: a cosmetic margin or scroll-width failure aborts Editor::create, so FastPad
+        // exits with a startup-fatal code instead of opening an editable window (spec 228).
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        let result = editor.initialize_view(|_| {
+            Err(crate::FastPadError::Invariant("cosmetic chrome failure"))
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            harness.messages(),
+            vec![crate::editor::scintilla_constants::SCI_SETCODEPAGE]
+        );
     }
 
     #[test]

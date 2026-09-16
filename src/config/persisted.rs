@@ -78,6 +78,8 @@ pub struct SettingsDelta {
 /// otherwise skipped — it never discards, and is never affected by, any other line's outcome.
 pub fn parse(source: &str) -> SettingsDelta {
     let mut delta = SettingsDelta::default();
+    // An editor that saves fastpad.ini with a UTF-8 BOM must not hide its first setting.
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     for (index, raw_line) in source.lines().enumerate() {
         let line_number = index + 1;
         let line = trim_ascii(raw_line);
@@ -223,6 +225,17 @@ mod tests {
         assert_eq!(delta.tab_width, None);
         assert_eq!(delta.theme, Some(ThemePreference::Dark));
         assert_eq!(delta.warnings.len(), 2);
+    }
+
+    #[test]
+    fn a_leading_utf8_bom_does_not_hide_the_first_setting() {
+        // Break caught: an editor that saves fastpad.ini with a UTF-8 BOM makes its first line
+        // parse as an unknown key, so that setting is dropped and a warning is shown instead.
+        let delta = parse("\u{feff}font_size=13\ntab_width=4\n");
+
+        assert_eq!(delta.font_size, Some(13));
+        assert_eq!(delta.tab_width, Some(4));
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
     }
 
     #[test]
