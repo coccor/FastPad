@@ -12,9 +12,13 @@ $CacheRoot = Join-Path $NativeRoot "cache"
 $SourceRoot = Join-Path $NativeRoot "src"
 $Manifest = Get-Content -Raw (Join-Path $NativeRoot "dependencies.json") | ConvertFrom-Json
 
-$DownloadAttempts = 5
+$DownloadRounds = 3
 $DownloadTimeoutSeconds = 300
 $InitialRetryDelaySeconds = 5
+# SourceForge serves an HTML interstitial page to PowerShell's default agent and the archive itself
+# to curl-like agents, so a mirror download without this lands a 137 KB web page in the cache. The
+# pinned SHA-256 catches that (it did, during testing), but only after wasting the attempt.
+$DownloadUserAgent = "curl/8.4.0"
 
 $Dependencies = @(
     [pscustomobject]@{ Name = "scintilla"; Version = "5.6.6"; Archive = "scintilla566.zip"; VersionFile = "566" },
@@ -50,32 +54,41 @@ function Assert-ExtractedVersion {
     }
 }
 
-# Upstream hosting is slow and occasionally times out, so each attempt is bounded and retried with
-# exponential backoff. A partial file never lands at the cached archive path.
+# Upstream hosting is slow, and from some networks unreachable outright: GitHub's Windows runners
+# cannot open a connection to www.scintilla.org at all, so retrying that one host only burns minutes
+# before failing. Every source gets one attempt per round, mirrors included, and rounds back off.
+# Mirrors are safe because the archive is checked against the pinned SHA-256 whatever served it.
+# A partial file never lands at the cached archive path.
 function Invoke-ArchiveDownload {
     param(
-        [Parameter(Mandatory = $true)] [string]$Uri,
+        [Parameter(Mandatory = $true)] [string[]]$Uris,
         [Parameter(Mandatory = $true)] [string]$Destination
     )
 
     $partialPath = "$Destination.partial"
     $delaySeconds = $InitialRetryDelaySeconds
-    for ($attempt = 1; $attempt -le $DownloadAttempts; $attempt++) {
-        try {
-            Invoke-WebRequest -Uri $Uri -OutFile $partialPath -TimeoutSec $DownloadTimeoutSeconds
-            Move-Item -LiteralPath $partialPath -Destination $Destination -Force
-            return
-        }
-        catch {
-            Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
-            if ($attempt -eq $DownloadAttempts) {
-                throw "Downloading '$Uri' failed after $DownloadAttempts attempts: $($_.Exception.Message)"
+    $lastError = "no attempt was made"
+    for ($round = 1; $round -le $DownloadRounds; $round++) {
+        foreach ($uri in $Uris) {
+            try {
+                Invoke-WebRequest -Uri $uri -OutFile $partialPath -TimeoutSec $DownloadTimeoutSeconds -UserAgent $DownloadUserAgent
+                Move-Item -LiteralPath $partialPath -Destination $Destination -Force
+                return
             }
-            Write-Warning "Download attempt $attempt of $DownloadAttempts for '$Uri' failed: $($_.Exception.Message). Retrying in $delaySeconds s."
+            catch {
+                Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
+                $lastError = $_.Exception.Message
+                Write-Warning "Round $round of ${DownloadRounds}: '$uri' failed: $lastError"
+            }
+        }
+        if ($round -lt $DownloadRounds) {
+            Write-Warning "Every source failed in round $round. Retrying in $delaySeconds s."
             Start-Sleep -Seconds $delaySeconds
             $delaySeconds *= 2
         }
     }
+
+    throw "Downloading '$($Uris[0])' failed after $DownloadRounds rounds over $($Uris.Count) source(s). Last error: $lastError"
 }
 
 foreach ($dependency in $Dependencies) {
@@ -95,7 +108,11 @@ foreach ($dependency in $Dependencies) {
         }
 
         New-Item -ItemType Directory -Force -Path $CacheRoot | Out-Null
-        Invoke-ArchiveDownload -Uri $manifestEntry.url -Destination $archivePath
+        $sources = @($manifestEntry.url)
+        if ($manifestEntry.PSObject.Properties.Name -contains "mirrors") {
+            $sources += $manifestEntry.mirrors
+        }
+        Invoke-ArchiveDownload -Uris $sources -Destination $archivePath
         $downloaded = $true
     }
 
