@@ -45,6 +45,10 @@ notification and every valid line still applies.
 | `theme` | `system`, `light`, `dark` | `system` |
 | `recovery_interval_seconds` | Positive integer | `30` |
 
+The command palette (Ctrl+Shift+P) changes the theme, word wrap (also Alt+Z), line numbers, font
+size (6-72 pt) and tab width (2, 4 or 8) while FastPad runs. Each change is written back to
+`fastpad.ini` immediately, rewriting only that key's line; comments and other lines are kept.
+
 ## Crash recovery
 
 While you edit, FastPad periodically writes snapshots of unsaved documents to

@@ -49,7 +49,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
     SetWindowLongPtrW, SetWindowPos, WM_CHAR, WM_DPICHANGED_AFTERPARENT, WM_NCDESTROY, WS_CHILD,
-    WS_EX_LAYOUTRTL, WS_TABSTOP, WS_VISIBLE,
+    WS_CLIPSIBLINGS, WS_EX_LAYOUTRTL, WS_TABSTOP, WS_VISIBLE,
 };
 
 pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;
@@ -1241,7 +1241,8 @@ fn create_scintilla_child(parent: HWND) -> Result<HWND> {
             0,
             class_name.as_ptr(),
             std::ptr::null(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            // Clipped against siblings so overlays such as the command palette stay on top.
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS,
             0,
             0,
             width,

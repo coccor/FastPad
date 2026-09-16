@@ -5,6 +5,7 @@ use crate::editor::{Editor, TextDirection};
 use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
 use crate::window::accessibility::{self, AccessibleSelectRequest, WM_FASTPAD_ACCESSIBLE_SELECT};
+use crate::window::command_palette::{self, CommandPalette};
 use crate::window::commands::CommandId;
 use crate::window::find_bar;
 use crate::window::menus::{self, MenuBar};
@@ -20,25 +21,26 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::Graphics::Gdi::{HDC, InvalidateRect};
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
-use windows_sys::Win32::UI::Controls::{NMHDR, WM_MOUSELEAVE};
+use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, NMHDR, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, GetLastInputInfo, LASTINPUTINFO, ReleaseCapture, SetCapture, SetFocus,
     VK_CONTROL, VK_F10, VK_MENU, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GWLP_USERDATA,
-    GetClientRect, GetWindowLongPtrW, HTCAPTION, IsZoomed, KillTimer, MoveWindow, OBJID_CLIENT,
-    PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE,
-    SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    UnregisterClassW, WHEEL_DELTA, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY,
-    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE, GWL_STYLE,
+    GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCAPTION, IsZoomed, KillTimer, MoveWindow,
+    OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU,
+    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_HIDE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, UnregisterClassW, WHEEL_DELTA, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_PAINT,
+    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 #[cfg(test)]
@@ -374,6 +376,27 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_FASTPAD_ACCESSIBLE_SELECT => handle_accessible_select(hwnd, lparam),
+        WM_COMMAND
+            if lparam != 0
+                && ((wparam >> 16) & 0xffff) as u32 == EN_CHANGE
+                && command_palette_owns(hwnd, lparam as HWND) =>
+        {
+            refilter_command_palette(hwnd);
+            0
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX if command_palette_owns(hwnd, lparam as HWND) => {
+            with_command_palette(hwnd, |palette| {
+                palette.control_color(wparam as HDC, lparam as HWND) as LRESULT
+            })
+            .unwrap_or(0)
+        }
+        WM_DRAWITEM if lparam != 0 => {
+            let item = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
+            if command_palette_owns(hwnd, item.hwndItem) {
+                with_command_palette(hwnd, |palette| palette.draw_item(item));
+            }
+            1
+        }
         WM_COMMAND => {
             if let Ok(command) = CommandId::try_from((wparam & 0xffff) as u16) {
                 execute_command(hwnd, command);
@@ -739,6 +762,7 @@ fn with_editor(hwnd: HWND, action: impl FnOnce(&Editor)) {
 /// optional find/replace bar reserved above it. The sole layout choke point for both; extends the
 /// pre-Task-12 `WM_SIZE` editor-only positioning rather than duplicating it.
 fn layout_editor_and_find_bar(hwnd: HWND) {
+    layout_command_palette(hwnd);
     let Some(editor_hwnd) = (unsafe { editor_hwnd(hwnd) }) else {
         return;
     };
@@ -822,6 +846,156 @@ pub(crate) fn close_find_bar(hwnd: HWND) {
             SetFocus(editor_hwnd);
         }
     }
+}
+
+/// Overlays the palette at the top of the editor, even with no tab open (New and Open stay
+/// available then). It stays below a visible find bar: nothing repaints the band around the find
+/// fields, so a palette hidden over it would leave its pixels behind.
+fn layout_command_palette(hwnd: HWND) {
+    if !with_command_palette(hwnd, CommandPalette::is_visible).unwrap_or(false) {
+        return;
+    }
+    let find_bar_height = unsafe { app_ptr(hwnd) }
+        .and_then(|app| {
+            unsafe { app.as_ref() }
+                .find_bar
+                .as_ref()?
+                .is_visible()
+                .then_some(())
+        })
+        .map_or(0, |()| find_bar::FIND_BAR_HEIGHT);
+    let top = title_layout(hwnd).height + find_bar_height;
+    let mut rect = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut rect);
+    }
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    let font = title_chrome(hwnd).1.text();
+    let width = rect.right - rect.left;
+    if let Some(mut app) = unsafe { app_ptr(hwnd) }
+        && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
+    {
+        palette.measure(width, dpi, font);
+    }
+    with_command_palette(hwnd, |palette| palette.apply_layout(width, top, dpi, font));
+}
+
+/// Runs `action` on the palette through a shared borrow only, so re-entrant window-procedure
+/// calls its Win32 messages trigger can borrow the App again.
+fn with_command_palette<R>(hwnd: HWND, action: impl FnOnce(&CommandPalette) -> R) -> Option<R> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    unsafe { app.as_ref() }.command_palette.as_ref().map(action)
+}
+
+fn open_command_palette(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
+    let colors = title_chrome(hwnd).0;
+    let newly_shown = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let app = unsafe { app.as_mut() };
+        if app.command_palette.is_none() {
+            app.command_palette = CommandPalette::create(hwnd).ok();
+        }
+        Some(app.command_palette.as_mut()?.mark_shown(colors))
+    });
+    let Some(newly_shown) = newly_shown else {
+        return;
+    };
+    if newly_shown {
+        // Clearing the field sends EN_CHANGE, which lists every available command.
+        with_command_palette(hwnd, CommandPalette::clear_query);
+    }
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    refilter_command_palette(hwnd);
+    with_command_palette(hwnd, CommandPalette::focus_query);
+}
+
+/// Hides the palette. `restore_focus` returns the focus to the editor (or the frame with no tab);
+/// it is false when the focus already moved somewhere else.
+pub(crate) fn close_command_palette(hwnd: HWND, restore_focus: bool) {
+    let was_visible = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
+        unsafe { app.as_mut() }
+            .command_palette
+            .as_mut()
+            .is_some_and(CommandPalette::mark_hidden)
+    });
+    if !was_visible {
+        return;
+    }
+    with_command_palette(hwnd, CommandPalette::hide_controls);
+    // Repaint what the palette covered now: a command run right after this (Find) can move the
+    // editor before its queued paint, leaving the palette's pixels in the unpainted gaps.
+    if let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) } {
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::UpdateWindow(editor_hwnd);
+        }
+    }
+    if restore_focus {
+        let target = if tab_count(hwnd) > 0 {
+            unsafe { editor_hwnd(hwnd) }.unwrap_or(hwnd)
+        } else {
+            hwnd
+        };
+        unsafe {
+            SetFocus(target);
+        }
+    }
+}
+
+fn refilter_command_palette(hwnd: HWND) {
+    let Some(query) = with_command_palette(hwnd, |palette| {
+        palette.is_visible().then(|| palette.query_text())
+    })
+    .flatten() else {
+        return;
+    };
+    let has_tabs = tab_count(hwnd) > 0;
+    let entries =
+        command_palette::filter_entries(&query, |command| has_tabs || !command.needs_document());
+    if let Some(mut app) = unsafe { app_ptr(hwnd) }
+        && let Some(palette) = unsafe { app.as_mut() }.command_palette.as_mut()
+    {
+        palette.set_entries(entries);
+    }
+    with_command_palette(hwnd, CommandPalette::fill_list);
+    layout_command_palette(hwnd);
+}
+
+pub(crate) fn paint_command_palette(hwnd: HWND, panel: HWND) {
+    if with_command_palette(hwnd, |palette| palette.paint_panel(panel)).is_none() {
+        // Validates the region so an orphaned panel does not repaint forever.
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::ValidateRect(panel, std::ptr::null());
+        }
+    }
+}
+
+pub(crate) fn run_command_palette_selection(hwnd: HWND) {
+    let command = with_command_palette(hwnd, CommandPalette::selected_command).flatten();
+    close_command_palette(hwnd, true);
+    if let Some(command) = command {
+        execute_command(hwnd, command);
+    }
+}
+
+pub(crate) fn move_command_palette_selection(hwnd: HWND, step: isize) {
+    with_command_palette(hwnd, |palette| palette.move_selection(step));
+}
+
+pub(crate) fn select_command_palette_row(hwnd: HWND, lparam: LPARAM) -> bool {
+    with_command_palette(hwnd, |palette| palette.select_row_at(lparam)).unwrap_or(false)
+}
+
+pub(crate) fn focus_command_palette(hwnd: HWND) {
+    with_command_palette(hwnd, CommandPalette::focus_query);
+}
+
+pub(crate) fn command_palette_owns(hwnd: HWND, control: HWND) -> bool {
+    !control.is_null()
+        && with_command_palette(hwnd, |palette| palette.owns(control)).unwrap_or(false)
 }
 
 pub(crate) fn find_next(hwnd: HWND) {
@@ -1141,6 +1315,34 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             let _ = editor.paste();
         }),
         CommandId::Find => open_find_bar(hwnd, find_bar::FindBarMode::Find),
+        CommandId::CommandPalette => open_command_palette(hwnd),
+        CommandId::ThemeSystem => set_theme(hwnd, crate::config::ThemePreference::System),
+        CommandId::ThemeLight => set_theme(hwnd, crate::config::ThemePreference::Light),
+        CommandId::ThemeDark => set_theme(hwnd, crate::config::ThemePreference::Dark),
+        CommandId::ToggleWordWrap => change_setting(hwnd, |settings| {
+            settings.word_wrap = !settings.word_wrap;
+            Some(("word_wrap", settings.word_wrap.to_string()))
+        }),
+        CommandId::ToggleLineNumbers => change_setting(hwnd, |settings| {
+            settings.line_numbers = !settings.line_numbers;
+            Some(("line_numbers", settings.line_numbers.to_string()))
+        }),
+        CommandId::FontSizeIncrease => {
+            set_font_size(hwnd, |size| {
+                size.saturating_add(1).min(MAX_FONT_SIZE.max(size))
+            });
+        }
+        CommandId::FontSizeDecrease => {
+            set_font_size(hwnd, |size| {
+                size.saturating_sub(1).max(MIN_FONT_SIZE.min(size))
+            });
+        }
+        CommandId::FontSizeReset => {
+            set_font_size(hwnd, |_| crate::config::defaults::DEFAULT_FONT_SIZE);
+        }
+        CommandId::TabWidth2 => set_tab_width(hwnd, 2),
+        CommandId::TabWidth4 => set_tab_width(hwnd, 4),
+        CommandId::TabWidth8 => set_tab_width(hwnd, 8),
         CommandId::Replace => open_find_bar(hwnd, find_bar::FindBarMode::Replace),
         CommandId::LanguagePlainText => apply_language(hwnd, crate::document::Language::PlainText),
         CommandId::LanguageJson => apply_language(hwnd, crate::document::Language::Json),
@@ -1170,6 +1372,97 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             }
         }
     }
+}
+
+/// Font-size commands step within this range; a size set outside it in `fastpad.ini` is kept
+/// until a step moves it back toward the range.
+const MIN_FONT_SIZE: u16 = 6;
+const MAX_FONT_SIZE: u16 = 72;
+
+fn set_font_size(hwnd: HWND, next: impl FnOnce(u16) -> u16) {
+    change_setting(hwnd, |settings| {
+        let size = next(settings.font_size);
+        (size != settings.font_size).then(|| {
+            settings.font_size = size;
+            ("font_size", size.to_string())
+        })
+    });
+}
+
+fn set_tab_width(hwnd: HWND, width: u8) {
+    change_setting(hwnd, |settings| {
+        (settings.tab_width != width).then(|| {
+            settings.tab_width = width;
+            ("tab_width", width.to_string())
+        })
+    });
+}
+
+fn set_theme(hwnd: HWND, theme: crate::config::ThemePreference) {
+    change_setting(hwnd, |settings| {
+        (settings.theme != theme).then(|| {
+            settings.theme = theme;
+            ("theme", theme.ini_value().to_owned())
+        })
+    });
+}
+
+/// Applies one settings change from a command and saves it to `fastpad.ini`. `change` edits the
+/// in-memory settings and names the `key=value` it made, or returns `None` when nothing changed.
+fn change_setting(
+    hwnd: HWND,
+    change: impl FnOnce(&mut crate::config::Settings) -> Option<(&'static str, String)>,
+) {
+    let Some((previous_theme, (key, value))) = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
+        let settings = &mut unsafe { app.as_mut() }.settings;
+        let previous_theme = settings.theme;
+        Some((previous_theme, change(settings)?))
+    }) else {
+        return;
+    };
+    let theme_changed = unsafe { app_ptr(hwnd) }
+        .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
+    if theme_changed {
+        apply_theme(hwnd);
+        unsafe {
+            InvalidateRect(hwnd, std::ptr::null(), 1);
+        }
+    } else {
+        apply_editor_settings(hwnd);
+    }
+    if let Err(error) = save_setting(key, &value) {
+        push_notice(hwnd, format!("FastPad could not save fastpad.ini: {error}"));
+    }
+}
+
+#[cfg(not(test))]
+fn save_setting(key: &str, value: &str) -> Result<()> {
+    crate::config::save_setting(key, value)
+}
+
+/// Tests never touch the real `%LocalAppData%\FastPadastpad.ini`: a setting is saved only to a
+/// path a test chose with `save_settings_to`.
+#[cfg(test)]
+fn save_setting(key: &str, value: &str) -> Result<()> {
+    TEST_SETTINGS_PATH.with(|path| match path.borrow().as_deref() {
+        Some(path) => crate::config::save_setting_to(path, key, value),
+        None => Ok(()),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SETTINGS_PATH: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "not every source-linked test target saves settings"
+)]
+pub(crate) fn save_settings_to(path: Option<std::path::PathBuf>) {
+    TEST_SETTINGS_PATH.with(|slot| *slot.borrow_mut() = path);
 }
 
 fn file_population_active(hwnd: HWND) -> bool {
@@ -3200,6 +3493,163 @@ mod tests {
         assert!(mirrored());
         execute_command(window.hwnd, CommandId::TextLeftToRight);
         assert!(!mirrored());
+    }
+
+    #[test]
+    fn the_command_palette_filters_as_typed_and_runs_the_selection_on_enter() {
+        // Break caught: a palette whose field never refilters the list, or whose Enter leaves the
+        // palette open or runs nothing.
+        use crate::editor::scintilla_constants::SCI_GETZOOM;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_KEYDOWN};
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let palette = |hwnd| app_mut(hwnd).command_palette.as_ref().unwrap();
+
+        // The test window itself is never shown, so check the panel's own style bit.
+        let panel_visible = |hwnd| {
+            (unsafe { GetWindowLongPtrW(palette(hwnd).panel_hwnd(), super::GWL_STYLE) }) as u32
+                & super::WS_VISIBLE
+                != 0
+        };
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        assert!(palette(window.hwnd).is_visible());
+        assert!(panel_visible(window.hwnd));
+        assert_eq!(
+            palette(window.hwnd).shown().len(),
+            crate::window::command_palette::ENTRIES.len()
+        );
+        let query = palette(window.hwnd).query_hwnd();
+        let typed = crate::platform::wide_null("zoom");
+        unsafe { SetWindowTextW(query, typed.as_ptr()) };
+        let shown = palette(window.hwnd)
+            .shown()
+            .iter()
+            .map(|entry| entry.command)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            [CommandId::ZoomIn, CommandId::ZoomOut, CommandId::ZoomReset]
+        );
+
+        unsafe { SendMessageW(query, WM_KEYDOWN, VK_DOWN as usize, 0) };
+        assert_eq!(
+            palette(window.hwnd).selected_command(),
+            Some(CommandId::ZoomOut)
+        );
+        unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+        assert!(!palette(window.hwnd).is_visible());
+        assert!(!panel_visible(window.hwnd));
+        assert_eq!(
+            unsafe { SendMessageW(editor.hwnd(), SCI_GETZOOM, 0, 0) },
+            -1
+        );
+
+        // Reopening starts from an empty query; Escape closes without running anything.
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        assert_eq!(palette(window.hwnd).query_text(), "");
+        unsafe { SendMessageW(query, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+        assert!(!palette(window.hwnd).is_visible());
+        assert_eq!(
+            unsafe { SendMessageW(editor.hwnd(), SCI_GETZOOM, 0, 0) },
+            -1
+        );
+    }
+
+    #[test]
+    fn with_no_tab_open_the_command_palette_lists_only_commands_that_need_no_document() {
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::CloseAllTabs);
+        assert!(app_mut(window.hwnd).tabs.is_empty());
+
+        execute_command(window.hwnd, CommandId::CommandPalette);
+        let shown = app_mut(window.hwnd)
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .shown()
+            .iter()
+            .map(|entry| entry.command)
+            .collect::<Vec<_>>();
+        assert!(shown.iter().all(|command| !command.needs_document()));
+        assert!(shown.contains(&CommandId::Open));
+        assert!(shown.contains(&CommandId::ThemeDark));
+        assert!(!shown.contains(&CommandId::Save));
+    }
+
+    #[test]
+    fn setting_commands_apply_to_the_editor_and_save_only_their_own_ini_lines() {
+        // Break caught: a palette setting that changes the editor but is lost on restart, or that
+        // rewrites fastpad.ini and drops what the user wrote there by hand.
+        use crate::editor::scintilla_constants::{
+            SCI_GETTABWIDTH, SCI_STYLEGETBACK, STYLE_DEFAULT,
+        };
+        const SCI_GETWRAPMODE: u32 = 2269;
+        const SCI_STYLEGETSIZEFRACTIONAL: u32 = 2062;
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("settings");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\nfont_face=Cascadia Mono\r\ntab_width=4\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let send = |message, wparam| unsafe { SendMessageW(editor.hwnd(), message, wparam, 0) };
+
+        execute_command(window.hwnd, CommandId::ToggleWordWrap);
+        assert_ne!(send(SCI_GETWRAPMODE, 0), 0);
+        execute_command(window.hwnd, CommandId::TabWidth8);
+        assert_eq!(send(SCI_GETTABWIDTH, 0), 8);
+        execute_command(window.hwnd, CommandId::FontSizeIncrease);
+        execute_command(window.hwnd, CommandId::FontSizeIncrease);
+        assert_eq!(
+            send(SCI_STYLEGETSIZEFRACTIONAL, STYLE_DEFAULT as usize),
+            1300
+        );
+        execute_command(window.hwnd, CommandId::FontSizeReset);
+        assert_eq!(
+            send(SCI_STYLEGETSIZEFRACTIONAL, STYLE_DEFAULT as usize),
+            1100
+        );
+        execute_command(window.hwnd, CommandId::ToggleLineNumbers);
+        assert!(!app_mut(window.hwnd).settings.line_numbers);
+
+        super::build_chrome(window.hwnd);
+        execute_command(window.hwnd, CommandId::ThemeDark);
+        assert_eq!(
+            send(SCI_STYLEGETBACK, STYLE_DEFAULT as usize) as u32,
+            crate::window::palette::Palette::for_theme(true, false).editor_background
+        );
+        execute_command(window.hwnd, CommandId::ThemeLight);
+        assert_eq!(
+            send(SCI_STYLEGETBACK, STYLE_DEFAULT as usize) as u32,
+            crate::window::palette::Palette::for_theme(false, false).editor_background
+        );
+        super::save_settings_to(None);
+
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nfont_face=Cascadia Mono\r\ntab_width=8\r\nword_wrap=true\r\n\
+             font_size=11\r\nline_numbers=false\r\ntheme=light\r\n"
+        );
+        let (reloaded, warnings) = {
+            let mut settings = crate::config::default_settings();
+            let delta = crate::config::parse(&std::fs::read_to_string(&ini).unwrap());
+            settings.apply_delta(&delta);
+            (settings, delta.warnings)
+        };
+        assert!(warnings.is_empty());
+        // The window never loaded this file, so only the hand-written font differs.
+        assert_eq!(reloaded.font_face, "Cascadia Mono");
+        assert_eq!(
+            crate::config::Settings {
+                font_face: app_mut(window.hwnd).settings.font_face.clone(),
+                ..reloaded
+            },
+            app_mut(window.hwnd).settings
+        );
     }
 
     #[test]

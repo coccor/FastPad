@@ -6,6 +6,7 @@ use crate::launch::LaunchOptions;
 use crate::perf::{Milestone, StartupMetrics};
 use crate::platform::theme::SystemTheme;
 use crate::window::accessibility::AccessibilityState;
+use crate::window::command_palette::CommandPalette;
 use crate::window::commands::CommandId;
 use crate::window::find_bar::FindBar;
 use crate::window::menus::{AcceleratorTable, MenuBar};
@@ -42,6 +43,7 @@ pub struct App {
     pub(crate) accelerators: Option<AcceleratorTable>,
     pub(crate) menu_bar: Option<MenuBar>,
     pub(crate) find_bar: Option<FindBar>,
+    pub(crate) command_palette: Option<CommandPalette>,
     pub(crate) language_manager: Option<LanguageManager>,
     pub(crate) settings: Settings,
     pub(crate) theme: Option<SystemTheme>,
@@ -87,6 +89,7 @@ impl App {
             accelerators: AcceleratorTable::create().ok(),
             menu_bar: None,
             find_bar: None,
+            command_palette: None,
             language_manager: None,
             settings: crate::config::default_settings(),
             theme: None,

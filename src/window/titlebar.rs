@@ -499,6 +499,13 @@ impl TitleFonts {
     }
 }
 
+impl TitleFontHandles {
+    /// The UI text font, null before chrome fonts exist.
+    pub(crate) fn text(&self) -> HFONT {
+        self.text
+    }
+}
+
 impl Drop for TitleFonts {
     fn drop(&mut self) {
         for font in [self.handles.text, self.handles.glyph] {

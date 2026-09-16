@@ -222,9 +222,135 @@ fn load_from_path(path: &Path) -> (Settings, Vec<SettingWarning>) {
     }
 }
 
+impl ThemePreference {
+    /// The `theme=` value that parses back to this preference.
+    pub const fn ini_value(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+/// Returns `source` with every `key=` line set to `value`, or with `key=value` appended when no
+/// line names the key. Everything else is kept byte for byte: comments, other keys, invalid lines,
+/// a leading BOM, and the file's line ending style.
+pub fn set_setting(source: &str, key: &str, value: &str) -> String {
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut output = String::with_capacity(source.len() + key.len() + value.len() + 3);
+    let mut found = false;
+    for raw_line in source.split_inclusive('\n') {
+        let content = raw_line.trim_end_matches(['\r', '\n']);
+        let bom = content.starts_with('\u{feff}');
+        let names_key = trim_ascii(content.trim_start_matches('\u{feff}'))
+            .split_once('=')
+            .is_some_and(|(line_key, _)| trim_ascii(line_key) == key);
+        if names_key {
+            found = true;
+            if bom {
+                output.push('\u{feff}');
+            }
+            output.push_str(key);
+            output.push('=');
+            output.push_str(value);
+            output.push_str(&raw_line[content.len()..]);
+        } else {
+            output.push_str(raw_line);
+        }
+    }
+    if !found {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push_str(newline);
+        }
+        output.push_str(key);
+        output.push('=');
+        output.push_str(value);
+        output.push_str(newline);
+    }
+    output
+}
+
+/// Writes one setting into the settings file, creating the file and its directory when needed.
+pub fn save_setting(key: &str, value: &str) -> Result<()> {
+    save_setting_to(&settings_file_path()?, key, value)
+}
+
+/// A file that exists but is not UTF-8 is left alone rather than overwritten.
+pub fn save_setting_to(path: &Path, key: &str, value: &str) -> Result<()> {
+    let source = match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map_err(|_| crate::FastPadError::Invariant("the settings file is not valid UTF-8"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::file::saver::save_atomic(path, set_setting(&source, key, value).as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_a_key_rewrites_only_its_lines_and_keeps_everything_else() {
+        // Break caught: a palette toggle that rewrites fastpad.ini from scratch, dropping the
+        // user's comments, unknown keys and line endings.
+        let source = "\u{feff}# mine\r\ntheme = light\r\nbogus\r\nfont_size=12\r\ntheme=dark";
+        let updated = set_setting(source, "theme", "system");
+        assert_eq!(
+            updated,
+            "\u{feff}# mine\r\ntheme=system\r\nbogus\r\nfont_size=12\r\ntheme=system"
+        );
+        assert_eq!(parse(&updated).theme, Some(ThemePreference::System));
+        assert_eq!(set_setting("", "word_wrap", "true"), "word_wrap=true\n");
+        assert_eq!(
+            set_setting("font_size=12", "tab_width", "2"),
+            "font_size=12\ntab_width=2\n"
+        );
+        assert_eq!(
+            set_setting("\u{feff}tab_width=4\n", "tab_width", "8"),
+            "\u{feff}tab_width=8\n"
+        );
+        // A key that only appears inside a comment is not a setting line.
+        assert_eq!(
+            set_setting("# theme=dark\n", "theme", "light"),
+            "# theme=dark\ntheme=light\n"
+        );
+    }
+
+    #[test]
+    fn saving_a_setting_creates_the_file_and_preserves_an_existing_one() {
+        let directory = std::env::temp_dir().join(format!(
+            "fastpad-save-setting-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("nested").join("fastpad.ini");
+        save_setting_to(&path, "line_numbers", "false").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line_numbers=false\n"
+        );
+        save_setting_to(&path, "theme", "dark").unwrap();
+        save_setting_to(&path, "line_numbers", "true").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line_numbers=true\ntheme=dark\n"
+        );
+        // Break caught: clobbering a file the user saved in another encoding.
+        std::fs::write(&path, b"theme=dark\n\xff\n").unwrap();
+        assert!(save_setting_to(&path, "theme", "light").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"theme=dark\n\xff\n");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     #[test]
     fn bad_key_does_not_discard_valid_keys() {

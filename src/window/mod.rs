@@ -1,4 +1,5 @@
 pub(crate) mod accessibility;
+pub(crate) mod command_palette;
 pub mod commands;
 pub mod find_bar;
 mod main_window;

@@ -10,8 +10,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
-    DestroyAcceleratorTable, DestroyMenu, DrawMenuBar, FCONTROL, FSHIFT, FVIRTKEY, HACCEL, HMENU,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SetMenu, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    DestroyAcceleratorTable, DestroyMenu, DrawMenuBar, FALT, FCONTROL, FSHIFT, FVIRTKEY, HACCEL,
+    HMENU, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SetMenu, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenuEx, TranslateAcceleratorW,
 };
 
@@ -22,7 +22,7 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 39] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 41] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
         accelerator(FCONTROL, b'T', CommandId::New),
@@ -64,6 +64,8 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 39] {
         virtual_key(FCONTROL, VK_NUMPAD0, CommandId::ZoomReset),
         accelerator(FCONTROL, b'L', CommandId::TextLeftToRight),
         accelerator(FCONTROL, b'R', CommandId::TextRightToLeft),
+        accelerator(FCONTROL | FSHIFT, b'P', CommandId::CommandPalette),
+        accelerator(FALT, b'Z', CommandId::ToggleWordWrap),
     ]
 }
 
@@ -161,6 +163,14 @@ impl MenuBar {
                 MenuEntry::Separator,
                 MenuEntry::command("&Left-to-right text	Ctrl+L", CommandId::TextLeftToRight),
                 MenuEntry::command("&Right-to-left text	Ctrl+R", CommandId::TextRightToLeft),
+                MenuEntry::Separator,
+                MenuEntry::command("&Word wrap	Alt+Z", CommandId::ToggleWordWrap),
+                MenuEntry::command("Line &numbers", CommandId::ToggleLineNumbers),
+                MenuEntry::Separator,
+                MenuEntry::command(
+                    "Command &palette...	Ctrl+Shift+P",
+                    CommandId::CommandPalette,
+                ),
             ])?;
             append_popup(root, "&View", view)?;
             let help = create_popup(&[])?;
@@ -264,6 +274,7 @@ pub(crate) fn show_overflow(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
             MenuEntry::Separator,
             MenuEntry::command("Find", CommandId::Find),
             MenuEntry::command("Format JSON", CommandId::FormatJson),
+            MenuEntry::command("Command palette...", CommandId::CommandPalette),
             MenuEntry::Separator,
             MenuEntry::command("Exit", CommandId::Exit),
         ],
@@ -348,7 +359,7 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 39);
+        assert_eq!(specs.len(), 41);
     }
 
     #[test]
@@ -406,6 +417,17 @@ mod tests {
         assert_eq!(
             bound(FCONTROL, u16::from(b'R')),
             Some(CommandId::TextRightToLeft)
+        );
+        assert_eq!(
+            bound(FCONTROL | FSHIFT, u16::from(b'P')),
+            Some(CommandId::CommandPalette)
+        );
+        assert_eq!(
+            bound(
+                windows_sys::Win32::UI::WindowsAndMessaging::FALT,
+                u16::from(b'Z')
+            ),
+            Some(CommandId::ToggleWordWrap)
         );
     }
 }

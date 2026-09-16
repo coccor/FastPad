@@ -36,6 +36,18 @@ pub enum CommandId {
     ZoomReset,
     TextLeftToRight,
     TextRightToLeft,
+    CommandPalette,
+    ThemeSystem,
+    ThemeLight,
+    ThemeDark,
+    ToggleWordWrap,
+    ToggleLineNumbers,
+    FontSizeIncrease,
+    FontSizeDecrease,
+    FontSizeReset,
+    TabWidth2,
+    TabWidth4,
+    TabWidth8,
 }
 
 impl CommandId {
@@ -43,7 +55,22 @@ impl CommandId {
     pub const fn needs_document(self) -> bool {
         !matches!(
             self,
-            Self::New | Self::Open | Self::Exit | Self::CloseAllTabs
+            Self::New
+                | Self::Open
+                | Self::Exit
+                | Self::CloseAllTabs
+                | Self::CommandPalette
+                | Self::ThemeSystem
+                | Self::ThemeLight
+                | Self::ThemeDark
+                | Self::ToggleWordWrap
+                | Self::ToggleLineNumbers
+                | Self::FontSizeIncrease
+                | Self::FontSizeDecrease
+                | Self::FontSizeReset
+                | Self::TabWidth2
+                | Self::TabWidth4
+                | Self::TabWidth8
         )
     }
 
@@ -63,7 +90,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 35] = [
+        const COMMANDS: [CommandId; 47] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -99,6 +126,18 @@ impl TryFrom<u16> for CommandId {
             CommandId::ZoomReset,
             CommandId::TextLeftToRight,
             CommandId::TextRightToLeft,
+            CommandId::CommandPalette,
+            CommandId::ThemeSystem,
+            CommandId::ThemeLight,
+            CommandId::ThemeDark,
+            CommandId::ToggleWordWrap,
+            CommandId::ToggleLineNumbers,
+            CommandId::FontSizeIncrease,
+            CommandId::FontSizeDecrease,
+            CommandId::FontSizeReset,
+            CommandId::TabWidth2,
+            CommandId::TabWidth4,
+            CommandId::TabWidth8,
         ];
         COMMANDS
             .into_iter()
@@ -134,6 +173,10 @@ mod tests {
         assert!(!CommandId::New.needs_document());
         assert!(CommandId::Paste.needs_document());
         assert_eq!(CommandId::try_from(134), Ok(CommandId::TextRightToLeft));
+        assert_eq!(CommandId::try_from(135), Ok(CommandId::CommandPalette));
+        assert!(!CommandId::CommandPalette.needs_document());
+        assert_eq!(CommandId::try_from(146), Ok(CommandId::TabWidth8));
+        assert!(!CommandId::ToggleWordWrap.needs_document());
     }
 
     #[test]
