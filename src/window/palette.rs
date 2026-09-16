@@ -23,6 +23,9 @@ pub struct Palette {
     pub close_pressed_background: u32,
     pub selection_background: u32,
     pub inactive_selection_background: u32,
+    /// Selected-text foreground. `None` leaves Scintilla's own syntax colors showing through, which
+    /// is what the themed palettes want; high contrast must force the system pair to stay legible.
+    pub selection_foreground: Option<u32>,
     pub caret_line_background: u32,
     /// Resting caption-button glyphs and status-line text on `strip_background`.
     pub strip_foreground: u32,
@@ -47,6 +50,7 @@ const LIGHT: Palette = Palette {
     close_pressed_background: CLOSE_PRESSED,
     selection_background: rgb(173, 214, 255),
     inactive_selection_background: rgb(229, 235, 241),
+    selection_foreground: None,
     caret_line_background: rgb(245, 247, 250),
     strip_foreground: rgb(32, 32, 32),
     dark_frame: false,
@@ -65,6 +69,7 @@ const DARK: Palette = Palette {
     close_pressed_background: CLOSE_PRESSED,
     selection_background: rgb(38, 79, 120),
     inactive_selection_background: rgb(58, 61, 65),
+    selection_foreground: None,
     caret_line_background: rgb(40, 40, 40),
     strip_foreground: rgb(212, 212, 212),
     dark_frame: true,
@@ -120,6 +125,7 @@ impl Palette {
             close_pressed_background: highlight,
             selection_background: highlight,
             inactive_selection_background: highlight,
+            selection_foreground: Some(highlight_text),
             caret_line_background: window,
             strip_foreground: color(COLOR_BTNTEXT),
             dark_frame: false,
@@ -147,6 +153,9 @@ mod tests {
         assert_eq!(Palette::neutral(), light);
         assert!(dark.dark_frame);
         assert!(!light.dark_frame);
+        // Themed palettes leave selected text to the lexer colors; only high contrast forces it.
+        assert_eq!(dark.selection_foreground, None);
+        assert_eq!(light.selection_foreground, None);
     }
 
     #[test]
@@ -184,6 +193,12 @@ mod tests {
             assert_eq!(
                 palette.close_hover_foreground,
                 GetSysColor(COLOR_HIGHLIGHTTEXT)
+            );
+            // Break caught: selected text keeping its lexer color on the system highlight
+            // background is unreadable in high contrast.
+            assert_eq!(
+                palette.selection_foreground,
+                Some(GetSysColor(COLOR_HIGHLIGHTTEXT))
             );
         }
         assert!(!palette.dark_frame);

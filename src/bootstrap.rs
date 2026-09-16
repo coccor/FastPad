@@ -532,8 +532,9 @@ mod tests {
         app.launch.request =
             crate::launch::LaunchRequest::Open(fixture.path.clone().into_os_string());
         let main = ProductionWindow::new(app);
-        let editor =
-            unsafe { initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap() };
+        unsafe {
+            initialize_editor_with(main.hwnd, &main.identity, Editor::create).unwrap();
+        }
         unsafe {
             SendMessageW(main.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);
             SendMessageW(main.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST, 0, 0);

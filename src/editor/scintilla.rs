@@ -11,7 +11,8 @@ use crate::editor::scintilla_constants::{
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{
     SC_ELEMENT_CARET_LINE_BACK, SC_ELEMENT_SELECTION_BACK, SC_ELEMENT_SELECTION_INACTIVE_BACK,
-    SC_WRAP_NONE, SC_WRAP_WORD, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR, SCI_SETMARGINLEFT,
+    SC_ELEMENT_SELECTION_INACTIVE_TEXT, SC_ELEMENT_SELECTION_TEXT, SC_WRAP_NONE, SC_WRAP_WORD,
+    SCI_RESETELEMENTCOLOUR, SCI_SETCARETFORE, SCI_SETELEMENTCOLOUR, SCI_SETMARGINLEFT,
     SCI_SETMARGINRIGHT, SCI_SETMARGINWIDTHN, SCI_SETSCROLLWIDTH, SCI_SETSCROLLWIDTHTRACKING,
     SCI_SETTABWIDTH, SCI_SETWRAPMODE, SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT,
 };
@@ -683,6 +684,38 @@ impl Editor {
         _inactive_selection: u32,
         _caret_line: u32,
     ) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
+    /// Forces the selected-text foreground (focused and unfocused), or resets both elements so the
+    /// lexer's own style colors show through again. Only high contrast sets a color, where selected
+    /// text must keep the system highlight pair to stay legible.
+    #[cfg(windows)]
+    pub fn set_selection_text_colors(&self, foreground: Option<u32>) -> Result<()> {
+        for element in [
+            SC_ELEMENT_SELECTION_TEXT,
+            SC_ELEMENT_SELECTION_INACTIVE_TEXT,
+        ] {
+            match foreground {
+                Some(colour) => self.endpoint.send_direct_checked(
+                    SCI_SETELEMENTCOLOUR,
+                    element as usize,
+                    ((colour & 0x00FF_FFFF) | 0xFF00_0000) as isize,
+                )?,
+                None => self.endpoint.send_direct_checked(
+                    SCI_RESETELEMENTCOLOUR,
+                    element as usize,
+                    0,
+                )?,
+            };
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_selection_text_colors(&self, _foreground: Option<u32>) -> Result<()> {
         Err(FastPadError::Invariant(
             "Scintilla editor is only supported on Windows",
         ))
@@ -1397,9 +1430,8 @@ mod tests {
         let harness = TestDirectHarness::new();
         let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
 
-        let result = editor.initialize_view(|_| {
-            Err(crate::FastPadError::Invariant("cosmetic chrome failure"))
-        });
+        let result = editor
+            .initialize_view(|_| Err(crate::FastPadError::Invariant("cosmetic chrome failure")));
 
         assert!(result.is_ok());
         assert_eq!(
@@ -1489,6 +1521,47 @@ mod tests {
                     SCI_SETELEMENTCOLOUR,
                     SC_ELEMENT_CARET_LINE_BACK as usize,
                     0xFF28_2828_u32 as isize
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn high_contrast_selection_text_is_forced_and_otherwise_reset() {
+        // Break caught: leaving the selected-text element unset paints lexer-colored text on the
+        // system highlight background in high contrast, which is frequently unreadable; never
+        // resetting it would then keep those system colors after leaving high contrast.
+        use crate::editor::scintilla_constants::{
+            SC_ELEMENT_SELECTION_INACTIVE_TEXT, SC_ELEMENT_SELECTION_TEXT, SCI_RESETELEMENTCOLOUR,
+        };
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.set_selection_text_colors(Some(0x00FF_FFFF)).unwrap();
+        editor.set_selection_text_colors(None).unwrap();
+
+        assert_eq!(
+            harness.calls(),
+            vec![
+                (
+                    SCI_SETELEMENTCOLOUR,
+                    SC_ELEMENT_SELECTION_TEXT as usize,
+                    0xFFFF_FFFF_u32 as isize
+                ),
+                (
+                    SCI_SETELEMENTCOLOUR,
+                    SC_ELEMENT_SELECTION_INACTIVE_TEXT as usize,
+                    0xFFFF_FFFF_u32 as isize
+                ),
+                (
+                    SCI_RESETELEMENTCOLOUR,
+                    SC_ELEMENT_SELECTION_TEXT as usize,
+                    0
+                ),
+                (
+                    SCI_RESETELEMENTCOLOUR,
+                    SC_ELEMENT_SELECTION_INACTIVE_TEXT as usize,
+                    0
                 ),
             ]
         );

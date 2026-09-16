@@ -11,6 +11,7 @@ use crate::window::menus::{self, MenuBar};
 use crate::window::messages::{
     DeferredAction, classify_deferred_message, completed_milestone, deferred_start_message,
 };
+use crate::window::modal::prompt_close_decision;
 use crate::window::palette::Palette;
 use crate::window::tabs::CloseReviewKey;
 use crate::window::titlebar::{HitTarget, PointerState, TitleFontHandles};
@@ -28,17 +29,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
     GetWindowLongPtrW, IsZoomed, KillTimer, MoveWindow, OBJID_CLIENT, PostMessageW,
-    PostQuitMessage, QS_INPUT, RegisterClassW,
-    SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
-    WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE,
-    WM_NCMOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    PostQuitMessage, QS_INPUT, RegisterClassW, SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE,
+    SC_RESTORE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, UnregisterClassW, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITMENULOOP,
+    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED,
+    WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
-use crate::window::modal::prompt_close_decision;
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
 
@@ -1123,6 +1123,7 @@ fn apply_theme(hwnd: HWND) {
         palette.inactive_selection_background,
         palette.caret_line_background,
     );
+    let _ = editor.set_selection_text_colors(palette.selection_foreground);
     if frame_change {
         crate::window::titlebar::apply_frame_theme(hwnd, editor.hwnd(), palette.dark_frame);
     }
@@ -1941,8 +1942,10 @@ fn snapshot_next_document(hwnd: HWND) {
     let job = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
         let editor = app.editor.clone()?;
-        let document =
-            crate::recovery::next_snapshot_document(app.tabs.documents(), app.last_snapshot_attempt)?;
+        let document = crate::recovery::next_snapshot_document(
+            app.tabs.documents(),
+            app.last_snapshot_attempt,
+        )?;
         let origin = document.recovery_origin.as_ref();
         Some(SnapshotJob {
             editor,
@@ -2557,7 +2560,6 @@ mod tests {
     };
     use crate::app::App;
     use crate::document::{CloseDecision, Language, RecoveryId};
-    use crate::window::modal::{answer_next_close_prompt, answer_next_save_dialog};
     use crate::editor::scintilla_constants::SCI_GETMODIFY;
     use crate::file::encoding::Encoding;
     use crate::languages::LanguageManager;
@@ -2566,6 +2568,7 @@ mod tests {
     use crate::recovery::snapshot::snapshot_path;
     use crate::recovery::{Snapshot, write_snapshot};
     use crate::window::commands::CommandId;
+    use crate::window::modal::{answer_next_close_prompt, answer_next_save_dialog};
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::sync::{

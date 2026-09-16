@@ -280,7 +280,10 @@ fn open_failure_is_exit(error: u32, process_id: u32) -> TestResult<()> {
     if error == ERROR_INVALID_PARAMETER {
         return Ok(());
     }
-    Err(format!("could not open process {process_id} to wait for its exit: Win32 error {error}").into())
+    Err(
+        format!("could not open process {process_id} to wait for its exit: Win32 error {error}")
+            .into(),
+    )
 }
 
 #[cfg(windows)]

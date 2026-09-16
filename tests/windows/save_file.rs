@@ -281,7 +281,9 @@ fn tab_close_yes_keeps_the_tab_open_when_the_write_fails() {
     assert_eq!(scintilla_text(main.editor).unwrap(), edited);
     let reported = notices(&main);
     assert!(
-        reported.iter().any(|notice| notice.contains("could not save")),
+        reported
+            .iter()
+            .any(|notice| notice.contains("could not save")),
         "{reported:?}"
     );
     main.with_app(|app| {

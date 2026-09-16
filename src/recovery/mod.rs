@@ -43,7 +43,11 @@ pub fn next_snapshot_document<'a>(
         return None;
     }
     let start = previous
-        .and_then(|previous| documents.iter().position(|document| document.id == previous))
+        .and_then(|previous| {
+            documents
+                .iter()
+                .position(|document| document.id == previous)
+        })
         .map_or(0, |index| index + 1);
     (0..documents.len())
         .map(|offset| documents[(start + offset) % documents.len()])
