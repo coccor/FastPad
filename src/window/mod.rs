@@ -8,6 +8,7 @@ mod messages;
 mod modal;
 pub mod notification;
 pub mod palette;
+pub(crate) mod panel;
 pub mod status;
 pub mod tabs;
 pub mod titlebar;

@@ -384,6 +384,14 @@ unsafe extern "system" fn main_window_proc(
             refilter_command_palette(hwnd);
             0
         }
+        WM_CTLCOLOREDIT if find_bar_owns(hwnd, lparam as HWND) => unsafe { app_ptr(hwnd) }
+            .and_then(|app| {
+                unsafe { app.as_ref() }
+                    .find_bar
+                    .as_ref()
+                    .map(|bar| bar.control_color(wparam as HDC) as LRESULT)
+            })
+            .unwrap_or(0),
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX if command_palette_owns(hwnd, lparam as HWND) => {
             with_command_palette(hwnd, |palette| {
                 palette.control_color(wparam as HDC, lparam as HWND) as LRESULT
@@ -772,11 +780,13 @@ fn layout_editor_and_find_bar(hwnd: HWND) {
         GetClientRect(hwnd, &mut rect);
     }
     let width = rect.right - rect.left;
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
+    let font = title_chrome(hwnd).1.text();
     let find_bar_height = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             let bar = unsafe { app.as_ref() }.find_bar.as_ref()?;
-            bar.layout(width, title_height);
-            bar.is_visible().then_some(find_bar::FIND_BAR_HEIGHT)
+            bar.layout(width, title_height, dpi, font);
+            bar.is_visible().then(|| find_bar::find_bar_height(dpi))
         })
         .unwrap_or(0);
     let content_top = title_height + find_bar_height;
@@ -804,6 +814,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
         let text = editor.selected_text().ok()?;
         (!text.is_empty() && !text.contains(['\n', '\r'])).then_some(text)
     });
+    let colors = title_chrome(hwnd).0;
     let opened = unsafe { app_ptr(hwnd) }.is_some_and(|mut app| {
         let app = unsafe { app.as_mut() };
         if app.find_bar.is_none() {
@@ -812,7 +823,7 @@ fn open_find_bar(hwnd: HWND, mode: find_bar::FindBarMode) {
         let Some(bar) = app.find_bar.as_mut() else {
             return false;
         };
-        bar.show(mode, prefill.as_deref());
+        bar.show(mode, prefill.as_deref(), colors);
         true
     });
     if !opened || !identity.is_live_for(hwnd) {
@@ -849,8 +860,7 @@ pub(crate) fn close_find_bar(hwnd: HWND) {
 }
 
 /// Overlays the palette at the top of the editor, even with no tab open (New and Open stay
-/// available then). It stays below a visible find bar: nothing repaints the band around the find
-/// fields, so a palette hidden over it would leave its pixels behind.
+/// available then), below a visible find bar so both stay usable.
 fn layout_command_palette(hwnd: HWND) {
     if !with_command_palette(hwnd, CommandPalette::is_visible).unwrap_or(false) {
         return;
@@ -863,7 +873,11 @@ fn layout_command_palette(hwnd: HWND) {
                 .is_visible()
                 .then_some(())
         })
-        .map_or(0, |()| find_bar::FIND_BAR_HEIGHT);
+        .map_or(0, |()| {
+            find_bar::find_bar_height(
+                unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96),
+            )
+        });
     let top = title_layout(hwnd).height + find_bar_height;
     let mut rect = RECT::default();
     unsafe {
@@ -964,8 +978,22 @@ fn refilter_command_palette(hwnd: HWND) {
     layout_command_palette(hwnd);
 }
 
-pub(crate) fn paint_command_palette(hwnd: HWND, panel: HWND) {
-    if with_command_palette(hwnd, |palette| palette.paint_panel(panel)).is_none() {
+/// `WM_PAINT` for a palette or find bar panel.
+pub(crate) fn paint_panel(hwnd: HWND, panel: HWND) {
+    let glyph_font = title_chrome(hwnd).1.glyph();
+    let painted = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        let app = unsafe { app.as_ref() };
+        if let Some(palette) = app.command_palette.as_ref().filter(|p| p.owns(panel)) {
+            palette.paint_panel(panel);
+            true
+        } else if let Some(bar) = app.find_bar.as_ref().filter(|bar| bar.owns(panel)) {
+            bar.paint_panel(panel, glyph_font);
+            true
+        } else {
+            false
+        }
+    });
+    if !painted {
         // Validates the region so an orphaned panel does not repaint forever.
         unsafe {
             windows_sys::Win32::Graphics::Gdi::ValidateRect(panel, std::ptr::null());
@@ -996,6 +1024,39 @@ pub(crate) fn focus_command_palette(hwnd: HWND) {
 pub(crate) fn command_palette_owns(hwnd: HWND, control: HWND) -> bool {
     !control.is_null()
         && with_command_palette(hwnd, |palette| palette.owns(control)).unwrap_or(false)
+}
+
+/// Mouse input on a panel: hovering and clicking the find bar's close button.
+pub(crate) fn panel_pointer(hwnd: HWND, panel: HWND, message: u32, lparam: LPARAM) {
+    let close = unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .find_bar
+            .as_ref()
+            .filter(|bar| bar.owns(panel))
+            .is_some_and(|bar| bar.pointer(message, lparam))
+    });
+    if close {
+        close_find_bar(hwnd);
+    }
+}
+
+/// `WM_PAINT` for an empty find field; false when there is no find bar to paint it.
+pub(crate) fn paint_find_placeholder(hwnd: HWND, edit: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .find_bar
+            .as_ref()
+            .is_some_and(|bar| bar.paint_placeholder(edit))
+    })
+}
+
+fn find_bar_owns(hwnd: HWND, control: HWND) -> bool {
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .find_bar
+            .as_ref()
+            .is_some_and(|bar| bar.owns(control))
+    })
 }
 
 pub(crate) fn find_next(hwnd: HWND) {
@@ -1656,6 +1717,12 @@ fn apply_theme(hwnd: HWND) {
             let palette = Palette::for_cached_theme(app.theme, app.settings.theme);
             let frame_change = app.dark_frame_applied != palette.dark_frame;
             app.dark_frame_applied = palette.dark_frame;
+            if let Some(bar) = app.find_bar.as_mut() {
+                bar.set_colors(palette);
+            }
+            if let Some(command_palette) = app.command_palette.as_mut() {
+                command_palette.set_colors(palette);
+            }
             let language = app
                 .tabs
                 .active()
@@ -1676,6 +1743,15 @@ fn apply_theme(hwnd: HWND) {
         palette.caret_line_background,
     );
     let _ = editor.set_selection_text_colors(palette.selection_foreground);
+    if let Some(app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_ref() };
+        if let Some(bar) = app.find_bar.as_ref() {
+            bar.invalidate();
+        }
+        if let Some(command_palette) = app.command_palette.as_ref() {
+            command_palette.invalidate();
+        }
+    }
     if frame_change {
         crate::window::titlebar::apply_frame_theme(hwnd, editor.hwnd(), palette.dark_frame);
     }
@@ -3567,6 +3643,74 @@ mod tests {
             unsafe { SendMessageW(editor.hwnd(), SCI_GETZOOM, 0, 0) },
             -1
         );
+    }
+
+    #[test]
+    fn the_find_bar_panel_reserves_its_band_above_the_editor_and_follows_theme_changes() {
+        // Break caught: a find bar whose painted band is not reserved (the editor draws over it),
+        // or that keeps the old colors after the theme changes while it is open.
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        super::build_chrome(window.hwnd);
+        let top_of = |child| {
+            let mut rect = RECT::default();
+            let mut origin = windows_sys::Win32::Foundation::POINT::default();
+            unsafe {
+                GetWindowRect(child, &mut rect);
+                windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut origin);
+            }
+            (rect.top - origin.y, rect.bottom - rect.top)
+        };
+        let visible = |child| {
+            (unsafe { GetWindowLongPtrW(child, super::GWL_STYLE) }) as u32 & super::WS_VISIBLE != 0
+        };
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
+        let title_height = super::title_layout(window.hwnd).height;
+
+        execute_command(window.hwnd, CommandId::Find);
+        let panel = app_mut(window.hwnd).find_bar.as_ref().unwrap().panel_hwnd();
+        assert!(visible(panel));
+        let band = super::find_bar::find_bar_height(dpi);
+        assert_eq!(top_of(panel), (title_height, band));
+        assert_eq!(top_of(editor.hwnd()).0, title_height + band);
+
+        let brush_before = {
+            let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+            bar.control_color(std::ptr::null_mut())
+        };
+        execute_command(window.hwnd, CommandId::ThemeCatppuccinMocha);
+        let bar = app_mut(window.hwnd).find_bar.as_ref().unwrap();
+        assert!(bar.is_visible());
+        assert_ne!(bar.control_color(std::ptr::null_mut()), brush_before);
+
+        assert_eq!(bar.placeholder(bar.query_hwnd()), Some("Find"));
+        assert_eq!(bar.placeholder(bar.replace_hwnd()), Some("Replace"));
+
+        // A click released on the close button at the bar's right end closes it.
+        let mut client = RECT::default();
+        unsafe { GetClientRect(panel, &mut client) };
+        let point = |x: i32, y: i32| ((y as u32) << 16 | (x as u32 & 0xffff)) as super::LPARAM;
+        let close_point = point(client.right - band / 2, band / 2);
+        super::panel_pointer(
+            window.hwnd,
+            panel,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+            point(client.right / 2, band / 2),
+        );
+        assert!(
+            visible(panel),
+            "a click on the field area must not close the bar"
+        );
+        super::panel_pointer(
+            window.hwnd,
+            panel,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP,
+            close_point,
+        );
+        assert!(!visible(panel));
+        assert_eq!(top_of(editor.hwnd()).0, title_height);
     }
 
     #[test]

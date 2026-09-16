@@ -143,30 +143,43 @@ impl SearchState {
 
 // --- Window integration: native child controls hosting Find/Replace ---
 
-#[cfg(windows)]
 use crate::platform::{last_error, wide_null};
-#[cfg(windows)]
+use crate::window::palette::Palette;
+use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
+use std::cell::Cell;
 use std::rc::Rc;
-use windows_sys::Win32::Foundation::HWND;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
-#[cfg(windows)]
-use windows_sys::Win32::UI::Controls::EM_SETSEL;
-#[cfg(windows)]
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SetFocus, VK_ESCAPE, VK_RETURN, VK_SHIFT,
+use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow, SelectObject, SetBkColor, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
-#[cfg(windows)]
+use windows_sys::Win32::UI::Controls::{
+    EM_GETMARGINS, EM_REPLACESEL, EM_SETSEL, EM_UNDO, WM_MOUSELEAVE,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetFocus, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
+    VK_RETURN, VK_SHIFT,
+};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
-#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, ES_AUTOHSCROLL, GetWindowTextLengthW, GetWindowTextW, MoveWindow, SW_HIDE,
-    SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow, WM_KEYDOWN, WM_NCDESTROY, WS_BORDER,
-    WS_CHILD, WS_TABSTOP,
+    DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetParent, GetWindowTextLengthW, GetWindowTextW,
+    HWND_TOP, MoveWindow, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
+    SetWindowPos, SetWindowTextW, ShowWindow, WM_CHAR, WM_CLEAR, WM_CUT, WM_GETFONT, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_PASTE, WM_SETFOCUS,
+    WM_SETFONT, WM_SETTEXT, WM_UNDO, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
 };
 
-/// Fixed height of the bar, reserved above the editor whenever it's visible.
-pub(crate) const FIND_BAR_HEIGHT: i32 = 26;
+const BAR_HEIGHT_AT_96_DPI: i32 = 36;
+const FIELD_HEIGHT_AT_96_DPI: i32 = 28;
+const PADDING_AT_96_DPI: i32 = 6;
+const FIELD_TEXT_INSET_AT_96_DPI: i32 = 8;
+
+/// Height of the bar, reserved above the editor whenever it's visible.
+pub(crate) const fn find_bar_height(dpi: u32) -> i32 {
+    scale(BAR_HEIGHT_AT_96_DPI, dpi)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FindBarMode {
@@ -174,62 +187,154 @@ pub(crate) enum FindBarMode {
     Replace,
 }
 
-/// Two plain Win32 `Edit` child controls (query, replacement) parented directly to the main
-/// window, shown/hidden/positioned by the caller. No custom window class: consistent with the
-/// project's "no UI framework" constraint, and simple enough not to need one.
+/// One painted field box and the borderless `Edit` centered inside it, in bar coordinates.
+#[derive(Clone, Copy)]
+struct FieldLayout {
+    field: RECT,
+    edit: RECT,
+}
+
+/// The bar's parts in bar coordinates: the query field, in Replace mode the replacement field
+/// beside it (each half the width), and a square close button at the right end.
+struct BarLayout {
+    query: FieldLayout,
+    replace: Option<FieldLayout>,
+    close: RECT,
+}
+
+fn bar_layout(width: i32, dpi: u32, text_height: i32, mode: FindBarMode) -> BarLayout {
+    let padding = scale(PADDING_AT_96_DPI, dpi);
+    let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
+    let top = (find_bar_height(dpi) - 1 - field_height) / 2;
+    let close = RECT {
+        left: (width - padding - field_height).max(0),
+        top,
+        right: (width - padding).max(0),
+        bottom: top + field_height,
+    };
+    let (query, replace) = field_layouts(close.left, dpi, text_height, mode, top);
+    BarLayout {
+        query,
+        replace,
+        close,
+    }
+}
+
+/// The fields across `width` (the right padding included), starting `top` pixels down the bar.
+fn field_layouts(
+    width: i32,
+    dpi: u32,
+    text_height: i32,
+    mode: FindBarMode,
+    top: i32,
+) -> (FieldLayout, Option<FieldLayout>) {
+    let padding = scale(PADDING_AT_96_DPI, dpi);
+    let field_height = scale(FIELD_HEIGHT_AT_96_DPI, dpi);
+    let inset_x = scale(FIELD_TEXT_INSET_AT_96_DPI, dpi);
+    let text_height = text_height.clamp(1, (field_height - 2).max(1));
+    let field = |left: i32, right: i32| {
+        let field = RECT {
+            left,
+            top,
+            right: right.max(left),
+            bottom: top + field_height,
+        };
+        let edit_top = top + (field_height - text_height) / 2;
+        FieldLayout {
+            field,
+            edit: RECT {
+                left: left + inset_x,
+                top: edit_top,
+                right: (field.right - inset_x).max(left + inset_x),
+                bottom: edit_top + text_height,
+            },
+        }
+    };
+    match mode {
+        FindBarMode::Find => (field(padding, width - padding), None),
+        FindBarMode::Replace => {
+            let half = (width - 3 * padding) / 2;
+            (
+                field(padding, padding + half),
+                // An odd leftover pixel stays at the right edge so both fields match.
+                Some(field(2 * padding + half, 2 * padding + 2 * half)),
+            )
+        }
+    }
+}
+
+/// A painted band in the strip colors hosting two borderless `Edit` controls (query, replacement),
+/// shown/hidden/positioned by the main window. Each field sits in a box in the editor's colors,
+/// outlined with the accent while it has the focus.
 #[derive(Debug)]
 pub(crate) struct FindBar {
+    panel: HWND,
     query_edit: HWND,
     replace_edit: HWND,
     mode: FindBarMode,
     visible: bool,
+    colors: Palette,
+    field_brush: HBRUSH,
+    close_hovered: Cell<bool>,
 }
 
 impl FindBar {
-    #[cfg(windows)]
     pub(crate) fn create(parent: HWND) -> crate::Result<Self> {
-        let query_edit = create_edit_child(parent)?;
-        let replace_edit = create_edit_child(parent)?;
-        install_field_hook(query_edit, parent, FindField::Query)?;
-        install_field_hook(replace_edit, parent, FindField::Replace)?;
+        let panel = create_panel(parent)?;
+        let fields = (|| {
+            let query_edit = create_edit_child(panel)?;
+            let replace_edit = create_edit_child(panel)?;
+            install_field_hook(query_edit, parent, FindField::Query)?;
+            install_field_hook(replace_edit, parent, FindField::Replace)?;
+            Ok((query_edit, replace_edit))
+        })();
+        let (query_edit, replace_edit) = match fields {
+            Ok(fields) => fields,
+            Err(error) => {
+                unsafe {
+                    DestroyWindow(panel);
+                }
+                return Err(error);
+            }
+        };
+        let colors = Palette::neutral();
         Ok(Self {
+            panel,
             query_edit,
             replace_edit,
             mode: FindBarMode::Find,
             visible: false,
+            colors,
+            field_brush: unsafe { CreateSolidBrush(colors.editor_background) },
+            close_hovered: Cell::new(false),
         })
-    }
-
-    #[cfg(not(windows))]
-    pub(crate) fn create(_parent: HWND) -> crate::Result<Self> {
-        Err(crate::FastPadError::Invariant(
-            "Scintilla editor is only supported on Windows",
-        ))
     }
 
     pub(crate) fn is_visible(&self) -> bool {
         self.visible
     }
 
-    #[cfg(windows)]
+    pub(crate) fn owns(&self, hwnd: HWND) -> bool {
+        !hwnd.is_null()
+            && (hwnd == self.panel || hwnd == self.query_edit || hwnd == self.replace_edit)
+    }
+
     pub(crate) fn query_text(&self) -> String {
         control_text(self.query_edit)
     }
 
-    #[cfg(windows)]
     pub(crate) fn replace_text(&self) -> String {
         control_text(self.replace_edit)
     }
 
-    #[cfg(windows)]
-    pub(crate) fn show(&mut self, mode: FindBarMode, prefill: Option<&str>) {
+    pub(crate) fn show(&mut self, mode: FindBarMode, prefill: Option<&str>, colors: Palette) {
+        self.set_colors(colors);
         self.mode = mode;
         self.visible = true;
         if let Some(text) = prefill {
             set_control_text(self.query_edit, text);
         }
         unsafe {
-            ShowWindow(self.query_edit, SW_SHOWNA);
             ShowWindow(
                 self.replace_edit,
                 if mode == FindBarMode::Replace {
@@ -241,48 +346,251 @@ impl FindBar {
         }
     }
 
-    #[cfg(windows)]
     pub(crate) fn hide(&mut self) {
         self.visible = false;
         unsafe {
-            ShowWindow(self.query_edit, SW_HIDE);
-            ShowWindow(self.replace_edit, SW_HIDE);
+            ShowWindow(self.panel, SW_HIDE);
         }
     }
 
-    #[cfg(windows)]
-    pub(crate) fn layout(&self, width: i32, top: i32) {
+    /// Recolors for a theme change; the caller repaints with `invalidate`.
+    pub(crate) fn set_colors(&mut self, colors: Palette) {
+        if colors == self.colors {
+            return;
+        }
+        unsafe {
+            DeleteObject(self.field_brush);
+            self.field_brush = CreateSolidBrush(colors.editor_background);
+        }
+        self.colors = colors;
+    }
+
+    pub(crate) fn invalidate(&self) {
+        unsafe {
+            RedrawWindow(
+                self.panel,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
+        }
+    }
+
+    /// Places the bar across `width` at `top` and its fields inside it.
+    pub(crate) fn layout(&self, width: i32, top: i32, dpi: u32, font: HFONT) {
         if !self.visible {
             return;
         }
-        let inner_top = top + 3;
-        let inner_height = (FIND_BAR_HEIGHT - 6).max(0);
-        let replace_visible = self.mode == FindBarMode::Replace;
-        let field_width = if replace_visible {
-            ((width - 12) / 2).max(0)
-        } else {
-            (width - 8).max(0)
-        };
         unsafe {
-            MoveWindow(self.query_edit, 4, inner_top, field_width, inner_height, 1);
-            if replace_visible {
-                MoveWindow(
-                    self.replace_edit,
-                    8 + field_width,
-                    inner_top,
-                    field_width,
-                    inner_height,
-                    1,
-                );
+            if !font.is_null() {
+                SendMessageW(self.query_edit, WM_SETFONT, font as WPARAM, 0);
+                SendMessageW(self.replace_edit, WM_SETFONT, font as WPARAM, 0);
             }
+        }
+        let BarLayout { query, replace, .. } =
+            bar_layout(width, dpi, text_height(self.query_edit, font), self.mode);
+        let move_to = |hwnd, rect: RECT| unsafe {
+            MoveWindow(
+                hwnd,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                1,
+            );
+        };
+        move_to(self.query_edit, query.edit);
+        if let Some(replace) = replace {
+            move_to(self.replace_edit, replace.edit);
+        }
+        unsafe {
+            SetWindowPos(
+                self.panel,
+                HWND_TOP,
+                0,
+                top,
+                width.max(0),
+                find_bar_height(dpi),
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            InvalidateRect(self.panel, std::ptr::null(), 0);
         }
     }
 
-    #[cfg(windows)]
     pub(crate) fn focus_query(&self) {
         unsafe {
             SetFocus(self.query_edit);
             select_all(self.query_edit);
+        }
+    }
+
+    /// `WM_CTLCOLOREDIT` for either field.
+    pub(crate) fn control_color(&self, dc: HDC) -> HBRUSH {
+        unsafe {
+            SetTextColor(dc, self.colors.editor_foreground);
+            SetBkColor(dc, self.colors.editor_background);
+        }
+        self.field_brush
+    }
+
+    /// `WM_MOUSEMOVE`, `WM_MOUSELEAVE` and `WM_LBUTTONUP` on the bar; returns true when the close
+    /// button was clicked.
+    pub(crate) fn pointer(&self, message: u32, lparam: LPARAM) -> bool {
+        let layout = self.current_layout();
+        let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+        let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+        let over_close = message != WM_MOUSELEAVE
+            && x >= layout.close.left
+            && x < layout.close.right
+            && y >= layout.close.top
+            && y < layout.close.bottom;
+        if message == WM_MOUSEMOVE {
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.panel,
+                dwHoverTime: 0,
+            };
+            unsafe {
+                TrackMouseEvent(&mut track);
+            }
+        }
+        if self.close_hovered.replace(over_close) != over_close {
+            unsafe {
+                InvalidateRect(self.panel, &layout.close, 0);
+            }
+        }
+        message == WM_LBUTTONUP && over_close
+    }
+
+    fn current_layout(&self) -> BarLayout {
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(self.panel, &mut client);
+        }
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(self.panel) }.max(96);
+        bar_layout(client.right, dpi, 0, self.mode)
+    }
+
+    /// `WM_PAINT` for an empty field: its placeholder in the muted color where typed text starts.
+    /// Returns false for a field that is not this bar's, which then paints normally.
+    pub(crate) fn paint_placeholder(&self, edit: HWND) -> bool {
+        let Some(placeholder) = self.placeholder(edit) else {
+            return false;
+        };
+        let mut paint = PAINTSTRUCT::default();
+        let dc = unsafe { BeginPaint(edit, &mut paint) };
+        if dc.is_null() {
+            return true;
+        }
+        unsafe {
+            let mut client = RECT::default();
+            GetClientRect(edit, &mut client);
+            fill(dc, client, self.colors.editor_background);
+            let font = SendMessageW(edit, WM_GETFONT, 0, 0);
+            let previous = (font != 0).then(|| SelectObject(dc, font as _));
+            // Typed text starts after the Edit's left margin (the low word).
+            client.left += (SendMessageW(edit, EM_GETMARGINS, 0, 0) & 0xffff) as i32;
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, self.colors.muted_foreground);
+            let mut text = placeholder.encode_utf16().collect::<Vec<_>>();
+            DrawTextW(
+                dc,
+                text.as_mut_ptr(),
+                text.len() as i32,
+                &mut client,
+                DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+            if let Some(previous) = previous {
+                SelectObject(dc, previous);
+            }
+            EndPaint(edit, &paint);
+        }
+        true
+    }
+
+    /// What an empty field shows, or `None` for a control that is not one of this bar's fields.
+    pub(crate) fn placeholder(&self, edit: HWND) -> Option<&'static str> {
+        if edit == self.query_edit {
+            Some("Find")
+        } else if edit == self.replace_edit {
+            Some("Replace")
+        } else {
+            None
+        }
+    }
+
+    /// `WM_PAINT` for the bar: strip background, a hairline above the editor, each visible
+    /// field's box (outlined with the accent while it has the focus), and the close button.
+    pub(crate) fn paint_panel(&self, panel: HWND, glyph_font: HFONT) {
+        let mut paint = PAINTSTRUCT::default();
+        let dc = unsafe { BeginPaint(panel, &mut paint) };
+        if dc.is_null() {
+            return;
+        }
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(panel, &mut client);
+        }
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(panel) }.max(96);
+        let colors = self.colors;
+        let BarLayout {
+            query,
+            replace,
+            close,
+        } = bar_layout(client.right, dpi, 0, self.mode);
+        let focus = unsafe { GetFocus() };
+        unsafe {
+            fill(dc, client, colors.strip_background);
+            fill(
+                dc,
+                RECT {
+                    top: client.bottom - 1,
+                    ..client
+                },
+                colors.pressed_background,
+            );
+            for (layout, edit) in [(Some(query), self.query_edit), (replace, self.replace_edit)] {
+                let Some(layout) = layout else {
+                    continue;
+                };
+                let outline = if focus == edit {
+                    colors.selection_background
+                } else {
+                    colors.pressed_background
+                };
+                fill(dc, layout.field, outline);
+                fill(dc, inset(layout.field, 1), colors.editor_background);
+            }
+            let hovered = self.close_hovered.get();
+            if hovered {
+                fill(dc, close, colors.hover_background);
+            }
+            if !glyph_font.is_null() {
+                let previous = SelectObject(dc, glyph_font as _);
+                SetBkMode(dc, TRANSPARENT as i32);
+                SetTextColor(
+                    dc,
+                    if hovered {
+                        colors.hover_foreground
+                    } else {
+                        colors.muted_foreground
+                    },
+                );
+                let mut glyph = crate::window::titlebar::GLYPH_CLOSE
+                    .encode_utf16()
+                    .collect::<Vec<_>>();
+                let mut rect = close;
+                DrawTextW(
+                    dc,
+                    glyph.as_mut_ptr(),
+                    glyph.len() as i32,
+                    &mut rect,
+                    DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX,
+                );
+                SelectObject(dc, previous);
+            }
+            EndPaint(panel, &paint);
         }
     }
 
@@ -303,6 +611,19 @@ impl FindBar {
     pub(crate) fn replace_hwnd(&self) -> HWND {
         self.replace_edit
     }
+
+    #[cfg(test)]
+    pub(crate) fn panel_hwnd(&self) -> HWND {
+        self.panel
+    }
+}
+
+impl Drop for FindBar {
+    fn drop(&mut self) {
+        unsafe {
+            DeleteObject(self.field_brush);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,7 +638,6 @@ struct FindFieldHook {
 }
 const FIND_FIELD_HOOK_ID: usize = 0x4650_4644;
 
-#[cfg(windows)]
 fn install_field_hook(field_hwnd: HWND, parent: HWND, field: FindField) -> crate::Result<()> {
     let data = Rc::into_raw(Rc::new(FindFieldHook { parent, field })) as usize;
     if unsafe { SetWindowSubclass(field_hwnd, Some(find_field_proc), FIND_FIELD_HOOK_ID, data) }
@@ -331,7 +651,6 @@ fn install_field_hook(field_hwnd: HWND, parent: HWND, field: FindField) -> crate
     Ok(())
 }
 
-#[cfg(windows)]
 unsafe extern "system" fn find_field_proc(
     hwnd: HWND,
     message: u32,
@@ -351,51 +670,70 @@ unsafe extern "system" fn find_field_proc(
             Rc::decrement_strong_count(raw);
         }
     }
+    // A single-line Edit beeps at Enter and Escape characters; both are handled on key down.
+    if message == WM_CHAR && matches!(wparam as u16, 0x0d | 0x1b) {
+        return 0;
+    }
+    if message == WM_PAINT
+        && unsafe { GetWindowTextLengthW(hwnd) } == 0
+        && super::main_window::paint_find_placeholder(hook.parent, hwnd)
+    {
+        return 0;
+    }
+    // The Edit repaints only the text it changes; the placeholder must go (or come back) whole.
+    let edits_text = matches!(
+        message,
+        WM_CHAR
+            | WM_KEYDOWN
+            | WM_PASTE
+            | WM_CUT
+            | WM_CLEAR
+            | WM_UNDO
+            | WM_SETTEXT
+            | EM_UNDO
+            | EM_REPLACESEL
+    );
+    let was_empty = edits_text && unsafe { GetWindowTextLengthW(hwnd) } == 0;
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
-    if message == WM_KEYDOWN {
-        let shift = unsafe { GetAsyncKeyState(VK_SHIFT as i32) } < 0;
-        let key = wparam as u16;
-        if key == VK_RETURN {
-            match hook.field {
-                FindField::Query if shift => super::main_window::find_previous(hook.parent),
-                FindField::Query => super::main_window::find_next(hook.parent),
-                FindField::Replace if shift => super::main_window::replace_all_matches(hook.parent),
-                FindField::Replace => super::main_window::replace_current(hook.parent),
-            }
-        } else if key == VK_ESCAPE {
-            super::main_window::close_find_bar(hook.parent);
+    if edits_text && was_empty != (unsafe { GetWindowTextLengthW(hwnd) } == 0) {
+        unsafe {
+            InvalidateRect(hwnd, std::ptr::null(), 1);
         }
+    }
+    match message {
+        WM_KEYDOWN => {
+            let shift = unsafe { GetAsyncKeyState(VK_SHIFT as i32) } < 0;
+            let key = wparam as u16;
+            if key == VK_RETURN {
+                match hook.field {
+                    FindField::Query if shift => super::main_window::find_previous(hook.parent),
+                    FindField::Query => super::main_window::find_next(hook.parent),
+                    FindField::Replace if shift => {
+                        super::main_window::replace_all_matches(hook.parent)
+                    }
+                    FindField::Replace => super::main_window::replace_current(hook.parent),
+                }
+            } else if key == VK_ESCAPE {
+                super::main_window::close_find_bar(hook.parent);
+            }
+        }
+        // The focused field carries the accent outline the bar paints.
+        WM_SETFOCUS | WM_KILLFOCUS => unsafe {
+            InvalidateRect(GetParent(hwnd), std::ptr::null(), 0);
+        },
+        _ => {}
     }
     result
 }
 
-#[cfg(windows)]
-fn create_edit_child(parent: HWND) -> crate::Result<HWND> {
-    let class_name = wide_null("Edit");
-    let hwnd = unsafe {
-        CreateWindowExW(
-            0,
-            class_name.as_ptr(),
-            std::ptr::null(),
-            WS_CHILD | WS_TABSTOP | WS_BORDER | (ES_AUTOHSCROLL as u32),
-            0,
-            0,
-            0,
-            0,
-            parent,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if hwnd.is_null() {
-        Err(last_error())
-    } else {
-        Ok(hwnd)
-    }
+fn create_edit_child(panel: HWND) -> crate::Result<HWND> {
+    create_child(
+        panel,
+        &wide_null("Edit"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | (ES_AUTOHSCROLL as u32),
+    )
 }
 
-#[cfg(windows)]
 fn control_text(hwnd: HWND) -> String {
     unsafe {
         let length = GetWindowTextLengthW(hwnd);
@@ -409,7 +747,6 @@ fn control_text(hwnd: HWND) -> String {
     }
 }
 
-#[cfg(windows)]
 fn set_control_text(hwnd: HWND, text: &str) {
     let wide = wide_null(text);
     unsafe {
@@ -417,7 +754,6 @@ fn set_control_text(hwnd: HWND, text: &str) {
     }
 }
 
-#[cfg(windows)]
 fn select_all(hwnd: HWND) {
     unsafe {
         SendMessageW(hwnd, EM_SETSEL, 0, -1);
@@ -433,6 +769,35 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    #[test]
+    fn find_fields_center_their_text_and_replace_mode_splits_the_bar_without_overlap() {
+        // Break caught: field text stuck to the top of its box, or a replacement field that
+        // overlaps the query field or runs past the bar.
+        use super::{FindBarMode, bar_layout, find_bar_height};
+        for dpi in [96, 144] {
+            let height = find_bar_height(dpi);
+            let layout = bar_layout(800, dpi, 16, FindBarMode::Find);
+            let (query, replace, close) = (layout.query, layout.replace, layout.close);
+            assert!(replace.is_none());
+            // Break caught: a close button overlapping the field or hanging off the bar.
+            assert!(query.field.right < close.left && close.right < 800);
+            assert_eq!(close.right - close.left, close.bottom - close.top);
+            assert!(query.field.top > 0 && query.field.bottom < height - 1);
+            let field_middle = (query.field.top + query.field.bottom) / 2;
+            let edit_middle = (query.edit.top + query.edit.bottom) / 2;
+            assert!((field_middle - edit_middle).abs() <= 1);
+
+            let layout = bar_layout(800, dpi, 16, FindBarMode::Replace);
+            let (query, replace) = (layout.query, layout.replace.unwrap());
+            assert!(query.field.right < replace.field.left);
+            assert!(replace.field.right < layout.close.left);
+            assert_eq!(
+                query.field.right - query.field.left,
+                replace.field.right - replace.field.left
+            );
+        }
+    }
 
     #[test]
     fn next_match_wraps_once_then_stops() {

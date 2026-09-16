@@ -7,17 +7,15 @@ use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
 use crate::window::menus::{AcceleratorSpec, accelerator_specs};
 use crate::window::palette::Palette;
+use crate::window::panel::{create_child, create_panel, fill, inset, scale, text_height};
 use std::rc::Rc;
-use windows_sys::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
-};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DC_BRUSH, DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetStockObject, GetTextMetricsW, HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT, ReleaseDC,
-    SelectObject, SetBkColor, SetBkMode, SetDCBrushColor, SetTextColor, TEXTMETRICW, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, HBRUSH, HDC, HFONT,
+    InvalidateRect, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, EM_SETSEL, ODS_SELECTED, SetWindowTheme};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN,
@@ -25,15 +23,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetParent,
-    GetWindowTextLengthW, GetWindowTextW, HWND_TOP, IDC_ARROW, LB_ADDSTRING, LB_GETCURSEL,
-    LB_ITEMFROMPOINT, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, LBS_HASSTRINGS,
-    LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, MoveWindow, RegisterClassW, SW_HIDE,
-    SW_SHOWNA, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetWindowPos, SetWindowTextW,
-    ShowWindow, WM_CHAR, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DRAWITEM,
-    WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SETFONT, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_VISIBLE, WS_VSCROLL,
+    DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW, GetWindowTextW, HWND_TOP,
+    LB_ADDSTRING, LB_GETCURSEL, LB_ITEMFROMPOINT, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT,
+    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, MoveWindow, SW_HIDE, SW_SHOWNA,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow,
+    WM_CHAR, WM_GETFONT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCDESTROY,
+    WM_SETFOCUS, WM_SETFONT, WS_CHILD, WS_VISIBLE, WS_VSCROLL,
 };
 
 /// One runnable row: the command and what the palette calls it.
@@ -191,11 +186,6 @@ const ROW_HEIGHT_AT_96_DPI: i32 = 26;
 const VISIBLE_ROWS: usize = 12;
 const MARGIN_AT_96_DPI: i32 = 8;
 
-const fn scale(value: i32, dpi: u32) -> i32 {
-    let dpi = if dpi == 0 { 96 } else { dpi };
-    ((value as i64 * dpi as i64 + 48) / 96) as i32
-}
-
 /// Where the panel's parts sit, in panel client coordinates.
 #[derive(Clone, Copy)]
 struct PanelLayout {
@@ -273,11 +263,7 @@ pub(crate) struct CommandPalette {
 
 impl CommandPalette {
     pub(crate) fn create(parent: HWND) -> crate::Result<Self> {
-        let panel = create_child(
-            parent,
-            register_panel_class()?,
-            WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-        )?;
+        let panel = create_panel(parent)?;
         let controls = (|| {
             let query_edit = create_child(
                 panel,
@@ -341,16 +327,33 @@ impl CommandPalette {
     /// Marks the palette shown in `colors`; returns whether it was hidden before. Makes no calls
     /// that re-enter the window procedure, so the caller may hold the App borrow across it.
     pub(crate) fn mark_shown(&mut self, colors: Palette) -> bool {
-        if colors != self.colors {
-            unsafe {
-                DeleteObject(self.field_brush);
-                DeleteObject(self.list_brush);
-                self.field_brush = CreateSolidBrush(colors.editor_background);
-                self.list_brush = CreateSolidBrush(colors.strip_background);
-            }
-            self.colors = colors;
-        }
+        self.set_colors(colors);
         !std::mem::replace(&mut self.visible, true)
+    }
+
+    /// Recolors for a theme change; the caller repaints with `invalidate`.
+    pub(crate) fn set_colors(&mut self, colors: Palette) {
+        if colors == self.colors {
+            return;
+        }
+        unsafe {
+            DeleteObject(self.field_brush);
+            DeleteObject(self.list_brush);
+            self.field_brush = CreateSolidBrush(colors.editor_background);
+            self.list_brush = CreateSolidBrush(colors.strip_background);
+        }
+        self.colors = colors;
+    }
+
+    pub(crate) fn invalidate(&self) {
+        unsafe {
+            RedrawWindow(
+                self.panel,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
+        }
     }
 
     /// Returns whether it was visible; `hide_controls` then removes it from the screen.
@@ -651,44 +654,6 @@ impl Drop for CommandPalette {
     }
 }
 
-unsafe fn fill(dc: HDC, rect: RECT, color: u32) {
-    unsafe {
-        SetDCBrushColor(dc, color);
-        FillRect(dc, &rect, GetStockObject(DC_BRUSH));
-    }
-}
-
-const fn inset(rect: RECT, by: i32) -> RECT {
-    RECT {
-        left: rect.left + by,
-        top: rect.top + by,
-        right: rect.right - by,
-        bottom: rect.bottom - by,
-    }
-}
-
-/// The pixel height of a line of `font` text, as the `Edit` will draw it.
-fn text_height(control: HWND, font: HFONT) -> i32 {
-    unsafe {
-        let dc = GetDC(control);
-        if dc.is_null() {
-            return 0;
-        }
-        let previous = (!font.is_null()).then(|| SelectObject(dc, font as _));
-        let mut metrics = TEXTMETRICW::default();
-        let height = if GetTextMetricsW(dc, &mut metrics) != 0 {
-            metrics.tmHeight
-        } else {
-            0
-        };
-        if let Some(previous) = previous {
-            SelectObject(dc, previous);
-        }
-        ReleaseDC(control, dc);
-        height
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PaletteControl {
     Query,
@@ -780,76 +745,6 @@ unsafe extern "system" fn palette_control_proc(
         _ => {}
     }
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
-}
-
-/// Registers the panel window class once per process and returns its name.
-fn register_panel_class() -> crate::Result<&'static [u16]> {
-    static CLASS_NAME: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
-    static REGISTERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let name = CLASS_NAME.get_or_init(|| wide_null("FastPadCommandPalette"));
-    let registered = *REGISTERED.get_or_init(|| {
-        let class = WNDCLASSW {
-            lpfnWndProc: Some(panel_proc),
-            hInstance: unsafe { GetModuleHandleW(std::ptr::null()) },
-            hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
-            lpszClassName: name.as_ptr(),
-            ..Default::default()
-        };
-        unsafe { RegisterClassW(&class) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS }
-    });
-    if registered {
-        Ok(name)
-    } else {
-        Err(crate::FastPadError::Invariant(
-            "the command palette window class could not be registered",
-        ))
-    }
-}
-
-/// The panel paints itself and passes its controls' notifications on to the main window, which
-/// owns the palette.
-unsafe extern "system" fn panel_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    let main = unsafe { GetParent(hwnd) };
-    match message {
-        WM_PAINT => {
-            super::main_window::paint_command_palette(main, hwnd);
-            0
-        }
-        WM_ERASEBKGND => 1,
-        WM_COMMAND | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_DRAWITEM => unsafe {
-            SendMessageW(main, message, wparam, lparam)
-        },
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
-    }
-}
-
-fn create_child(parent: HWND, class: &[u16], style: u32) -> crate::Result<HWND> {
-    let hwnd = unsafe {
-        CreateWindowExW(
-            0,
-            class.as_ptr(),
-            std::ptr::null(),
-            style,
-            0,
-            0,
-            0,
-            0,
-            parent,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if hwnd.is_null() {
-        Err(last_error())
-    } else {
-        Ok(hwnd)
-    }
 }
 
 #[cfg(test)]

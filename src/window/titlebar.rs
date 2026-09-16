@@ -27,7 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const GLYPH_MINIMIZE: &str = "\u{E921}";
 const GLYPH_MAXIMIZE: &str = "\u{E922}";
 const GLYPH_RESTORE: &str = "\u{E923}";
-const GLYPH_CLOSE: &str = "\u{E8BB}";
+pub(crate) const GLYPH_CLOSE: &str = "\u{E8BB}";
 const GLYPH_MORE: &str = "\u{E712}";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,6 +503,11 @@ impl TitleFontHandles {
     /// The UI text font, null before chrome fonts exist.
     pub(crate) fn text(&self) -> HFONT {
         self.text
+    }
+
+    /// The Segoe MDL2 Assets glyph font, null before chrome fonts exist.
+    pub(crate) fn glyph(&self) -> HFONT {
+        self.glyph
     }
 }
 
