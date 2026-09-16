@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::app::{App, WindowIdentity};
 use crate::document::{CloseDecision, Document, DocumentId, RecoveryId};
-use crate::editor::Editor;
+use crate::editor::{Editor, TextDirection};
 use crate::perf::Milestone;
 use crate::platform::{last_error, wide_null};
 use crate::window::accessibility::{self, AccessibleSelectRequest, WM_FASTPAD_ACCESSIBLE_SELECT};
@@ -1083,6 +1083,12 @@ fn execute_command(hwnd: HWND, command: CommandId) {
     if command.needs_document() && tab_count(hwnd) == 0 {
         return;
     }
+    if let Some(index) = command.tab_index() {
+        if index < tab_count(hwnd) {
+            activate_tab(hwnd, index);
+        }
+        return;
+    }
     match command {
         CommandId::Open => {
             let identity = unsafe { window_identity(hwnd) };
@@ -1141,6 +1147,23 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         CommandId::LanguageMarkdown => apply_language(hwnd, crate::document::Language::Markdown),
         CommandId::ValidateJson => validate_active_json(hwnd),
         CommandId::FormatJson => format_active_json(hwnd),
+        CommandId::NextTab => cycle_tab(hwnd, true),
+        CommandId::PreviousTab => cycle_tab(hwnd, false),
+        CommandId::ZoomIn => with_editor(hwnd, |editor| {
+            let _ = editor.zoom_in();
+        }),
+        CommandId::ZoomOut => with_editor(hwnd, |editor| {
+            let _ = editor.zoom_out();
+        }),
+        CommandId::ZoomReset => with_editor(hwnd, |editor| {
+            let _ = editor.reset_zoom();
+        }),
+        CommandId::TextLeftToRight => with_editor(hwnd, |editor| {
+            let _ = editor.set_text_direction(TextDirection::LeftToRight);
+        }),
+        CommandId::TextRightToLeft => with_editor(hwnd, |editor| {
+            let _ = editor.set_text_direction(TextDirection::RightToLeft);
+        }),
         _ => {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.execute(command);
@@ -1754,6 +1777,25 @@ fn activate_tab(hwnd: HWND, index: usize) {
     if let Some((id, revision)) = target {
         let _ = activate_document(hwnd, id, revision);
     }
+}
+
+/// Activates the tab after (or before) the active one, wrapping around the ends of the strip.
+fn cycle_tab(hwnd: HWND, forward: bool) {
+    let Some(active) =
+        (unsafe { app_ptr(hwnd) }).map(|app| unsafe { app.as_ref() }.tabs.active_index())
+    else {
+        return;
+    };
+    let count = tab_count(hwnd);
+    if count < 2 {
+        return;
+    }
+    let target = if forward {
+        (active + 1) % count
+    } else {
+        (active + count - 1) % count
+    };
+    activate_tab(hwnd, target);
 }
 
 fn activate_document(hwnd: HWND, id: DocumentId, revision: u64) -> bool {
@@ -2632,6 +2674,12 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     if unsafe { editor_hwnd(hwnd) } != Some(notification.hwndFrom) {
         return;
     }
+    if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {
+        with_editor(hwnd, |editor| {
+            let _ = editor.remeasure_line_numbers();
+        });
+        return;
+    }
     if notification.code == crate::editor::scintilla_constants::SCN_MODIFIED {
         let modification = unsafe { &*(lparam as *const TextModificationNotification) };
         let text_changes = crate::editor::scintilla_constants::SC_MOD_INSERTTEXT
@@ -3022,6 +3070,66 @@ mod tests {
         }
         assert!(app_mut(window.hwnd).tabs.is_empty());
         assert!(!editor_visible());
+    }
+
+    #[test]
+    fn tab_shortcuts_cycle_with_wrap_around_and_select_by_position() {
+        // Break caught: Ctrl+Tab stopping at the last tab, or Ctrl+9 with fewer than nine tabs
+        // activating some other tab instead of doing nothing.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        execute_command(window.hwnd, CommandId::New);
+        execute_command(window.hwnd, CommandId::New);
+        let active = || app_mut(window.hwnd).tabs.active_index();
+        assert_eq!(active(), 2);
+
+        execute_command(window.hwnd, CommandId::NextTab);
+        assert_eq!(active(), 0);
+        execute_command(window.hwnd, CommandId::PreviousTab);
+        assert_eq!(active(), 2);
+        execute_command(window.hwnd, CommandId::PreviousTab);
+        assert_eq!(active(), 1);
+        execute_command(window.hwnd, CommandId::SelectTab1);
+        assert_eq!(active(), 0);
+        execute_command(window.hwnd, CommandId::SelectTab3);
+        assert_eq!(active(), 2);
+        execute_command(window.hwnd, CommandId::SelectTab9);
+        assert_eq!(active(), 2);
+    }
+
+    #[test]
+    fn zoom_resizes_the_line_number_gutter_and_direction_mirrors_the_editor() {
+        // Break caught: zoomed digits clipped by a gutter measured at the unzoomed size, or the
+        // direction shortcuts leaving the editor window unmirrored.
+        use crate::editor::scintilla_constants::SCI_GETZOOM;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowLongPtrW, WS_EX_LAYOUTRTL,
+        };
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        let zoom = || unsafe { SendMessageW(editor.hwnd(), SCI_GETZOOM, 0, 0) };
+        let unzoomed_width = line_number_margin_width(&editor);
+
+        execute_command(window.hwnd, CommandId::ZoomIn);
+        execute_command(window.hwnd, CommandId::ZoomIn);
+        assert_eq!(zoom(), 2);
+        assert!(line_number_margin_width(&editor) > unzoomed_width);
+        execute_command(window.hwnd, CommandId::ZoomOut);
+        assert_eq!(zoom(), 1);
+        execute_command(window.hwnd, CommandId::ZoomReset);
+        assert_eq!(zoom(), 0);
+        assert_eq!(line_number_margin_width(&editor), unzoomed_width);
+
+        let mirrored = || {
+            (unsafe { GetWindowLongPtrW(editor.hwnd(), GWL_EXSTYLE) }) as u32 & WS_EX_LAYOUTRTL != 0
+        };
+        assert!(!mirrored());
+        execute_command(window.hwnd, CommandId::TextRightToLeft);
+        assert!(mirrored());
+        execute_command(window.hwnd, CommandId::TextLeftToRight);
+        assert!(!mirrored());
     }
 
     #[test]

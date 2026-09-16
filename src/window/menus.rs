@@ -4,6 +4,10 @@ use crate::window::commands::CommandId;
 use crate::window::modal::ModalScope;
 use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    VIRTUAL_KEY, VK_ADD, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5,
+    VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_OEM_MINUS, VK_OEM_PLUS, VK_SUBTRACT, VK_TAB,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
     DestroyAcceleratorTable, DestroyMenu, DrawMenuBar, FCONTROL, FSHIFT, FVIRTKEY, HACCEL, HMENU,
@@ -18,9 +22,10 @@ pub struct AcceleratorSpec {
     pub command: CommandId,
 }
 
-pub const fn accelerator_specs() -> [AcceleratorSpec; 9] {
+pub const fn accelerator_specs() -> [AcceleratorSpec; 39] {
     [
         accelerator(FCONTROL, b'N', CommandId::New),
+        accelerator(FCONTROL, b'T', CommandId::New),
         accelerator(FCONTROL, b'O', CommandId::Open),
         accelerator(FCONTROL, b'S', CommandId::Save),
         accelerator(FCONTROL | FSHIFT, b'S', CommandId::SaveAs),
@@ -29,13 +34,47 @@ pub const fn accelerator_specs() -> [AcceleratorSpec; 9] {
         accelerator(FCONTROL, b'Z', CommandId::Undo),
         accelerator(FCONTROL, b'Y', CommandId::Redo),
         accelerator(FCONTROL | FSHIFT, b'F', CommandId::FormatJson),
+        virtual_key(FCONTROL, VK_TAB, CommandId::NextTab),
+        virtual_key(FCONTROL | FSHIFT, VK_TAB, CommandId::PreviousTab),
+        accelerator(FCONTROL, b'1', CommandId::SelectTab1),
+        accelerator(FCONTROL, b'2', CommandId::SelectTab2),
+        accelerator(FCONTROL, b'3', CommandId::SelectTab3),
+        accelerator(FCONTROL, b'4', CommandId::SelectTab4),
+        accelerator(FCONTROL, b'5', CommandId::SelectTab5),
+        accelerator(FCONTROL, b'6', CommandId::SelectTab6),
+        accelerator(FCONTROL, b'7', CommandId::SelectTab7),
+        accelerator(FCONTROL, b'8', CommandId::SelectTab8),
+        accelerator(FCONTROL, b'9', CommandId::SelectTab9),
+        virtual_key(FCONTROL, VK_NUMPAD1, CommandId::SelectTab1),
+        virtual_key(FCONTROL, VK_NUMPAD2, CommandId::SelectTab2),
+        virtual_key(FCONTROL, VK_NUMPAD3, CommandId::SelectTab3),
+        virtual_key(FCONTROL, VK_NUMPAD4, CommandId::SelectTab4),
+        virtual_key(FCONTROL, VK_NUMPAD5, CommandId::SelectTab5),
+        virtual_key(FCONTROL, VK_NUMPAD6, CommandId::SelectTab6),
+        virtual_key(FCONTROL, VK_NUMPAD7, CommandId::SelectTab7),
+        virtual_key(FCONTROL, VK_NUMPAD8, CommandId::SelectTab8),
+        virtual_key(FCONTROL, VK_NUMPAD9, CommandId::SelectTab9),
+        // "+" shares a key with "=" on most layouts, so Ctrl+Shift+= is Ctrl++ as typed.
+        virtual_key(FCONTROL, VK_OEM_PLUS, CommandId::ZoomIn),
+        virtual_key(FCONTROL | FSHIFT, VK_OEM_PLUS, CommandId::ZoomIn),
+        virtual_key(FCONTROL, VK_ADD, CommandId::ZoomIn),
+        virtual_key(FCONTROL, VK_OEM_MINUS, CommandId::ZoomOut),
+        virtual_key(FCONTROL, VK_SUBTRACT, CommandId::ZoomOut),
+        accelerator(FCONTROL, b'0', CommandId::ZoomReset),
+        virtual_key(FCONTROL, VK_NUMPAD0, CommandId::ZoomReset),
+        accelerator(FCONTROL, b'L', CommandId::TextLeftToRight),
+        accelerator(FCONTROL, b'R', CommandId::TextRightToLeft),
     ]
 }
 
 const fn accelerator(modifiers: u8, key: u8, command: CommandId) -> AcceleratorSpec {
+    virtual_key(modifiers, key as VIRTUAL_KEY, command)
+}
+
+const fn virtual_key(modifiers: u8, key: VIRTUAL_KEY, command: CommandId) -> AcceleratorSpec {
     AcceleratorSpec {
         modifiers,
-        key: key as u16,
+        key,
         command,
     }
 }
@@ -109,6 +148,13 @@ impl MenuBar {
                 MenuEntry::command("Plain text", CommandId::LanguagePlainText),
                 MenuEntry::command("JSON", CommandId::LanguageJson),
                 MenuEntry::command("Markdown", CommandId::LanguageMarkdown),
+                MenuEntry::Separator,
+                MenuEntry::command("Zoom &in	Ctrl++", CommandId::ZoomIn),
+                MenuEntry::command("Zoom &out	Ctrl+-", CommandId::ZoomOut),
+                MenuEntry::command("Reset &zoom	Ctrl+0", CommandId::ZoomReset),
+                MenuEntry::Separator,
+                MenuEntry::command("&Left-to-right text	Ctrl+L", CommandId::TextLeftToRight),
+                MenuEntry::command("&Right-to-left text	Ctrl+R", CommandId::TextRightToLeft),
             ])?;
             append_popup(root, "&View", view)?;
             let help = create_popup(&[])?;
@@ -296,6 +342,56 @@ mod tests {
                 .iter()
                 .any(|item| item.command == CommandId::FormatJson)
         );
-        assert_eq!(specs.len(), 9);
+        assert_eq!(specs.len(), 39);
+    }
+
+    #[test]
+    fn every_shortcut_chord_maps_to_exactly_one_command() {
+        let specs = accelerator_specs();
+        for (index, spec) in specs.iter().enumerate() {
+            assert!(
+                specs[index + 1..]
+                    .iter()
+                    .all(|other| (other.modifiers, other.key) != (spec.modifiers, spec.key)),
+                "duplicate chord for {:?}",
+                spec.command
+            );
+        }
+    }
+
+    #[test]
+    fn tab_zoom_and_direction_shortcuts_are_bound() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_NUMPAD9, VK_OEM_MINUS, VK_OEM_PLUS, VK_TAB,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FCONTROL, FSHIFT};
+        let bound = |modifiers: u8, key: u16| {
+            accelerator_specs()
+                .into_iter()
+                .find(|spec| spec.modifiers == modifiers && spec.key == key)
+                .map(|spec| spec.command)
+        };
+        assert_eq!(bound(FCONTROL, u16::from(b'T')), Some(CommandId::New));
+        assert_eq!(bound(FCONTROL, VK_TAB), Some(CommandId::NextTab));
+        assert_eq!(
+            bound(FCONTROL | FSHIFT, VK_TAB),
+            Some(CommandId::PreviousTab)
+        );
+        assert_eq!(
+            bound(FCONTROL, u16::from(b'1')),
+            Some(CommandId::SelectTab1)
+        );
+        assert_eq!(bound(FCONTROL, VK_NUMPAD9), Some(CommandId::SelectTab9));
+        assert_eq!(bound(FCONTROL, VK_OEM_PLUS), Some(CommandId::ZoomIn));
+        assert_eq!(bound(FCONTROL, VK_OEM_MINUS), Some(CommandId::ZoomOut));
+        assert_eq!(bound(FCONTROL, u16::from(b'0')), Some(CommandId::ZoomReset));
+        assert_eq!(
+            bound(FCONTROL, u16::from(b'L')),
+            Some(CommandId::TextLeftToRight)
+        );
+        assert_eq!(
+            bound(FCONTROL, u16::from(b'R')),
+            Some(CommandId::TextRightToLeft)
+        );
     }
 }

@@ -20,6 +20,22 @@ pub enum CommandId {
     LanguageMarkdown,
     Exit,
     CloseAllTabs,
+    NextTab,
+    PreviousTab,
+    SelectTab1,
+    SelectTab2,
+    SelectTab3,
+    SelectTab4,
+    SelectTab5,
+    SelectTab6,
+    SelectTab7,
+    SelectTab8,
+    SelectTab9,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    TextLeftToRight,
+    TextRightToLeft,
 }
 
 impl CommandId {
@@ -30,13 +46,24 @@ impl CommandId {
             Self::New | Self::Open | Self::Exit | Self::CloseAllTabs
         )
     }
+
+    /// The zero-based tab a `SelectTabN` command activates.
+    pub const fn tab_index(self) -> Option<usize> {
+        let first = Self::SelectTab1 as u16;
+        let value = self as u16;
+        if value >= first && value <= Self::SelectTab9 as u16 {
+            Some((value - first) as usize)
+        } else {
+            None
+        }
+    }
 }
 
 impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 19] = [
+        const COMMANDS: [CommandId; 35] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -56,6 +83,22 @@ impl TryFrom<u16> for CommandId {
             CommandId::LanguageMarkdown,
             CommandId::Exit,
             CommandId::CloseAllTabs,
+            CommandId::NextTab,
+            CommandId::PreviousTab,
+            CommandId::SelectTab1,
+            CommandId::SelectTab2,
+            CommandId::SelectTab3,
+            CommandId::SelectTab4,
+            CommandId::SelectTab5,
+            CommandId::SelectTab6,
+            CommandId::SelectTab7,
+            CommandId::SelectTab8,
+            CommandId::SelectTab9,
+            CommandId::ZoomIn,
+            CommandId::ZoomOut,
+            CommandId::ZoomReset,
+            CommandId::TextLeftToRight,
+            CommandId::TextRightToLeft,
         ];
         COMMANDS
             .into_iter()
@@ -90,5 +133,14 @@ mod tests {
         assert_eq!(CommandId::try_from(118), Ok(CommandId::CloseAllTabs));
         assert!(!CommandId::New.needs_document());
         assert!(CommandId::Paste.needs_document());
+        assert_eq!(CommandId::try_from(134), Ok(CommandId::TextRightToLeft));
+    }
+
+    #[test]
+    fn select_tab_commands_map_to_zero_based_indices() {
+        assert_eq!(CommandId::SelectTab1.tab_index(), Some(0));
+        assert_eq!(CommandId::SelectTab9.tab_index(), Some(8));
+        assert_eq!(CommandId::NextTab.tab_index(), None);
+        assert_eq!(CommandId::ZoomIn.tab_index(), None);
     }
 }

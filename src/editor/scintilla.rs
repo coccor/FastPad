@@ -18,7 +18,9 @@ use crate::editor::scintilla_constants::{
 };
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
-use crate::editor::scintilla_constants::{SCI_GETLINECOUNT, SCI_TEXTWIDTH, STYLE_LINENUMBER};
+use crate::editor::scintilla_constants::{
+    SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
+};
 use crate::{FastPadError, Result};
 use std::cell::Cell;
 use std::ffi::CString;
@@ -32,15 +34,19 @@ use crate::platform::{last_error, wide_null};
 #[cfg(windows)]
 use std::mem::transmute;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{LPARAM, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{GetLastError, LPARAM, RECT, SetLastError, WPARAM};
+#[cfg(windows)]
+use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, SendMessageW, WM_CHAR,
-    WM_DPICHANGED_AFTERPARENT, WM_NCDESTROY, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
+    SetWindowLongPtrW, SetWindowPos, WM_CHAR, WM_DPICHANGED_AFTERPARENT, WM_NCDESTROY, WS_CHILD,
+    WS_EX_LAYOUTRTL, WS_TABSTOP, WS_VISIBLE,
 };
 
 pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;
@@ -48,6 +54,13 @@ pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;
 const ENDPOINT_DESTROYED: &str = "Scintilla editor endpoint is no longer alive";
 #[cfg(windows)]
 const EDITOR_ENDPOINT_SUBCLASS_ID: usize = 0x4650_4544;
+
+/// The reading order the editor lays text out in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextDirection {
+    LeftToRight,
+    RightToLeft,
+}
 
 #[derive(Debug)]
 pub struct Editor {
@@ -733,6 +746,64 @@ impl Editor {
         ))
     }
 
+    /// Magnifies every style by one point. The view notifies `SCN_ZOOM`, which is where the owner
+    /// re-measures the line-number margin, so Ctrl+wheel zooming keeps the gutter sized too.
+    pub fn zoom_in(&self) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_ZOOMIN, 0, 0)?;
+        Ok(())
+    }
+
+    pub fn zoom_out(&self) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_ZOOMOUT, 0, 0)?;
+        Ok(())
+    }
+
+    /// Returns to the configured font size.
+    pub fn reset_zoom(&self) -> Result<()> {
+        self.endpoint.send_direct_checked(SCI_SETZOOM, 0, 0)?;
+        Ok(())
+    }
+
+    /// Mirrors the editor window so lines start at the right edge and the vertical scrollbar sits
+    /// on the left. Scintilla's own bidirectional mode needs DirectWrite, and FastPad draws with
+    /// GDI, which already reorders right-to-left runs inside a mirrored window.
+    #[cfg(windows)]
+    pub fn set_text_direction(&self, direction: TextDirection) -> Result<()> {
+        let hwnd = self.endpoint.hwnd;
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        let updated = match direction {
+            TextDirection::LeftToRight => style & !(WS_EX_LAYOUTRTL as isize),
+            TextDirection::RightToLeft => style | WS_EX_LAYOUTRTL as isize,
+        };
+        if updated == style {
+            return Ok(());
+        }
+        unsafe {
+            SetLastError(0);
+            if SetWindowLongPtrW(hwnd, GWL_EXSTYLE, updated) == 0 && GetLastError() != 0 {
+                return Err(last_error());
+            }
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            InvalidateRect(hwnd, std::ptr::null(), 1);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_text_direction(&self, _direction: TextDirection) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
     /// Sets the selection (focused and unfocused) and caret-line backgrounds as opaque Scintilla 5
     /// element colours.
     #[cfg(windows)]
@@ -1220,8 +1291,8 @@ mod tests {
         SCI_STYLESETFONT, SCI_STYLESETFORE, SCI_UNDO,
     };
     use crate::editor::scintilla_constants::{
-        SC_MARGIN_NUMBER, SCI_GETLINECOUNT, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK, SCI_TEXTWIDTH,
-        STYLE_DEFAULT, STYLE_LINENUMBER,
+        SC_MARGIN_NUMBER, SCI_GETLINECOUNT, SCI_SETMARGINTYPEN, SCI_SETZOOM, SCI_STYLEGETBACK,
+        SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_DEFAULT, STYLE_LINENUMBER,
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -1699,6 +1770,21 @@ mod tests {
         assert_eq!(
             harness.calls(),
             vec![(SCI_SETMARGINLEFT, 0, 8), (SCI_SETMARGINRIGHT, 0, 8)]
+        );
+    }
+
+    #[test]
+    fn zoom_commands_step_the_view_and_reset_to_the_configured_size() {
+        let harness = TestDirectHarness::new();
+        let editor = Editor::test_fixture(test_direct, harness.direct_ptr());
+
+        editor.zoom_in().unwrap();
+        editor.zoom_out().unwrap();
+        editor.reset_zoom().unwrap();
+
+        assert_eq!(
+            harness.calls(),
+            vec![(SCI_ZOOMIN, 0, 0), (SCI_ZOOMOUT, 0, 0), (SCI_SETZOOM, 0, 0)]
         );
     }
 
