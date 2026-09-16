@@ -1,6 +1,7 @@
 use crate::Result;
 use crate::platform::{last_error, wide_null};
 use crate::window::commands::CommandId;
+use crate::window::modal::ModalScope;
 use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -202,6 +203,14 @@ fn append_popup(root: HMENU, label: &str, popup: HMENU) -> Result<()> {
 }
 
 pub(crate) fn show_overflow(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
+    // TrackPopupMenuEx runs a nested modal loop that reenters the window procedure, exactly as the
+    // file dialogs do. Hold deferred, IPC and snapshot work for its duration so the command the
+    // user picks still acts on the document that was active when they opened the menu.
+    let _modal = ModalScope::enter(hwnd);
+    #[cfg(test)]
+    if let Some(answer) = OVERFLOW_ANSWERS.with(|answers| answers.borrow_mut().pop_front()) {
+        return answer(hwnd);
+    }
     let menu = create_popup(&[
         MenuEntry::command("New", CommandId::New),
         MenuEntry::command("Open...", CommandId::Open),
@@ -233,6 +242,21 @@ pub(crate) fn show_overflow(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
     u16::try_from(selected)
         .ok()
         .and_then(|value| CommandId::try_from(value).ok())
+}
+
+#[cfg(test)]
+type OverflowAnswer = Box<dyn FnOnce(HWND) -> Option<CommandId>>;
+
+#[cfg(test)]
+thread_local! {
+    static OVERFLOW_ANSWERS: std::cell::RefCell<std::collections::VecDeque<OverflowAnswer>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Answers the next overflow menu from inside its modal scope instead of tracking a real popup.
+#[cfg(test)]
+pub(crate) fn answer_next_overflow_menu(answer: impl FnOnce(HWND) -> Option<CommandId> + 'static) {
+    OVERFLOW_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
 }
 
 #[cfg(test)]

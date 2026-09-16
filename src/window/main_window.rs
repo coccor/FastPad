@@ -1718,10 +1718,17 @@ fn save_active_document_as(hwnd: HWND) -> bool {
     if !identity.is_live_for(hwnd) {
         return false;
     }
-    let Ok(Some(path)) = selection else {
-        // Cancellation is not an error; a real error is silently dropped, matching Open's
-        // existing precedent above.
-        return false;
+    let path = match selection {
+        Ok(Some(path)) => path,
+        // Cancelling the dialog is not an error and says nothing.
+        Ok(None) => return false,
+        Err(error) => {
+            push_notice(
+                hwnd,
+                format!("FastPad could not open the Save As dialog: {error}"),
+            );
+            return false;
+        }
     };
     // The dialog's modal loop can have activated another tab; save the document that was chosen.
     if !activate_document_by_id(hwnd, target) {
@@ -2568,6 +2575,7 @@ mod tests {
     use crate::recovery::snapshot::snapshot_path;
     use crate::recovery::{Snapshot, write_snapshot};
     use crate::window::commands::CommandId;
+    use crate::window::menus::answer_next_overflow_menu;
     use crate::window::modal::{answer_next_close_prompt, answer_next_save_dialog};
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -2693,6 +2701,43 @@ mod tests {
             app_mut(window.hwnd).tabs.len(),
             before + 1,
             "the held recovery unit must run once the modal loop ends"
+        );
+    }
+
+    #[test]
+    fn queued_ipc_requests_wait_for_the_overflow_menu_to_close() {
+        // Break caught: the overflow menu's own modal loop dispatches a forwarded request, so a
+        // new tab becomes active underneath it and the command the user picks acts on that tab
+        // instead of the one they opened the menu on.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        editor.set_text("dirty").unwrap();
+        app_mut(window.hwnd)
+            .ipc_requests
+            .push(crate::ipc::IpcRequest::New);
+        let before = app_mut(window.hwnd).tabs.len();
+
+        answer_next_overflow_menu(|hwnd| {
+            unsafe {
+                SendMessageW(hwnd, crate::window::WM_FASTPAD_IPC_REQUEST, 0, 0);
+            }
+            None
+        });
+        assert!(crate::window::menus::show_overflow(window.hwnd, 0, 0).is_none());
+
+        assert_eq!(
+            app_mut(window.hwnd).tabs.len(),
+            before,
+            "a forwarded request was handled inside the overflow menu's modal loop"
+        );
+
+        pump_posted_messages(window.hwnd);
+
+        assert_eq!(
+            app_mut(window.hwnd).tabs.len(),
+            before + 1,
+            "the held request must run once the overflow menu closes"
         );
     }
 
