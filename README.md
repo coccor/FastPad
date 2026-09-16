@@ -42,8 +42,12 @@ notification and every valid line still applies.
 | `tab_width` | Integer 1-255 | `4` |
 | `word_wrap` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `line_numbers` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
-| `theme` | `system`, `light`, `dark` | `system` |
+| `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
 | `recovery_interval_seconds` | Positive integer | `30` |
+
+`system` and `catppuccin` follow the Windows light/dark app setting (`catppuccin` uses Latte when
+light and Mocha when dark); the other themes are fixed. Windows high contrast always overrides the
+configured theme.
 
 The command palette (Ctrl+Shift+P) changes the theme, word wrap (also Alt+Z), line numbers, font
 size (6-72 pt) and tab width (2, 4 or 8) while FastPad runs. Each change is written back to

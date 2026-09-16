@@ -8,6 +8,20 @@ pub enum ThemePreference {
     System,
     Light,
     Dark,
+    /// Catppuccin that follows the system: Latte when light, Mocha when dark.
+    Catppuccin,
+    CatppuccinLatte,
+    CatppuccinFrappe,
+    CatppuccinMacchiato,
+    CatppuccinMocha,
+}
+
+impl ThemePreference {
+    /// Whether resolving this preference needs the system light/dark state. Fixed themes never
+    /// read it.
+    pub const fn follows_system(self) -> bool {
+        matches!(self, Self::System | Self::Catppuccin)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +178,11 @@ fn parse_theme(value: &str) -> Option<ThemePreference> {
         "system" => Some(ThemePreference::System),
         "light" => Some(ThemePreference::Light),
         "dark" => Some(ThemePreference::Dark),
+        "catppuccin" => Some(ThemePreference::Catppuccin),
+        "catppuccin-latte" => Some(ThemePreference::CatppuccinLatte),
+        "catppuccin-frappe" => Some(ThemePreference::CatppuccinFrappe),
+        "catppuccin-macchiato" => Some(ThemePreference::CatppuccinMacchiato),
+        "catppuccin-mocha" => Some(ThemePreference::CatppuccinMocha),
         _ => None,
     }
 }
@@ -229,6 +248,11 @@ impl ThemePreference {
             Self::System => "system",
             Self::Light => "light",
             Self::Dark => "dark",
+            Self::Catppuccin => "catppuccin",
+            Self::CatppuccinLatte => "catppuccin-latte",
+            Self::CatppuccinFrappe => "catppuccin-frappe",
+            Self::CatppuccinMacchiato => "catppuccin-macchiato",
+            Self::CatppuccinMocha => "catppuccin-mocha",
         }
     }
 }
@@ -416,10 +440,52 @@ mod tests {
     }
 
     #[test]
-    fn theme_accepts_all_three_variants_case_insensitively() {
+    fn every_theme_writes_the_ini_value_that_parses_back_to_it() {
+        use ThemePreference::*;
+        for theme in [
+            System,
+            Light,
+            Dark,
+            Catppuccin,
+            CatppuccinLatte,
+            CatppuccinFrappe,
+            CatppuccinMacchiato,
+            CatppuccinMocha,
+        ] {
+            assert_eq!(
+                parse(&format!("theme={}", theme.ini_value())).theme,
+                Some(theme)
+            );
+        }
+    }
+
+    #[test]
+    fn theme_accepts_every_variant_case_insensitively() {
         assert_eq!(parse("theme=System").theme, Some(ThemePreference::System));
         assert_eq!(parse("theme=LIGHT").theme, Some(ThemePreference::Light));
         assert_eq!(parse("theme=dark").theme, Some(ThemePreference::Dark));
+        assert_eq!(
+            parse("theme=Catppuccin").theme,
+            Some(ThemePreference::Catppuccin)
+        );
+        assert_eq!(
+            parse("theme=catppuccin-latte").theme,
+            Some(ThemePreference::CatppuccinLatte)
+        );
+        assert_eq!(
+            parse("theme=catppuccin-frappe").theme,
+            Some(ThemePreference::CatppuccinFrappe)
+        );
+        assert_eq!(
+            parse("theme=CATPPUCCIN-MACCHIATO").theme,
+            Some(ThemePreference::CatppuccinMacchiato)
+        );
+        assert_eq!(
+            parse("theme=catppuccin-mocha").theme,
+            Some(ThemePreference::CatppuccinMocha)
+        );
+        // Break caught: a typo'd flavor silently falling back to some theme instead of warning.
+        assert_eq!(parse("theme=catppuccin-espresso").theme, None);
     }
 
     #[test]
