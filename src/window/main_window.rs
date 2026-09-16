@@ -200,7 +200,7 @@ unsafe extern "system" fn main_window_proc(
             let paint_title_strip = |hwnd, _, _, _| {
                 let (titles, active, scroll, empty) = tab_snapshot(hwnd);
                 let title_refs = titles.iter().map(String::as_str).collect::<Vec<_>>();
-                let status = current_status_text(hwnd);
+                let status = current_status_bar(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
                 unsafe {
                     crate::window::titlebar::paint(
@@ -210,7 +210,7 @@ unsafe extern "system" fn main_window_proc(
                             active,
                             scroll,
                             empty_hint: empty.then_some(EMPTY_TABS_HINT),
-                            status: status.as_deref(),
+                            status: status.as_ref(),
                             palette,
                             fonts,
                             pointer,
@@ -349,7 +349,7 @@ unsafe extern "system" fn main_window_proc(
                 (lparam as u32 & 0xffff) as u16 as i16 as i32,
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
             );
-            if status_contains(hwnd, point.y) {
+            if notice_contains(hwnd, point.y) {
                 dismiss_notifications(hwnd);
                 return 0;
             }
@@ -1216,6 +1216,7 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.tabs.set_active_language(language);
             }
+            invalidate_status_bar(hwnd);
             // Lexer style tables reset every style's font face; restore the configured one.
             apply_editor_settings(hwnd);
         }
@@ -1444,8 +1445,8 @@ fn run_caption_button(hwnd: HWND, target: HitTarget) {
     }
 }
 
-/// The status line exists only after `WM_FASTPAD_BUILD_CHROME` and only while notifications
-/// are pending.
+/// The pending-notification text shown on the bottom bar, which exists only after
+/// `WM_FASTPAD_BUILD_CHROME`.
 fn current_status_text(hwnd: HWND) -> Option<String> {
     let app = unsafe { app_ptr(hwnd) }?;
     let app = unsafe { app.as_ref() };
@@ -1453,8 +1454,28 @@ fn current_status_text(hwnd: HWND) -> Option<String> {
     crate::window::status::status_text(&app.notifications)
 }
 
+/// Everything the bottom bar paints, or `None` before `WM_FASTPAD_BUILD_CHROME` builds it.
+fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::StatusBarText> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    let app = unsafe { app.as_ref() };
+    app.status.as_ref()?;
+    let active = app.tabs.active().and_then(|document| {
+        Some(crate::window::status::ActiveDocumentStatus {
+            caret: app.editor.as_ref()?.caret_status().ok()?,
+            language: document.language,
+            encoding: document.encoding,
+        })
+    });
+    Some(crate::window::status::status_bar_text(
+        &app.notifications,
+        active,
+    ))
+}
+
 fn status_bar_height(hwnd: HWND) -> i32 {
-    if current_status_text(hwnd).is_none() {
+    let built =
+        unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.status.is_some());
+    if !built {
         return 0;
     }
     crate::window::status::status_height(unsafe {
@@ -1462,16 +1483,31 @@ fn status_bar_height(hwnd: HWND) -> i32 {
     })
 }
 
-fn status_contains(hwnd: HWND, y: i32) -> bool {
+fn status_bar_rect(hwnd: HWND) -> Option<RECT> {
     let height = status_bar_height(hwnd);
     if height == 0 {
-        return false;
+        return None;
     }
     let mut rect = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut rect);
     }
-    y >= rect.bottom - height
+    rect.top = (rect.bottom - height).max(rect.top);
+    Some(rect)
+}
+
+/// Clicking the bar dismisses notifications only while one is showing.
+fn notice_contains(hwnd: HWND, y: i32) -> bool {
+    current_status_text(hwnd).is_some() && status_bar_rect(hwnd).is_some_and(|rect| y >= rect.top)
+}
+
+/// Repaints just the bottom bar, for caret, selection and language changes.
+fn invalidate_status_bar(hwnd: HWND) {
+    if let Some(rect) = status_bar_rect(hwnd) {
+        unsafe {
+            InvalidateRect(hwnd, &rect, 0);
+        }
+    }
 }
 
 fn dismiss_notifications(hwnd: HWND) {
@@ -2674,6 +2710,10 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     if unsafe { editor_hwnd(hwnd) } != Some(notification.hwndFrom) {
         return;
     }
+    if notification.code == crate::editor::scintilla_constants::SCN_UPDATEUI {
+        invalidate_status_bar(hwnd);
+        return;
+    }
     if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {
         with_editor(hwnd, |editor| {
             let _ = editor.remeasure_line_numbers();
@@ -3359,10 +3399,11 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_settings_are_reported_non_modally_and_reserve_status_height() {
+    fn corrupt_settings_are_reported_on_the_bottom_bar_that_chrome_reserves() {
         // Break caught: nothing else asserts that invalid fastpad.ini lines actually reach the
-        // user. If load_settings stopped queuing warnings, or the painted status line stopped
-        // showing them, or layout stopped reserving room for it, every other test would still pass.
+        // user. If load_settings stopped queuing warnings, the painted bottom bar stopped showing
+        // them, layout stopped reserving room for it, or dismissing a notice collapsed the bar,
+        // every other test would still pass.
         let _scintilla = load_native_scintilla();
         let window = ProductionWindow::new(make_app());
         let identity = unsafe { super::window_identity(window.hwnd).unwrap() };
@@ -3376,8 +3417,9 @@ mod tests {
             .unwrap()
             .hwnd();
 
-        // No status line exists before WM_FASTPAD_BUILD_CHROME, regardless of pending warnings.
+        // No bottom bar exists before WM_FASTPAD_BUILD_CHROME, regardless of pending warnings.
         assert_eq!(super::current_status_text(window.hwnd), None);
+        assert_eq!(super::current_status_bar(window.hwnd), None);
 
         let warnings = vec![
             crate::config::SettingWarning {
@@ -3418,23 +3460,28 @@ mod tests {
             GetClientRect(window.hwnd, &mut client);
             GetClientRect(editor_hwnd, &mut shown);
         }
-        assert!(
-            shown.bottom - shown.top < client.bottom - client.top,
-            "the editor should be shorter than the client area while the status line is showing"
+        let dpi = unsafe { GetDpiForWindow(window.hwnd) };
+        let title_height = super::title_layout(window.hwnd).height;
+        assert_eq!(
+            (client.bottom - client.top) - (shown.bottom - shown.top),
+            title_height + crate::window::status::status_height(dpi),
+            "the editor should leave exactly the bottom bar's height below it"
         );
 
         super::dismiss_notifications(window.hwnd);
 
         assert_eq!(super::current_status_text(window.hwnd), None);
+        let bar = super::current_status_bar(window.hwnd).unwrap();
+        assert_eq!(bar.left, "Ln 1, Col 1");
+        assert_eq!(bar.right, "Plain Text    UTF-8");
         let mut dismissed = RECT::default();
         unsafe {
             GetClientRect(editor_hwnd, &mut dismissed);
         }
-        let dpi = unsafe { GetDpiForWindow(window.hwnd) };
         assert_eq!(
-            (dismissed.bottom - dismissed.top) - (shown.bottom - shown.top),
-            crate::window::status::status_height(dpi),
-            "dismissing notifications should return exactly the reserved status height"
+            dismissed.bottom - dismissed.top,
+            shown.bottom - shown.top,
+            "the bottom bar stays after its notices are dismissed"
         );
     }
 

@@ -5,12 +5,13 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
-    CreateCompatibleDC, CreateFontW, DC_BRUSH, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC,
-    DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FillRect, GetMonitorInfoW, GetStockObject, HDC,
-    HFONT, IntersectClipRect, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromRect, MonitorFromWindow, OUT_DEFAULT_PRECIS, PAINTSTRUCT, RestoreDC, SRCCOPY,
-    SaveDC, ScreenToClient, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor, TRANSPARENT,
+    CreateCompatibleDC, CreateFontW, DC_BRUSH, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FillRect,
+    GetMonitorInfoW, GetStockObject, HDC, HFONT, IntersectClipRect, InvalidateRect,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, RestoreDC, SRCCOPY, SaveDC, ScreenToClient, SelectObject, SetBkMode,
+    SetDCBrushColor, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::SetWindowTheme;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
@@ -538,7 +539,8 @@ pub(crate) struct TitlePaint<'a> {
     pub scroll: i32,
     /// Shown in place of the hidden editor while no tab is open.
     pub empty_hint: Option<&'a str>,
-    pub status: Option<&'a str>,
+    /// Present once deferred chrome is built; the bar is painted along the bottom edge.
+    pub status: Option<&'a crate::window::status::StatusBarText>,
     pub palette: Palette,
     pub fonts: TitleFontHandles,
     pub pointer: PointerState,
@@ -603,16 +605,38 @@ pub(crate) unsafe fn paint(hwnd: HWND, input: &TitlePaint<'_>) {
             client.right,
             client.bottom,
         );
+        let margin = scale(10, dpi);
+        let gap = scale(24, dpi);
+        let text = Rect::new(
+            margin,
+            bar.top,
+            (bar.right - margin).max(margin),
+            bar.bottom,
+        );
+        let format = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
         unsafe {
             fill(dc, bar, input.palette.strip_background);
             SetBkMode(dc, TRANSPARENT as i32);
             let previous = select_font(dc, input.fonts.text);
+            // The document details keep their full width; a long notice is what gets ellipsized.
+            let right_width = if status.right.is_empty() {
+                0
+            } else {
+                SetTextColor(dc, input.palette.muted_foreground);
+                draw_text(dc, &status.right, text, format | DT_RIGHT);
+                measure_text(dc, &status.right, format) + gap
+            };
             SetTextColor(dc, input.palette.strip_foreground);
             draw_text(
                 dc,
-                status,
-                Rect::new(8, bar.top, (bar.right - 8).max(8), bar.bottom),
-                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                &status.left,
+                Rect::new(
+                    text.left,
+                    text.top,
+                    (text.right - right_width).max(text.left),
+                    text.bottom,
+                ),
+                format | DT_END_ELLIPSIS,
             );
             restore_font(dc, previous);
         }
@@ -995,6 +1019,21 @@ fn native_rect(rect: Rect) -> RECT {
 
 fn from_native(rect: RECT) -> Rect {
     Rect::new(rect.left, rect.top, rect.right, rect.bottom)
+}
+
+unsafe fn measure_text(dc: HDC, text: &str, format: u32) -> i32 {
+    let wide = text.encode_utf16().collect::<Vec<_>>();
+    let mut rect = RECT::default();
+    unsafe {
+        DrawTextW(
+            dc,
+            wide.as_ptr(),
+            wide.len() as i32,
+            &mut rect,
+            format | DT_CALCRECT,
+        );
+    }
+    rect.right - rect.left
 }
 
 unsafe fn draw_text(dc: HDC, text: &str, rect: Rect, format: u32) {

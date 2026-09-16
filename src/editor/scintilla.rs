@@ -19,6 +19,9 @@ use crate::editor::scintilla_constants::{
 #[cfg(windows)]
 use crate::editor::scintilla_constants::{SC_MARGIN_NUMBER, SCI_SETMARGINTYPEN, SCI_STYLEGETBACK};
 use crate::editor::scintilla_constants::{
+    SCI_COUNTCHARACTERS, SCI_GETCOLUMN, SCI_GETCURRENTPOS, SCI_LINEFROMPOSITION,
+};
+use crate::editor::scintilla_constants::{
     SCI_GETLINECOUNT, SCI_SETZOOM, SCI_TEXTWIDTH, SCI_ZOOMIN, SCI_ZOOMOUT, STYLE_LINENUMBER,
 };
 use crate::{FastPadError, Result};
@@ -54,6 +57,14 @@ pub type SciFnDirect = unsafe extern "C" fn(isize, u32, usize, isize) -> isize;
 const ENDPOINT_DESTROYED: &str = "Scintilla editor endpoint is no longer alive";
 #[cfg(windows)]
 const EDITOR_ENDPOINT_SUBCLASS_ID: usize = 0x4650_4544;
+
+/// Where the caret sits, as `Editor::caret_status` reports it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaretStatus {
+    pub line: usize,
+    pub column: usize,
+    pub selected_characters: usize,
+}
 
 /// The reading order the editor lays text out in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -762,6 +773,29 @@ impl Editor {
     pub fn reset_zoom(&self) -> Result<()> {
         self.endpoint.send_direct_checked(SCI_SETZOOM, 0, 0)?;
         Ok(())
+    }
+
+    /// The caret's 1-based line and column (tabs expanded, as the view shows them) and how many
+    /// characters the main selection spans, for the status bar.
+    pub fn caret_status(&self) -> Result<CaretStatus> {
+        let caret = self.endpoint.send_direct_checked(SCI_GETCURRENTPOS, 0, 0)?;
+        let line = self
+            .endpoint
+            .send_direct_checked(SCI_LINEFROMPOSITION, caret as usize, 0)?;
+        let column = self
+            .endpoint
+            .send_direct_checked(SCI_GETCOLUMN, caret as usize, 0)?;
+        let selection = self.selection()?;
+        let selected = self.endpoint.send_direct_checked(
+            SCI_COUNTCHARACTERS,
+            selection.start,
+            selection.end as isize,
+        )?;
+        Ok(CaretStatus {
+            line: line.max(0) as usize + 1,
+            column: column.max(0) as usize + 1,
+            selected_characters: selected.max(0) as usize,
+        })
     }
 
     /// Mirrors the editor window so lines start at the right edge and the vertical scrollbar sits
