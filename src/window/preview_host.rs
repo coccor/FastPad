@@ -48,7 +48,6 @@ const NOT_MARKDOWN_NOTICE: &str = "Markdown preview is available for Markdown do
                                    View > Markdown to treat this tab as Markdown.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code, reason = "scroll sync sets `Preview` in a later change")]
 pub(crate) enum ScrollOrigin {
     #[default]
     None,
@@ -814,6 +813,53 @@ pub(crate) fn hover_link(hwnd: HWND, lparam: LPARAM) {
     let dest = *unsafe { Box::from_raw(lparam as *mut Option<String>) };
     with_host(hwnd, |host| host.hover_text = dest);
     host_window::invalidate_status_bar(hwnd);
+}
+
+/// `SCN_UPDATEUI` with a vertical scroll: move the preview to the editor's top line, unless this
+/// scroll is the echo of a preview-initiated one.
+pub(crate) fn editor_scrolled(hwnd: HWND) {
+    if mode(hwnd) != PreviewMode::Split || !preview_shown(hwnd) {
+        return;
+    }
+    let echo = with_host(hwnd, |host| {
+        std::mem::take(&mut host.scroll_origin) == ScrollOrigin::Preview
+    })
+    .unwrap_or(false);
+    if echo {
+        return;
+    }
+    let (Some(view), Some(editor)) = (view(hwnd), editor(hwnd)) else {
+        return;
+    };
+    if let Ok(line) = editor
+        .first_visible_line()
+        .and_then(|line| editor.doc_line_from_visible(line))
+    {
+        view.scroll_to_line(line);
+        with_host(hwnd, |host| host.sync_count += 1);
+    }
+}
+
+/// `WM_FASTPAD_PREVIEW_SCROLLED`: the user scrolled the preview; move the editor.
+pub(crate) fn preview_scrolled(hwnd: HWND, line: usize) {
+    if mode(hwnd) != PreviewMode::Split || !preview_shown(hwnd) {
+        return;
+    }
+    let Some(editor) = editor(hwnd) else {
+        return;
+    };
+    let Ok(target) = editor.visible_from_doc_line(line) else {
+        return;
+    };
+    if editor.first_visible_line().ok() == Some(target) {
+        return;
+    }
+    // Only set the guard when Scintilla will actually scroll and so send the echo that clears it.
+    with_host(hwnd, |host| {
+        host.scroll_origin = ScrollOrigin::Preview;
+        host.sync_count += 1;
+    });
+    let _ = editor.set_first_visible_line(target);
 }
 
 /// `WM_FASTPAD_DIAGNOSTIC_PREVIEW` (only under `--diagnostic`).

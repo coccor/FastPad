@@ -589,6 +589,10 @@ unsafe extern "system" fn main_window_proc(
                     crate::window::preview_host::refresh(hwnd);
                     return 0;
                 }
+                crate::window::WM_FASTPAD_PREVIEW_SCROLLED => {
+                    crate::window::preview_host::preview_scrolled(hwnd, wparam);
+                    return 0;
+                }
                 _ => {}
             }
             if message == crate::window::WM_FASTPAD_DIAGNOSTIC_PREVIEW
@@ -3246,6 +3250,10 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     }
     if notification.code == crate::editor::scintilla_constants::SCN_UPDATEUI {
         invalidate_status_bar(hwnd);
+        let update = unsafe { &*(lparam as *const crate::editor::ScintillaNotification) };
+        if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_V_SCROLL != 0 {
+            crate::window::preview_host::editor_scrolled(hwnd);
+        }
         return;
     }
     if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {

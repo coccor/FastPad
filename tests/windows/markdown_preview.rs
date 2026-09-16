@@ -140,7 +140,6 @@ fn pump_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool
     }
 }
 
-#[allow(dead_code, reason = "used by the scroll sync tests")]
 fn pump_for(duration: Duration) {
     let deadline = Instant::now() + duration;
     pump_until("pump_for", duration + Duration::from_secs(1), || {
@@ -366,4 +365,112 @@ fn large_documents_parse_on_a_worker_and_huge_ones_pause() {
     pump_until("refresh parse", Duration::from_secs(20), || {
         view.stats().block_count > 1000
     });
+}
+
+fn long_markdown() -> String {
+    (0..400)
+        .map(|index| {
+            format!(
+                "Paragraph {index}
+
+"
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn scrolling_the_editor_scrolls_the_preview() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(&long_markdown());
+    main.command(CommandId::MarkdownPreviewSide);
+    let view = main.view().unwrap();
+    pump_until("render", Duration::from_secs(3), || {
+        view.stats().block_count == 400
+    });
+    unsafe {
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_SETFIRSTVISIBLELINE,
+            300,
+            0,
+        );
+        windows_sys::Win32::Graphics::Gdi::UpdateWindow(main.editor);
+    }
+    pump_until("preview follows", Duration::from_secs(3), || {
+        view.top_line() >= 280
+    });
+}
+
+#[test]
+fn scrolling_the_preview_scrolls_the_editor_without_echo() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(&long_markdown());
+    main.command(CommandId::MarkdownPreviewSide);
+    let view = main.view().unwrap();
+    pump_until("render", Duration::from_secs(3), || {
+        view.stats().block_count == 400
+    });
+    let before = main.with_app(|app| app.preview.sync_count);
+    unsafe {
+        SendMessageW(
+            view.hwnd(),
+            WM_KEYDOWN,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_NEXT as usize,
+            0,
+        );
+    }
+    pump_until("editor follows", Duration::from_secs(3), || {
+        (unsafe {
+            SendMessageW(
+                main.editor,
+                crate::editor::scintilla_constants::SCI_GETFIRSTVISIBLELINE,
+                0,
+                0,
+            )
+        }) > 0
+    });
+    pump_for(Duration::from_millis(250));
+    let syncs = main.with_app(|app| app.preview.sync_count) - before;
+    assert!(syncs <= 2, "scroll sync echoed {syncs} times");
+}
+
+#[test]
+fn full_mode_keeps_the_editor_position() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(&long_markdown());
+    unsafe {
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_SETFIRSTVISIBLELINE,
+            100,
+            0,
+        )
+    };
+    main.command(CommandId::MarkdownPreviewFull);
+    let view = main.view().unwrap();
+    unsafe {
+        SendMessageW(
+            view.hwnd(),
+            WM_KEYDOWN,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_END as usize,
+            0,
+        )
+    };
+    pump_for(Duration::from_millis(300));
+    main.command(CommandId::MarkdownPreviewSide);
+    assert_eq!(
+        unsafe {
+            SendMessageW(
+                main.editor,
+                crate::editor::scintilla_constants::SCI_GETFIRSTVISIBLELINE,
+                0,
+                0,
+            )
+        },
+        100
+    );
 }
