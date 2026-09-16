@@ -10,6 +10,7 @@ pub mod layout;
 pub mod links;
 pub mod model;
 pub mod render;
+pub mod view;
 
 /// How the preview shares the content area with the editor. Owned by the window, not the tab.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

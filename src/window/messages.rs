@@ -12,6 +12,17 @@ pub const WM_FASTPAD_BUILD_CHROME: u32 = WM_APP + 6;
 pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
 // Not part of the deferred chain: answers only under --diagnostic, for acceptance tests.
 pub const WM_FASTPAD_DIAGNOSTIC_JSON_COUNT: u32 = WM_APP + 0x40;
+// Not part of the deferred chain: answers only under --diagnostic; wparam selects a preview value.
+pub const WM_FASTPAD_DIAGNOSTIC_PREVIEW: u32 = WM_APP + 0x41;
+// Preview window to main window. Payload-carrying messages pass a `Box` the receiver frees.
+pub const WM_FASTPAD_PREVIEW_SCROLLED: u32 = WM_APP + 0x50;
+pub const WM_FASTPAD_PREVIEW_LINK: u32 = WM_APP + 0x51;
+pub const WM_FASTPAD_PREVIEW_HOVER: u32 = WM_APP + 0x52;
+pub const WM_FASTPAD_PREVIEW_REFRESH: u32 = WM_APP + 0x53;
+pub const WM_FASTPAD_PREVIEW_ESCAPE: u32 = WM_APP + 0x54;
+pub const WM_FASTPAD_PREVIEW_IMAGE: u32 = WM_APP + 0x55;
+pub const WM_FASTPAD_PREVIEW_PARSED: u32 = WM_APP + 0x56;
+pub const WM_FASTPAD_PREVIEW_ACTIVATE: u32 = WM_APP + 0x57;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

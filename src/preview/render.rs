@@ -162,3 +162,122 @@ impl Drop for TestWindow {
         }
     }
 }
+
+use crate::preview::images::ImageCache;
+use crate::preview::layout::{DrawOp, ImageSlot};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ROUNDED_RECT,
+};
+use windows_numerics::Vector2;
+
+/// Paints `ops` with their block origin at (`x`, `y`). Scrollable groups draw clipped and shifted
+/// left by `h_offset`.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_ops(
+    target: &ID2D1RenderTarget,
+    brushes: &Brushes,
+    ops: &[DrawOp],
+    slots: &[ImageSlot],
+    cache: &mut ImageCache,
+    x: f32,
+    y: f32,
+    h_offset: f32,
+) {
+    for op in ops {
+        unsafe {
+            match op {
+                DrawOp::Text {
+                    layout,
+                    x: left,
+                    y: top,
+                    role,
+                } => target.DrawTextLayout(
+                    Vector2 {
+                        X: x + left,
+                        Y: y + top,
+                    },
+                    layout,
+                    brushes.get(*role),
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                ),
+                DrawOp::Fill { rect, role } => {
+                    target.FillRectangle(&rect.offset(x, y).to_d2d(), brushes.get(*role))
+                }
+                DrawOp::RoundedFill { rect, radius, role } => target.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: rect.offset(x, y).to_d2d(),
+                        radiusX: *radius,
+                        radiusY: *radius,
+                    },
+                    brushes.get(*role),
+                ),
+                DrawOp::Stroke { rect, role } => target.DrawRectangle(
+                    &rect.offset(x, y).inflate(-0.5).to_d2d(),
+                    brushes.get(*role),
+                    1.0,
+                    None,
+                ),
+                DrawOp::Checkbox { rect, checked } => {
+                    let rect = rect.offset(x, y);
+                    target.DrawRectangle(
+                        &rect.inflate(-0.5).to_d2d(),
+                        brushes.get(ColorRole::Border),
+                        1.0,
+                        None,
+                    );
+                    if *checked {
+                        target.FillRectangle(
+                            &rect.inflate(-3.0).to_d2d(),
+                            brushes.get(ColorRole::Link),
+                        );
+                    }
+                }
+                DrawOp::Image { slot } => {
+                    let Some(slot) = slots.get(*slot) else {
+                        continue;
+                    };
+                    let rect = slot.rect.offset(x, y);
+                    match slot
+                        .path
+                        .as_deref()
+                        .and_then(|path| cache.bitmap(target, path))
+                    {
+                        Some(bitmap) => target.DrawBitmap(
+                            &bitmap,
+                            Some(&rect.to_d2d()),
+                            1.0,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        ),
+                        None => {
+                            target.DrawRectangle(
+                                &rect.inflate(-0.5).to_d2d(),
+                                brushes.get(ColorRole::Border),
+                                1.0,
+                                None,
+                            );
+                            target.DrawTextLayout(
+                                Vector2 {
+                                    X: rect.left + 8.0,
+                                    Y: rect.top + 8.0,
+                                },
+                                &slot.alt,
+                                brushes.get(ColorRole::Muted),
+                                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            );
+                        }
+                    }
+                }
+                DrawOp::Scrollable { clip, ops, .. } => {
+                    target.PushAxisAlignedClip(
+                        &clip.offset(x, y).to_d2d(),
+                        D2D1_ANTIALIAS_MODE_ALIASED,
+                    );
+                    draw_ops(target, brushes, ops, slots, cache, x - h_offset, y, 0.0);
+                    target.PopAxisAlignedClip();
+                }
+            }
+        }
+    }
+}
