@@ -276,6 +276,10 @@ impl Tabs {
         if index != self.active_index() || self.documents[index].generation != review.generation {
             return Err(CloseReviewError::Stale);
         }
+        // A Save answer must never close a document whose save did not actually happen.
+        if decision == CloseDecision::Save && self.documents[index].dirty {
+            return Err(CloseReviewError::Unsaved);
+        }
         let closed = if self.documents.len() == 1 {
             let replacement = replacement.ok_or(CloseReviewError::MissingReplacement)?;
             std::mem::replace(&mut self.documents[0], replacement)
@@ -436,6 +440,7 @@ pub enum CloseReviewError {
     Cancelled,
     Stale,
     MissingReplacement,
+    Unsaved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -54,6 +54,8 @@ pub struct App {
     pub(crate) deferred_open_waiting: bool,
     pub(crate) launch_open_completed: bool,
     pub(crate) populating_file: bool,
+    pub(crate) modal_depth: u32,
+    pub(crate) held_messages: Vec<u32>,
     identity: WindowIdentity,
     first_paint_completed: bool,
     deferred_start_pending: bool,
@@ -94,6 +96,8 @@ impl App {
             deferred_open_waiting: false,
             launch_open_completed: false,
             populating_file: false,
+            modal_depth: 0,
+            held_messages: Vec::new(),
             identity: WindowIdentity {
                 state: Rc::new(Cell::new(WindowIdentityState::Unbound)),
             },

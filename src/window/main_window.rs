@@ -27,8 +27,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetWindowLongPtrW, IDCANCEL, IDNO, IDYES, IsZoomed, KillTimer, MB_ICONWARNING, MB_YESNOCANCEL,
-    MessageBoxW, MoveWindow, OBJID_CLIENT, PostMessageW, PostQuitMessage, QS_INPUT, RegisterClassW,
+    GetWindowLongPtrW, IsZoomed, KillTimer, MoveWindow, OBJID_CLIENT, PostMessageW,
+    PostQuitMessage, QS_INPUT, RegisterClassW,
     SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
     UnregisterClassW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
@@ -39,7 +39,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 #[cfg(not(test))]
-use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MessageBoxW,
+};
+use crate::window::modal::prompt_close_decision;
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
 
@@ -868,7 +871,7 @@ fn execute_command(hwnd: HWND, command: CommandId) {
         CommandId::Open => {
             let identity = unsafe { window_identity(hwnd) };
             // Modal Show reenters the window procedure. Only an owned identity crosses it.
-            let selection = crate::window::commands::choose_open_path(hwnd);
+            let selection = crate::window::modal::choose_open_path(hwnd);
             if identity
                 .as_ref()
                 .is_some_and(|identity| identity.is_live_for(hwnd))
@@ -881,8 +884,12 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             let _ = create_new_document(hwnd);
         }
         CommandId::CloseTab => close_active_document(hwnd),
-        CommandId::Save => save_active_document(hwnd),
-        CommandId::SaveAs => save_active_document_as(hwnd),
+        CommandId::Save => {
+            let _ = save_active_document(hwnd);
+        }
+        CommandId::SaveAs => {
+            let _ = save_active_document_as(hwnd);
+        }
         CommandId::Undo => with_editor(hwnd, |editor| {
             let _ = editor.undo();
         }),
@@ -1707,6 +1714,20 @@ fn close_active_document(hwnd: HWND) {
     if decision == CloseDecision::Cancel || !identity.is_live_for(hwnd) {
         return;
     }
+    // Saving clears the dirty flag, which advances the generation the prompt reviewed.
+    let review = if decision == CloseDecision::Save {
+        if !save_reviewed_document(hwnd, review.id) {
+            return;
+        }
+        match unsafe { app_ptr(hwnd) }
+            .and_then(|app| unsafe { app.as_ref() }.tabs.active_close_review())
+        {
+            Some(saved) if saved.id == review.id => saved,
+            _ => return,
+        }
+    } else {
+        review
+    };
 
     let current_len = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let app = unsafe { app.as_ref() };
@@ -1763,46 +1784,86 @@ fn close_active_document(hwnd: HWND) {
     }
 }
 
-fn save_active_document(hwnd: HWND) {
+/// Activates `id` (the prompt's modal loop can have activated another tab) and saves it. Reports
+/// success only when that same document is the active, no-longer-dirty one afterwards.
+fn save_reviewed_document(hwnd: HWND, id: DocumentId) -> bool {
+    if !activate_document_by_id(hwnd, id) || !save_active_document(hwnd) {
+        return false;
+    }
+    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
+        let app = unsafe { app.as_ref() };
+        app.tabs.active().id == id
+            && app
+                .tabs
+                .document(id)
+                .is_some_and(|document| !document.dirty)
+    })
+}
+
+/// Makes `id` the active document, or reports false when it no longer exists.
+fn activate_document_by_id(hwnd: HWND, id: DocumentId) -> bool {
+    let target = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        if app.tabs.active().id == id {
+            return Some(None);
+        }
+        app.tabs.document(id)?;
+        Some(Some(app.tabs.view().snapshot().revision))
+    });
+    match target {
+        Some(None) => true,
+        Some(Some(revision)) => activate_document(hwnd, id, revision),
+        None => false,
+    }
+}
+
+fn save_active_document(hwnd: HWND) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
-        return;
+        return false;
     };
     let has_path =
         unsafe { app_ptr(hwnd) }.map(|app| unsafe { app.as_ref() }.tabs.active().path.is_some());
     match has_path {
         Some(true) => complete_save(hwnd, &identity, None),
         Some(false) => save_active_document_as(hwnd),
-        None => {}
+        None => false,
     }
 }
 
-fn save_active_document_as(hwnd: HWND) {
+fn save_active_document_as(hwnd: HWND) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
-        return;
+        return false;
     };
-    let Some(suggested) = (unsafe { app_ptr(hwnd) }).map(|app| {
+    let Some((target, suggested)) = (unsafe { app_ptr(hwnd) }).map(|app| {
         let app = unsafe { app.as_ref() };
-        app.tabs
-            .active()
-            .path
-            .as_deref()
-            .and_then(std::path::Path::file_name)
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled.txt".to_owned())
+        let document = app.tabs.active();
+        (
+            document.id,
+            document
+                .path
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Untitled.txt".to_owned()),
+        )
     }) else {
-        return;
+        return false;
     };
     // Modal Show reenters the window procedure. Only an owned identity crosses it.
-    let selection = crate::window::commands::choose_save_path(hwnd, &suggested);
+    let selection = crate::window::modal::choose_save_path(hwnd, &suggested);
     if !identity.is_live_for(hwnd) {
-        return;
+        return false;
     }
     let Ok(Some(path)) = selection else {
         // Cancellation is not an error; a real error is silently dropped, matching Open's
         // existing precedent above.
-        return;
+        return false;
     };
-    complete_save(hwnd, &identity, Some(path));
+    // The dialog's modal loop can have activated another tab; save the document that was chosen.
+    if !activate_document_by_id(hwnd, target) {
+        return false;
+    }
+    complete_save(hwnd, &identity, Some(path))
 }
 
 /// Test-only entry point that drives Save As with an explicit path, bypassing the native dialog.
@@ -1831,7 +1892,11 @@ pub(crate) fn save_path_as(hwnd: HWND, path: &std::path::Path) {
 /// `editor.text()` read, or a failed `save_atomic`) reverts the tab's path back to whatever it
 /// held before this call: a failed write must never leave the tab claiming a path nothing was
 /// actually written to, orphaning it from the path it was last genuinely saved at.
-fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::path::PathBuf>) {
+fn complete_save(
+    hwnd: HWND,
+    identity: &WindowIdentity,
+    new_path: Option<std::path::PathBuf>,
+) -> bool {
     let is_save_as = new_path.is_some();
     let mut original_path: Option<std::path::PathBuf> = None;
     if let Some(path) = new_path {
@@ -1846,13 +1911,13 @@ fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::pa
                     hwnd,
                     "This file is already open in another tab. Choose a different name.",
                 );
-                return;
+                return false;
             }
-            None => return,
+            None => return false,
         }
     }
     if !identity.is_live_for(hwnd) {
-        return;
+        return false;
     }
     let Some((editor, path, encoding)) = (unsafe { app_ptr(hwnd) }).and_then(|app| {
         let app = unsafe { app.as_ref() };
@@ -1863,18 +1928,18 @@ fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::pa
         if is_save_as {
             revert_active_path(hwnd, original_path);
         }
-        return;
+        return false;
     };
     let Ok(text) = editor.text() else {
         if is_save_as {
             revert_active_path(hwnd, original_path);
         }
-        return;
+        return false;
     };
     let bytes = crate::file::encoding::encode(&text, encoding);
     let result = crate::file::saver::save_atomic(&path, &bytes);
     if !identity.is_live_for(hwnd) {
-        return;
+        return false;
     }
     match result {
         Ok(()) => {
@@ -1893,6 +1958,7 @@ fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::pa
                 }
                 invalidate_title_strip(hwnd);
             }
+            true
         }
         Err(_) => {
             if is_save_as {
@@ -1902,6 +1968,7 @@ fn complete_save(hwnd: HWND, identity: &WindowIdentity, new_path: Option<std::pa
                 hwnd,
                 "FastPad could not save this file. The previous version on disk was not modified.",
             );
+            false
         }
     }
 }
@@ -1967,6 +2034,13 @@ fn review_dirty_documents(hwnd: HWND) -> Option<Vec<DocumentId>> {
         if decision == CloseDecision::Cancel || !identity.is_live_for(hwnd) {
             return None;
         }
+        // A failed or cancelled save aborts the whole window close rather than losing the text.
+        if decision == CloseDecision::Save {
+            if !save_reviewed_document(hwnd, review.id) {
+                return None;
+            }
+            continue;
+        }
         let current = unsafe { app_ptr(hwnd) }
             .map(|app| unsafe { app.as_ref() }.tabs.dirty_review_is_current(review))
             .unwrap_or(false);
@@ -1977,24 +2051,6 @@ fn review_dirty_documents(hwnd: HWND) -> Option<Vec<DocumentId>> {
                 discarded.push(review.id);
             }
         }
-    }
-}
-
-fn prompt_close_decision(hwnd: HWND, title: &str) -> CloseDecision {
-    let message = wide_null(&format!("Save changes to {title} before closing?"));
-    let caption = wide_null("FastPad");
-    match unsafe {
-        MessageBoxW(
-            hwnd,
-            message.as_ptr(),
-            caption.as_ptr(),
-            MB_YESNOCANCEL | MB_ICONWARNING,
-        )
-    } {
-        IDYES => CloseDecision::Save,
-        IDNO => CloseDecision::Discard,
-        IDCANCEL => CloseDecision::Cancel,
-        _ => CloseDecision::Cancel,
     }
 }
 
@@ -2602,14 +2658,14 @@ unsafe fn install_editor(hwnd: HWND, editor: Editor, document: Document) -> Resu
     Ok(())
 }
 
-unsafe fn app_ptr(hwnd: HWND) -> Option<NonNull<App>> {
+pub(super) unsafe fn app_ptr(hwnd: HWND) -> Option<NonNull<App>> {
     // SAFETY: `GWLP_USERDATA` is written exactly once from `WM_NCCREATE` with a `Box<App>` owned
     // by the window and cleared in `WM_NCDESTROY`. Callers must not keep references alive across
     // reentrant Win32 calls; they may only copy values or perform immediate mutation.
     NonNull::new(unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App })
 }
 
-unsafe fn window_identity(hwnd: HWND) -> Option<WindowIdentity> {
+pub(super) unsafe fn window_identity(hwnd: HWND) -> Option<WindowIdentity> {
     // SAFETY: Clone only the App's stable identity token. The temporary App reference ends before
     // callers cross any reentrant Win32 boundary.
     let app = unsafe { app_ptr(hwnd) }?;

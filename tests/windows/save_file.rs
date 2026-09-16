@@ -188,6 +188,227 @@ fn save_as_failure_reverts_the_tabs_path_to_its_original_value() {
     assert_eq!(std::fs::read(&fixture.path).unwrap(), b"already saved");
 }
 
+#[test]
+fn tab_close_yes_saves_a_pathed_document_then_closes_it() {
+    // Break caught: answering Yes to the close prompt closes the tab without saving it, losing
+    // every unsaved edit.
+    let fixture = Fixture::new(b"before");
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    window::open_path(main.hwnd, &fixture.path).unwrap();
+    wait_text(main.editor, "before");
+    type_text(main.editor, "X");
+    let expected = scintilla_text(main.editor).unwrap();
+    window::answer_next_close_prompt(|_| document::CloseDecision::Save);
+
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0);
+    }
+
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), expected.as_bytes());
+    assert_eq!(scintilla_text(main.editor).unwrap(), "");
+    main.with_app(|app| {
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs.active().path, None);
+        assert!(!app.tabs.active().dirty);
+    });
+}
+
+#[test]
+fn tab_close_yes_on_an_untitled_document_saves_as_the_chosen_path_then_closes_it() {
+    // Break caught: Yes on a never-saved document closes it without asking where to save.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    type_text(main.editor, "draft");
+    let scratch = ScratchDir::new("close-yes-save-as");
+    let target = scratch.path().join("draft.txt");
+    let chosen = target.clone();
+    window::answer_next_close_prompt(|_| document::CloseDecision::Save);
+    window::answer_next_save_dialog(move |_| Some(chosen));
+
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0);
+    }
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"draft");
+    assert_eq!(scintilla_text(main.editor).unwrap(), "");
+    main.with_app(|app| {
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs.active().path, None);
+    });
+}
+
+#[test]
+fn tab_close_yes_on_an_untitled_document_keeps_it_open_when_save_as_is_cancelled() {
+    // Break caught: cancelling the Save As dialog that a Yes answer opens still closes the tab.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    type_text(main.editor, "draft");
+    window::answer_next_close_prompt(|_| document::CloseDecision::Save);
+    window::answer_next_save_dialog(|_| None);
+
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0);
+    }
+
+    assert_eq!(scintilla_text(main.editor).unwrap(), "draft");
+    main.with_app(|app| {
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs.active().path, None);
+        assert!(app.tabs.active().dirty);
+    });
+}
+
+#[test]
+fn tab_close_yes_keeps_the_tab_open_when_the_write_fails() {
+    // Break caught: a Yes answer whose save fails still closes the tab and discards its text.
+    let fixture = Fixture::new(b"before");
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    window::open_path(main.hwnd, &fixture.path).unwrap();
+    wait_text(main.editor, "before");
+    type_text(main.editor, "X");
+    let edited = scintilla_text(main.editor).unwrap();
+    // Without its directory, save_atomic cannot create the temporary file.
+    std::fs::remove_dir_all(&fixture.directory).unwrap();
+    window::answer_next_close_prompt(|_| document::CloseDecision::Save);
+
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0);
+    }
+
+    assert_eq!(scintilla_text(main.editor).unwrap(), edited);
+    main.with_app(|app| {
+        assert_eq!(
+            app.tabs.active().path.as_deref(),
+            Some(fixture.path.as_path())
+        );
+        assert!(app.tabs.active().dirty);
+    });
+}
+
+#[test]
+fn tab_close_no_discards_and_cancel_keeps_the_document() {
+    // Break caught: No leaving the tab open, or Cancel closing it.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    type_text(main.editor, "kept");
+    window::answer_next_close_prompt(|_| document::CloseDecision::Cancel);
+
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0);
+    }
+
+    assert_eq!(scintilla_text(main.editor).unwrap(), "kept");
+    main.with_app(|app| assert!(app.tabs.active().dirty));
+
+    window::answer_next_close_prompt(|_| document::CloseDecision::Discard);
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0);
+    }
+
+    assert_eq!(scintilla_text(main.editor).unwrap(), "");
+    main.with_app(|app| {
+        assert_eq!(app.tabs.len(), 1);
+        assert!(!app.tabs.active().dirty);
+    });
+}
+
+#[test]
+fn window_close_yes_saves_every_dirty_document_before_the_window_closes() {
+    // Break caught: window close treating Yes as "keep going" and destroying unsaved documents.
+    let fixture = Fixture::new(b"before");
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    window::open_path(main.hwnd, &fixture.path).unwrap();
+    wait_text(main.editor, "before");
+    type_text(main.editor, "X");
+    let first = scintilla_text(main.editor).unwrap();
+    unsafe {
+        SendMessageW(main.hwnd, WM_COMMAND, CommandId::New as usize, 0);
+    }
+    type_text(main.editor, "draft");
+    let scratch = ScratchDir::new("window-close-yes");
+    let target = scratch.path().join("draft.txt");
+    let chosen = target.clone();
+    window::answer_next_close_prompt(|_| document::CloseDecision::Save);
+    window::answer_next_close_prompt(|_| document::CloseDecision::Save);
+    window::answer_next_save_dialog(move |_| Some(chosen));
+
+    unsafe {
+        SendMessageW(
+            main.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+            0,
+            0,
+        );
+    }
+
+    assert_eq!(unsafe { IsWindow(main.hwnd) }, 0);
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), first.as_bytes());
+    assert_eq!(std::fs::read(&target).unwrap(), b"draft");
+}
+
+#[test]
+fn window_close_yes_with_save_as_cancelled_aborts_the_close() {
+    // Break caught: a cancelled Save As during window close still destroys the unsaved document.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    type_text(main.editor, "draft");
+    window::answer_next_close_prompt(|_| document::CloseDecision::Save);
+    window::answer_next_save_dialog(|_| None);
+
+    unsafe {
+        SendMessageW(
+            main.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+            0,
+            0,
+        );
+    }
+
+    assert_ne!(unsafe { IsWindow(main.hwnd) }, 0);
+    assert_eq!(scintilla_text(main.editor).unwrap(), "draft");
+    main.with_app(|app| assert!(app.tabs.active().dirty));
+}
+
+#[test]
+fn window_close_cancel_aborts_and_no_discards_without_writing() {
+    // Break caught: Cancel destroying the window, or No writing a file instead of discarding.
+    let fixture = Fixture::new(b"before");
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    window::open_path(main.hwnd, &fixture.path).unwrap();
+    wait_text(main.editor, "before");
+    type_text(main.editor, "X");
+    window::answer_next_close_prompt(|_| document::CloseDecision::Cancel);
+
+    unsafe {
+        SendMessageW(
+            main.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+            0,
+            0,
+        );
+    }
+
+    assert_ne!(unsafe { IsWindow(main.hwnd) }, 0);
+    main.with_app(|app| assert!(app.tabs.active().dirty));
+
+    window::answer_next_close_prompt(|_| document::CloseDecision::Discard);
+    unsafe {
+        SendMessageW(
+            main.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+            0,
+            0,
+        );
+    }
+
+    assert_eq!(unsafe { IsWindow(main.hwnd) }, 0);
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), b"before");
+}
+
 /// Drives a Save/Save As command and immediately cancels the native dialog.
 fn cancel_save_dialog(owner: HWND, command: CommandId) {
     let pid = std::process::id();

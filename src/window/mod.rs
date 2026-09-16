@@ -4,6 +4,7 @@ pub mod find_bar;
 mod main_window;
 pub(crate) mod menus;
 mod messages;
+mod modal;
 pub mod notification;
 pub mod palette;
 pub mod status;
@@ -28,6 +29,12 @@ pub(crate) use main_window::{save_path_as, take_save_errors, with_test_input_que
     reason = "consumed by the source-linked json_commands integration target"
 )]
 pub(crate) use main_window::{take_json_issues, take_json_valid_count};
+#[cfg(test)]
+#[allow(
+    unused_imports,
+    reason = "consumed by the source-linked save_file integration target"
+)]
+pub(crate) use modal::{answer_next_close_prompt, answer_next_save_dialog};
 pub use messages::{
     WM_FASTPAD_APPLY_LANGUAGE, WM_FASTPAD_BUILD_CHROME, WM_FASTPAD_DIAGNOSTIC_JSON_COUNT,
     WM_FASTPAD_IPC_REQUEST, WM_FASTPAD_LOAD_SETTINGS, WM_FASTPAD_OPEN_REQUEST, WM_FASTPAD_RECOVERY,

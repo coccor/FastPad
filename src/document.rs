@@ -222,13 +222,25 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_save_allows_a_dirty_document_to_close() {
-        // Break caught: the tab model can ignore a caller's successful save decision and leave
-        // the already-saved document open.
+    fn save_decision_closes_only_a_document_that_is_no_longer_dirty() {
+        // Break caught: a Save answer closing a tab whose save never happened or failed, which
+        // discards the only copy of its unsaved text.
         let mut tabs = Tabs::from_documents([dirty_document(1), document(2)]).unwrap();
+        let unsaved = tabs.active_close_review().unwrap();
 
+        assert_eq!(
+            tabs.close_reviewed(unsaved, CloseDecision::Save, None),
+            Err(CloseReviewError::Unsaved)
+        );
+        assert_eq!(
+            tabs.ids().collect::<Vec<_>>(),
+            [DocumentId(1), DocumentId(2)]
+        );
+
+        assert!(tabs.set_active_dirty(false));
+        let saved = tabs.active_close_review().unwrap();
         let closed = tabs
-            .close_active(CloseDecision::Save, || document(3))
+            .close_reviewed(saved, CloseDecision::Save, None)
             .unwrap();
 
         assert_eq!(closed.id, DocumentId(1));
