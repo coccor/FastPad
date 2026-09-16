@@ -519,9 +519,9 @@ pub(crate) struct ParsedPreview {
 
 /// Copies the text (the worker must not touch Scintilla's buffer) and parses it on a new thread.
 /// Bumping the generation retires any parse still running.
-fn spawn_parse(hwnd: HWND, editor: &Editor, document: DocumentId, started: Instant) {
+fn spawn_parse(hwnd: HWND, editor: &Editor, document: DocumentId, started: Instant) -> bool {
     let Ok(text) = editor.text() else {
-        return;
+        return false;
     };
     let generation = with_host(hwnd, |host| {
         host.parse_generation += 1;
@@ -551,6 +551,7 @@ fn spawn_parse(hwnd: HWND, editor: &Editor, document: DocumentId, started: Insta
             drop(unsafe { Box::from_raw(payload) });
         }
     });
+    true
 }
 
 /// `WM_FASTPAD_PREVIEW_PARSED`: installs a worker parse unless newer text superseded it.
@@ -559,19 +560,23 @@ pub(crate) fn parsed(hwnd: HWND, lparam: LPARAM) {
         return;
     }
     let payload = unsafe { Box::from_raw(lparam as *mut ParsedPreview) };
-    let current = with_host(hwnd, |host| {
+    let (current, edits_waiting) = with_host(hwnd, |host| {
         let current = host.view.is_some()
             && host.document == Some(payload.document)
             && host.parse_generation == payload.generation;
         if current {
             host.full_parse_pending = false;
         }
-        current
+        (current, !host.edits.is_empty())
     })
-    .unwrap_or(false);
+    .unwrap_or((false, false));
     let (Some(view), true) = (view(hwnd), current) else {
         return;
     };
+    // Edits made while the worker ran were deferred; they apply on top of the parsed snapshot.
+    if edits_waiting {
+        unsafe { SetTimer(hwnd, PREVIEW_TIMER_ID, PREVIEW_UPDATE_DELAY_MS, None) };
+    }
     let folder = active_document(hwnd).and_then(|(_, _, folder)| folder);
     let ParsedPreview {
         parsed, started, ..
@@ -613,6 +618,9 @@ pub(crate) fn record_edit(hwnd: HWND, notification: &ScintillaNotification) {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FlushPlan {
     Nothing,
+    /// A worker parse is still outstanding: keep these edits for when it lands. Spawning another
+    /// would copy the whole text again on every typing pause.
+    Defer(Pending),
     /// The document is over `LIVE_UPDATE_LIMIT`: show the refresh bar and drop the edits.
     Pause,
     /// Reparse everything on the UI thread.
@@ -626,8 +634,8 @@ pub(crate) enum FlushPlan {
     },
 }
 
-/// A paused preview, or one whose block model is stale behind an outstanding worker parse, cannot
-/// take incremental edits: both need the whole document parsed again.
+/// A paused preview needs the whole document parsed again. While a worker parse is outstanding the
+/// block model is stale, so edits wait for it instead of being applied on top.
 pub(crate) fn plan_flush(
     pending: Pending,
     length: usize,
@@ -638,8 +646,9 @@ pub(crate) fn plan_flush(
         return FlushPlan::Pause;
     }
     let pending = match pending {
-        Pending::Nothing if !paused => return FlushPlan::Nothing,
-        _ if paused || full_parse_pending => Pending::Full,
+        Pending::Nothing if !paused || full_parse_pending => return FlushPlan::Nothing,
+        pending if full_parse_pending => return FlushPlan::Defer(pending),
+        _ if paused => Pending::Full,
         pending => pending,
     };
     let large = length > WORKER_PARSE_THRESHOLD;
@@ -676,6 +685,10 @@ pub(crate) fn flush(hwnd: HWND) {
     let started = Instant::now();
     match plan_flush(pending, length, view.is_paused(), full_parse_pending) {
         FlushPlan::Nothing => {}
+        FlushPlan::Defer(pending) => {
+            with_host(hwnd, |host| host.edits.restore(pending));
+            unsafe { SetTimer(hwnd, PREVIEW_TIMER_ID, PREVIEW_UPDATE_DELAY_MS, None) };
+        }
         FlushPlan::Pause => view.set_paused(true),
         FlushPlan::Reparse => {
             view.set_paused(false);
@@ -688,7 +701,10 @@ pub(crate) fn flush(hwnd: HWND) {
         }
         FlushPlan::WorkerParse => {
             view.set_paused(false);
-            spawn_parse(hwnd, &editor, id, started);
+            if !spawn_parse(hwnd, &editor, id, started) {
+                // Keep the work for the next flush instead of dropping it.
+                with_host(hwnd, |host| host.edits.request_full());
+            }
         }
         FlushPlan::Incremental {
             edits,
@@ -696,8 +712,10 @@ pub(crate) fn flush(hwnd: HWND) {
         } => {
             let applied =
                 view.apply_edits(&ScintillaSource(&editor), &edits, started, allow_full_parse);
-            if applied.is_none() {
-                spawn_parse(hwnd, &editor, id, started);
+            // `try_apply` declining leaves the model untouched; if the worker cannot start either,
+            // the edits must survive as a full reparse request.
+            if applied.is_none() && !spawn_parse(hwnd, &editor, id, started) {
+                with_host(hwnd, |host| host.edits.request_full());
             }
         }
     }
@@ -818,14 +836,12 @@ pub(crate) fn hover_link(hwnd: HWND, lparam: LPARAM) {
 /// `SCN_UPDATEUI` with a vertical scroll: move the preview to the editor's top line, unless this
 /// scroll is the echo of a preview-initiated one.
 pub(crate) fn editor_scrolled(hwnd: HWND) {
-    if mode(hwnd) != PreviewMode::Split || !preview_shown(hwnd) {
-        return;
-    }
+    // Taken before the mode check so a guard can never outlive the scroll that set it.
     let echo = with_host(hwnd, |host| {
         std::mem::take(&mut host.scroll_origin) == ScrollOrigin::Preview
     })
     .unwrap_or(false);
-    if echo {
+    if echo || mode(hwnd) != PreviewMode::Split || !preview_shown(hwnd) {
         return;
     }
     let (Some(view), Some(editor)) = (view(hwnd), editor(hwnd)) else {
@@ -851,15 +867,22 @@ pub(crate) fn preview_scrolled(hwnd: HWND, line: usize) {
     let Ok(target) = editor.visible_from_doc_line(line) else {
         return;
     };
-    if editor.first_visible_line().ok() == Some(target) {
+    let before = editor.first_visible_line().ok();
+    if before == Some(target) {
         return;
     }
-    // Only set the guard when Scintilla will actually scroll and so send the echo that clears it.
-    with_host(hwnd, |host| {
-        host.scroll_origin = ScrollOrigin::Preview;
-        host.sync_count += 1;
-    });
+    with_host(hwnd, |host| host.scroll_origin = ScrollOrigin::Preview);
     let _ = editor.set_first_visible_line(target);
+    // Scintilla clamps near the end of the document; with no scroll there is no echo to clear the
+    // guard, and it would swallow the next real editor scroll.
+    let scrolled = editor.first_visible_line().ok() != before;
+    with_host(hwnd, |host| {
+        if scrolled {
+            host.sync_count += 1;
+        } else {
+            host.scroll_origin = ScrollOrigin::None;
+        }
+    });
 }
 
 /// `WM_FASTPAD_DIAGNOSTIC_PREVIEW` (only under `--diagnostic`).
@@ -917,7 +940,7 @@ fn over_divider(hwnd: HWND, x: i32, y: i32) -> bool {
 }
 
 pub(crate) fn begin_divider_drag(hwnd: HWND, x: i32, y: i32) -> bool {
-    if !over_divider(hwnd, x, y) {
+    if host_window::menu_mode(hwnd).is_some() || !over_divider(hwnd, x, y) {
         return false;
     }
     let now = unsafe { GetMessageTime() } as u32;
@@ -957,6 +980,16 @@ pub(crate) fn drag_divider(hwnd: HWND, x: i32) -> bool {
     host_window::layout_editor_and_find_bar(hwnd);
     host_window::invalidate_title_strip(hwnd);
     true
+}
+
+/// `WM_CAPTURECHANGED`: capture was taken away mid-drag (task switch, a dialog), so no button-up
+/// will arrive.
+pub(crate) fn cancel_divider_drag(hwnd: HWND) {
+    if with_host(hwnd, |host| std::mem::replace(&mut host.dragging, false)).unwrap_or(false)
+        && let Some(view) = view(hwnd)
+    {
+        view.set_live_resize(false);
+    }
 }
 
 pub(crate) fn end_divider_drag(hwnd: HWND) -> bool {
@@ -1067,16 +1100,20 @@ mod tests {
     }
 
     #[test]
-    fn edits_wait_for_an_outstanding_worker_parse_by_parsing_again() {
+    fn edits_wait_for_an_outstanding_worker_parse() {
         let small = 1_000;
         let large = WORKER_PARSE_THRESHOLD + 1;
         assert_eq!(
             plan_flush(Pending::Edits(vec![edit()]), large, false, true),
-            FlushPlan::WorkerParse
+            FlushPlan::Defer(Pending::Edits(vec![edit()]))
         );
         assert_eq!(
-            plan_flush(Pending::Edits(vec![edit()]), small, false, true),
-            FlushPlan::Reparse
+            plan_flush(Pending::Full, large, false, true),
+            FlushPlan::Defer(Pending::Full)
+        );
+        assert_eq!(
+            plan_flush(Pending::Edits(vec![edit()]), small, true, true),
+            FlushPlan::Defer(Pending::Edits(vec![edit()]))
         );
         assert_eq!(
             plan_flush(Pending::Nothing, large, false, true),

@@ -12,7 +12,7 @@ use support::acceptance::AcceptanceHarness;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, SendMessageW,
+    DispatchMessageW, IsWindowVisible, MSG, PM_QS_INPUT, PM_REMOVE, PeekMessageW, SendMessageW,
     TranslateMessage, WM_COMMAND, WM_KEYDOWN,
 };
 
@@ -125,18 +125,45 @@ impl Drop for TestMain {
 fn pump_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     loop {
-        let mut msg = MSG::default();
-        while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
-            unsafe {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+        pump_pending();
         if condition() {
             return;
         }
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Dispatches everything queued, draining input before each other message as FastPad's own loop
+/// prioritizes it. Posted messages are retrieved ahead of input, so a plain `PeekMessageW` loop
+/// livelocks when real mouse or keyboard input reaches the (foreground) test window while a
+/// deferred startup unit is queued: the unit sees input pending, reposts itself, and is retrieved
+/// again before the input ever is.
+fn pump_pending() {
+    let mut msg = MSG::default();
+    loop {
+        while unsafe {
+            PeekMessageW(
+                &mut msg,
+                std::ptr::null_mut(),
+                0,
+                0,
+                PM_REMOVE | PM_QS_INPUT,
+            )
+        } != 0
+        {
+            unsafe {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } == 0 {
+            return;
+        }
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
 }
 
@@ -434,7 +461,60 @@ fn scrolling_the_preview_scrolls_the_editor_without_echo() {
     });
     pump_for(Duration::from_millis(250));
     let syncs = main.with_app(|app| app.preview.sync_count) - before;
-    assert!(syncs <= 2, "scroll sync echoed {syncs} times");
+    assert_eq!(
+        syncs, 1,
+        "scroll sync echoed: {syncs} syncs for one preview scroll"
+    );
+}
+
+#[test]
+fn closing_the_find_bar_in_full_mode_focuses_the_preview() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown("# A\n");
+    main.command(CommandId::MarkdownPreviewFull);
+    let view = main.view().unwrap();
+    main.command(CommandId::Find);
+    let query = main.with_app(|app| app.find_bar.as_ref().unwrap().query_hwnd());
+    assert_eq!(unsafe { GetFocus() }, query);
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_ESCAPE as usize, 0) };
+    assert_eq!(unsafe { GetFocus() }, view.hwnd());
+}
+
+#[test]
+fn losing_capture_ends_a_divider_drag() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown("# A\n");
+    main.command(CommandId::MarkdownPreviewSide);
+    let divider = window::preview_host::divider_rect(main.hwnd).expect("divider");
+    assert!(window::preview_host::begin_divider_drag(
+        main.hwnd,
+        divider.left,
+        divider.top
+    ));
+    assert!(window::preview_host::drag_divider(main.hwnd, divider.left));
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
+    assert!(!window::preview_host::drag_divider(main.hwnd, divider.left));
+}
+
+#[test]
+fn menu_mode_keeps_the_frame_focus_in_full_mode() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown("# A\n");
+    main.command(CommandId::MarkdownPreviewFull);
+    // A tapped F10 enters menu mode, which parks the focus on the frame for the menu keys.
+    unsafe {
+        SendMessageW(
+            main.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND,
+            windows_sys::Win32::UI::WindowsAndMessaging::SC_KEYMENU as usize,
+            0,
+        )
+    };
+    assert!(main.with_app(|app| app.menu_mode.is_some()));
+    assert_eq!(unsafe { GetFocus() }, main.hwnd);
 }
 
 #[test]

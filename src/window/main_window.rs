@@ -162,18 +162,14 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_SETFOCUS => {
-            if let Some(preview) = crate::window::preview_host::full_view_hwnd(hwnd) {
-                unsafe { SetFocus(preview) };
-                return 0;
-            }
             // With no tab open the editor is hidden and the frame itself keeps the focus, as it
-            // does in menu mode to take the menu keys.
+            // does in menu mode to take the menu keys. A Full preview takes the editor's place.
             if menu_mode(hwnd).is_none()
                 && tab_count(hwnd) > 0
-                && let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) }
+                && let Some(target) = content_focus_target(hwnd)
             {
                 unsafe {
-                    SetFocus(editor_hwnd);
+                    SetFocus(target);
                 }
             }
             0
@@ -340,6 +336,7 @@ unsafe extern "system" fn main_window_proc(
             if let Some(mut app) = unsafe { app_ptr(hwnd) } {
                 unsafe { app.as_mut() }.tab_thumb_grab = None;
             }
+            crate::window::preview_host::cancel_divider_drag(hwnd);
             0
         }
         // The empty tab-strip space is the only caption: double-clicking it opens a tab, VSCode
@@ -981,11 +978,17 @@ pub(crate) fn close_find_bar(hwnd: HWND) {
         return;
     }
     layout_editor_and_find_bar(hwnd);
-    if let Some(editor_hwnd) = unsafe { editor_hwnd(hwnd) } {
+    if let Some(target) = content_focus_target(hwnd) {
         unsafe {
-            SetFocus(editor_hwnd);
+            SetFocus(target);
         }
     }
+}
+
+/// Where keyboard focus belongs in the content area: the preview while it replaces the editor in
+/// Full mode, otherwise the editor.
+fn content_focus_target(hwnd: HWND) -> Option<HWND> {
+    crate::window::preview_host::full_view_hwnd(hwnd).or_else(|| unsafe { editor_hwnd(hwnd) })
 }
 
 /// Overlays the palette at the top of the editor, even with no tab open (New and Open stay
@@ -1078,7 +1081,7 @@ pub(crate) fn close_command_palette(hwnd: HWND, restore_focus: bool) {
     }
     if restore_focus {
         let target = if tab_count(hwnd) > 0 {
-            unsafe { editor_hwnd(hwnd) }.unwrap_or(hwnd)
+            content_focus_target(hwnd).unwrap_or(hwnd)
         } else {
             hwnd
         };
@@ -3309,7 +3312,7 @@ fn ensure_accessibility(hwnd: HWND) -> *mut c_void {
         .unwrap_or(std::ptr::null_mut())
 }
 
-fn menu_mode(hwnd: HWND) -> Option<MenuMode> {
+pub(crate) fn menu_mode(hwnd: HWND) -> Option<MenuMode> {
     unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.menu_mode)
 }
 
@@ -3389,7 +3392,7 @@ fn exit_menu_mode(hwnd: HWND) {
     {
         Some(previous)
     } else if tab_count(hwnd) > 0 {
-        unsafe { editor_hwnd(hwnd) }
+        content_focus_target(hwnd)
     } else {
         None
     };
