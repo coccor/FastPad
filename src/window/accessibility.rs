@@ -52,7 +52,7 @@ impl AccessibleChild {
     }
 }
 
-pub fn accessible_children(tab_titles: &[&str]) -> Vec<AccessibleChild> {
+pub fn accessible_children(tab_titles: &[&str], preview_buttons: bool) -> Vec<AccessibleChild> {
     let mut children = tab_titles
         .iter()
         .map(|title| AccessibleChild::Tab((*title).to_owned()))
@@ -63,6 +63,12 @@ pub fn accessible_children(tab_titles: &[&str]) -> Vec<AccessibleChild> {
         AccessibleChild::Button("Maximize"),
         AccessibleChild::Button("Close"),
     ]);
+    if preview_buttons {
+        children.extend([
+            AccessibleChild::Button("Open Preview to the Side"),
+            AccessibleChild::Button("Open Preview"),
+        ]);
+    }
     children
 }
 
@@ -619,7 +625,7 @@ unsafe extern "system" fn accessible_select(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AccessibleDefaultAction {
     Command(CommandId),
-    Overflow,
+    Click(crate::window::titlebar::HitTarget),
     SystemCommand(usize),
 }
 
@@ -636,10 +642,18 @@ fn accessible_default_action(
         AccessibleChild::Button(_) => {
             let button = index.checked_sub(tab_count(children))?;
             match button {
-                0 => Some(AccessibleDefaultAction::Overflow),
+                0 => Some(AccessibleDefaultAction::Click(
+                    crate::window::titlebar::HitTarget::Overflow,
+                )),
                 1 => Some(AccessibleDefaultAction::SystemCommand(SC_MINIMIZE as usize)),
                 2 => Some(AccessibleDefaultAction::SystemCommand(SC_MAXIMIZE as usize)),
                 3 => Some(AccessibleDefaultAction::SystemCommand(SC_CLOSE as usize)),
+                4 => Some(AccessibleDefaultAction::Click(
+                    crate::window::titlebar::HitTarget::PreviewSide,
+                )),
+                5 => Some(AccessibleDefaultAction::Click(
+                    crate::window::titlebar::HitTarget::PreviewFull,
+                )),
                 _ => None,
             }
         }
@@ -761,6 +775,8 @@ unsafe extern "system" fn accessible_hit_test(
         crate::window::titlebar::HitTarget::Minimize => Some(tab_count as i32 + 2),
         crate::window::titlebar::HitTarget::Maximize => Some(tab_count as i32 + 3),
         crate::window::titlebar::HitTarget::Close => Some(tab_count as i32 + 4),
+        crate::window::titlebar::HitTarget::PreviewSide => Some(tab_count as i32 + 5),
+        crate::window::titlebar::HitTarget::PreviewFull => Some(tab_count as i32 + 6),
         _ => None,
     };
     unsafe { *output = id.map_or_else(RawVariant::empty, RawVariant::integer) };
@@ -781,8 +797,18 @@ unsafe extern "system" fn accessible_do_default_action(
         Some(AccessibleDefaultAction::Command(command)) => unsafe {
             PostMessageW(item.hwnd, WM_COMMAND, command as usize, 0)
         },
-        Some(AccessibleDefaultAction::Overflow) => {
-            let center = native_layout(item, tabs).overflow.center();
+        Some(AccessibleDefaultAction::Click(target)) => {
+            let layout = native_layout(item, tabs);
+            let rect = match target {
+                crate::window::titlebar::HitTarget::Overflow => Some(layout.overflow),
+                crate::window::titlebar::HitTarget::PreviewSide => layout.preview_side,
+                crate::window::titlebar::HitTarget::PreviewFull => layout.preview_full,
+                _ => None,
+            };
+            let Some(rect) = rect else {
+                return E_INVALIDARG;
+            };
+            let center = rect.center();
             let packed = (center.x as u16 as u32 | ((center.y as u16 as u32) << 16)) as isize;
             unsafe { PostMessageW(item.hwnd, WM_LBUTTONUP, 0, packed) }
         }
@@ -858,6 +884,8 @@ unsafe fn child_screen_rect(
             2 => layout.minimize,
             3 => layout.maximize,
             4 => layout.close,
+            5 => layout.preview_side?,
+            6 => layout.preview_full?,
             _ => return None,
         }
     };
@@ -878,11 +906,12 @@ fn native_layout(item: &AccessibleProvider, tabs: usize) -> TitleBarLayout {
     unsafe {
         GetClientRect(item.hwnd, &mut client);
     }
-    TitleBarLayout::calculate_scrolled(
+    TitleBarLayout::calculate_with_preview(
         Size::new(client.right - client.left, client.bottom - client.top),
         unsafe { GetDpiForWindow(item.hwnd) }.max(96),
         tabs,
         item.selection.scroll_offset(),
+        item.view.snapshot().preview_buttons,
     )
 }
 
@@ -896,15 +925,15 @@ fn children_from_view(view: &TabViewSnapshot) -> Vec<AccessibleChild> {
         .iter()
         .map(|tab| tab.title.as_str())
         .collect::<Vec<_>>();
-    accessible_children(&titles)
+    accessible_children(&titles, view.preview_buttons)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessibilityState, AccessibleChild, RawVariant, VariantValue, accessible_children,
-        accessible_default_action, accessible_get_default_action, accessible_get_focus,
-        accessible_get_selection, accessible_get_state, accessible_select,
+        AccessibilityState, AccessibleChild, AccessibleDefaultAction, RawVariant, VariantValue,
+        accessible_children, accessible_default_action, accessible_get_default_action,
+        accessible_get_focus, accessible_get_selection, accessible_get_state, accessible_select,
     };
     use crate::document::{Document, DocumentId};
     use crate::window::tabs::Tabs;
@@ -944,7 +973,7 @@ mod tests {
 
     #[test]
     fn title_strip_accessibility_contains_tab_and_four_named_buttons() {
-        let children = accessible_children(&["Untitled"]);
+        let children = accessible_children(&["Untitled"], false);
         assert_eq!(children[0], AccessibleChild::Tab("Untitled".into()));
         let names = children
             .iter()
@@ -1058,7 +1087,7 @@ mod tests {
 
     #[test]
     fn default_actions_route_tabs_and_overflow_to_real_actions() {
-        let children = accessible_children(&["Untitled"]);
+        let children = accessible_children(&["Untitled"], false);
         assert_eq!(
             accessible_default_action(&children, 1),
             Some(super::AccessibleDefaultAction::Command(
@@ -1067,10 +1096,44 @@ mod tests {
         );
         assert_eq!(
             accessible_default_action(&children, 2),
-            Some(super::AccessibleDefaultAction::Overflow)
+            Some(super::AccessibleDefaultAction::Click(
+                crate::window::titlebar::HitTarget::Overflow
+            ))
         );
         assert_eq!(accessible_default_action(&children, 0), None);
         assert_eq!(accessible_default_action(&children, 6), None);
+    }
+
+    #[test]
+    fn preview_buttons_are_appended_after_the_caption_buttons() {
+        let children = accessible_children(&["Untitled"], true);
+        let names = children
+            .iter()
+            .filter_map(AccessibleChild::button_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "Overflow",
+                "Minimize",
+                "Maximize",
+                "Close",
+                "Open Preview to the Side",
+                "Open Preview"
+            ]
+        );
+        assert_eq!(
+            accessible_default_action(&children, 6),
+            Some(AccessibleDefaultAction::Click(
+                crate::window::titlebar::HitTarget::PreviewSide
+            ))
+        );
+        assert_eq!(
+            accessible_default_action(&children, 7),
+            Some(AccessibleDefaultAction::Click(
+                crate::window::titlebar::HitTarget::PreviewFull
+            ))
+        );
     }
 
     fn fixture_tabs(count: u64) -> Tabs {
