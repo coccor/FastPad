@@ -23,3 +23,19 @@ cargo run --release --bin fastpad-bench -- compare baseline.jsonl candidate.json
 A milestone is reported as a regression only when candidate p95 increases by at least the larger
 of 2,000 microseconds or 10 percent and the deterministic 10,000-resample bootstrap 95 percent
 confidence interval for the p95 delta excludes zero.
+
+## Markdown preview
+
+Preview costs are measured in-process with ignored tests:
+
+```powershell
+cargo test --release --test markdown_preview -- --ignored --test-threads=1 --nocapture
+```
+
+Targets: preview open on 100 KB < 50 ms p95; one-paragraph update in a 1 MB document < 2 ms p95;
+keystroke cost with the side-by-side preview open within 10% (+100 µs) of no preview; private
+memory within 2 MB of never having opened the preview after closing it.
+
+Startup with a Markdown file is compared against the pre-preview baseline with
+`./tools/benchmark.ps1 -LaunchFile benchmarks/fixtures/sample.md` on both builds and
+`fastpad-bench compare`.

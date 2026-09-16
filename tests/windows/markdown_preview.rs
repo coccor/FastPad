@@ -554,3 +554,196 @@ fn full_mode_keeps_the_editor_position() {
         100
     );
 }
+
+fn sample_markdown(bytes: usize) -> String {
+    let section = "## Heading\n\nParagraph with **bold**, *emphasis*, `code`, and a [link](https://x.dev).\n\n- item one\n- item two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn f() {}\n```\n\n";
+    section.repeat(bytes / section.len() + 1)[..bytes]
+        .rsplit_once("\n\n")
+        .map_or_else(String::new, |(text, _)| format!("{text}\n"))
+}
+
+fn p95(mut samples: Vec<u64>) -> u64 {
+    samples.sort_unstable();
+    samples[(samples.len() * 95 / 100).min(samples.len() - 1)]
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+fn opening_a_100_kb_preview_renders_within_50_ms_p95() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(&sample_markdown(100_000));
+    let mut samples = Vec::new();
+    for _ in 0..30 {
+        main.command(CommandId::MarkdownPreviewSide);
+        let view = main.view().unwrap();
+        pump_until("first frame", Duration::from_secs(5), || {
+            view.stats().first_frame_micros > 0
+        });
+        samples.push(view.stats().first_frame_micros);
+        main.command(CommandId::MarkdownPreviewClose);
+    }
+    let p95 = p95(samples);
+    println!("preview open p95: {p95} us");
+    assert!(p95 < 50_000);
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+fn one_paragraph_updates_in_a_1_mb_document_within_2_ms_p95() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(&sample_markdown(1_000_000));
+    main.command(CommandId::MarkdownPreviewSide);
+    let view = main.view().unwrap();
+    pump_until("initial render", Duration::from_secs(10), || {
+        view.stats().block_count > 0
+    });
+    unsafe {
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_GOTOPOS,
+            500_000,
+            0,
+        )
+    };
+    pump_for(Duration::from_millis(300));
+    // Edit a line the synced preview actually shows: an off-screen edit correctly skips the
+    // repaint, which would leave `last_update_micros` holding the initial full render.
+    unsafe {
+        let line_start = SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_POSITIONFROMLINE,
+            view.top_line() + 1,
+            0,
+        );
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_GOTOPOS,
+            line_start as usize,
+            0,
+        );
+    }
+    let mut samples = Vec::new();
+    for _ in 0..50 {
+        let revision = view.stats().revision;
+        let previous = view.stats().last_update_micros;
+        type_text(main.editor, "x");
+        pump_until("update", Duration::from_secs(5), || {
+            view.stats().revision > revision && view.stats().last_update_micros != previous
+        });
+        pump_for(Duration::from_millis(20));
+        samples.push(view.stats().last_update_micros);
+    }
+    let p95 = p95(samples);
+    println!("incremental update p95: {p95} us");
+    assert!(p95 < 2_000);
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+fn typing_with_split_open_costs_the_same_as_without_a_preview() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(&sample_markdown(1_000_000));
+    unsafe {
+        SendMessageW(
+            main.editor,
+            crate::editor::scintilla_constants::SCI_GOTOPOS,
+            500_000,
+            0,
+        )
+    };
+    // Each run starts on a fresh line and breaks the line every 40 characters (unmeasured): one
+    // ever-growing line would make later samples pay for re-laying out a longer line and for
+    // horizontal caret scrolling in the narrower split editor, which is not the preview's cost.
+    let measure = |main: &TestMain| {
+        let mut samples = Vec::new();
+        type_text(main.editor, "\n\n");
+        for index in 0..200 {
+            if index % 40 == 0 {
+                type_text(main.editor, "\n");
+            }
+            let started = Instant::now();
+            type_text(main.editor, "x");
+            unsafe { windows_sys::Win32::Graphics::Gdi::UpdateWindow(main.editor) };
+            samples.push(started.elapsed().as_micros() as u64);
+        }
+        p95(samples)
+    };
+    let baseline = measure(&main);
+    main.command(CommandId::MarkdownPreviewSide);
+    pump_for(Duration::from_millis(500));
+    let with_preview = measure(&main);
+    println!("keystroke p95: off {baseline} us, split {with_preview} us");
+    assert!(with_preview <= baseline + baseline / 10 + 100);
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+fn closing_the_preview_returns_memory() {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    fn private_bytes() -> u64 {
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
+                counters.cb,
+            )
+        };
+        counters.PrivateUsage as u64
+    }
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown(&sample_markdown(1_000_000));
+    pump_for(Duration::from_millis(300));
+    let never_opened = private_bytes();
+    main.command(CommandId::MarkdownPreviewSide);
+    let view = main.view().unwrap();
+    pump_until("render", Duration::from_secs(10), || {
+        view.stats().block_count > 0
+    });
+    pump_for(Duration::from_millis(300));
+    let open = private_bytes();
+    main.command(CommandId::MarkdownPreviewClose);
+    pump_for(Duration::from_millis(500));
+    let closed = private_bytes();
+    println!("private bytes: never {never_opened}, open {open}, closed {closed}");
+    assert!(closed.saturating_sub(never_opened) < 2 * 1024 * 1024);
+}
+
+/// Guards the zero-startup-cost rule at runtime, complementing the import-table guard: launching
+/// with a Markdown file must not load the preview's graphics libraries.
+#[test]
+fn launching_with_a_markdown_file_loads_no_preview_graphics_library() {
+    use support::process::{FastPadProcess, process_has_module_loaded};
+    let root = std::env::temp_dir().join(format!("fastpad-startup-{}", std::process::id()));
+    let local_app_data = root.join("LocalAppData");
+    std::fs::create_dir_all(&local_app_data).unwrap();
+    let path = root.join("startup.md");
+    std::fs::write(&path, "# Title\n\nBody with a [link](https://x.dev).\n").unwrap();
+    let mut process = FastPadProcess::spawn_with_local_app_data(
+        [std::ffi::OsStr::new("--new-window"), path.as_os_str()],
+        &local_app_data,
+    )
+    .unwrap();
+    process
+        .wait_for_main_window(Duration::from_secs(2))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    for module in ["d2d1.dll", "dwrite.dll", "windowscodecs.dll"] {
+        assert!(
+            !process_has_module_loaded(process.id(), module).unwrap(),
+            "{module} was loaded before any preview was opened"
+        );
+    }
+    process.close().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}

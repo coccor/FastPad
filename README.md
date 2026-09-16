@@ -65,6 +65,22 @@ renamed with an `.invalid` suffix instead of being opened.
 Validate JSON and Format JSON run only when you choose them. They never modify a document that does
 not parse, and formatting is a single undo step.
 
+## Markdown preview
+
+Markdown tabs show two buttons at the right of the title strip: **Open Preview to the Side** and
+**Open Preview**. Ctrl+Shift+V cycles between no preview, side by side, and full width; the View
+menu and command palette have the same commands. Esc in the full-width preview returns to side by
+side. Drag the divider to resize the panes (double-click resets it).
+
+The preview renders GitHub-flavored Markdown natively (tables, task lists, strikethrough, code
+blocks, images) and updates shortly after you stop typing. Scrolling either pane scrolls the other.
+Only local images are shown. Links open when clicked: web and mail links in your default browser,
+`#anchors` inside the preview, and local files in a FastPad tab. Nothing is loaded from the
+network. Files larger than 10 MB pause live updates; click the bar at the top of the preview to
+refresh it.
+
+The preview's graphics libraries load only when a preview is first opened, so startup is unchanged.
+
 ## Building from source
 
 Requirements: Rust stable (see `rust-toolchain.toml`), Visual Studio 2022 with the C++ x64 build
