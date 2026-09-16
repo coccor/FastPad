@@ -9,7 +9,9 @@ use crate::preview::dwrite::Graphics;
 use crate::preview::heights::{HeightIndex, estimate_height, line_for_offset, offset_for_line};
 use crate::preview::images::ImageCache;
 use crate::preview::incremental::{Edit, PreviewDocument, SourceText, Update};
-use crate::preview::layout::{LaidBlock, LayoutContext, PreviewFonts, layout_block};
+use crate::preview::layout::{
+    LaidBlock, LayoutContext, PreviewFonts, block_has_link, layout_block,
+};
 use crate::preview::links::SlugSet;
 use crate::preview::model::BlockKind;
 use crate::preview::render::{Brushes, color_f, create_hwnd_target, draw_ops};
@@ -135,6 +137,8 @@ struct ViewState {
     centered: bool,
     paused: bool,
     live_resize: bool,
+    /// Set after a failed paint schedules its one retry; cleared by the next successful paint.
+    paint_retried: bool,
     anchors: Vec<(String, usize)>,
     stats: PreviewStats,
     opened_at: Option<Instant>,
@@ -182,6 +186,7 @@ impl PreviewView {
             centered: false,
             paused: false,
             live_resize: false,
+            paint_retried: false,
             anchors: Vec::new(),
             stats: PreviewStats::default(),
             opened_at: None,
@@ -214,8 +219,7 @@ impl PreviewView {
             state.document = document;
             state.document_dir = document_dir;
             state.scroll_y = 0.0;
-            state.update_started = Some(started);
-            accept_update(state, Update::Full);
+            accept_update(state, Update::Full, started);
         });
     }
 
@@ -232,8 +236,7 @@ impl PreviewView {
             } else {
                 state.document.try_apply(source, edits)
             }?;
-            state.update_started = Some(started);
-            accept_update(state, update.clone());
+            accept_update(state, update.clone(), started);
             Some(update)
         })
         .flatten()
@@ -242,8 +245,7 @@ impl PreviewView {
     pub fn reparse<S: SourceText + ?Sized>(&self, source: &S, started: Instant) -> Update {
         self.with(|state| {
             let update = state.document.reparse(source);
-            state.update_started = Some(started);
-            accept_update(state, update.clone());
+            accept_update(state, update.clone(), started);
             update
         })
         .unwrap_or(Update::Unchanged)
@@ -254,7 +256,7 @@ impl PreviewView {
             state.colors = colors;
             state.fonts = fonts;
             state.brushes = None;
-            reset_layouts(state);
+            relayout(state);
         });
         let theme = wide_null(if dark_scrollbar {
             "DarkMode_Explorer"
@@ -269,7 +271,7 @@ impl PreviewView {
         self.with(|state| {
             if state.document_dir != document_dir {
                 state.document_dir = document_dir;
-                reset_layouts(state);
+                relayout(state);
             }
         });
         invalidate(self.hwnd);
@@ -442,6 +444,7 @@ fn estimates(state: &ViewState) -> Vec<f32> {
         .collect()
 }
 
+/// Forgets every layout for a new document: heights fall back to estimates.
 fn reset_layouts(state: &mut ViewState) {
     state.layouts = (0..state.document.blocks.len()).map(|_| None).collect();
     let estimates = estimates(state);
@@ -451,14 +454,41 @@ fn reset_layouts(state: &mut ViewState) {
     state.focus = None;
 }
 
-fn accept_update(state: &mut ViewState, update: Update) {
-    match update {
+/// Forgets every layout of the current document (width, fonts, brushes, or folder changed) while
+/// keeping the reading position: the block at the top stays at the top.
+fn relayout(state: &mut ViewState) {
+    let anchor = (!state.heights.is_empty()).then(|| state.heights.anchor(state.scroll_y));
+    reset_layouts(state);
+    if let Some(anchor) = anchor
+        && anchor.0 < state.heights.len()
+    {
+        state.scroll_y = state.heights.scroll_for_anchor(anchor);
+    }
+}
+
+/// Everything tied to the Direct2D device. Layouts hold brushes as drawing effects, so the next
+/// paint lays out again once brushes are recreated; decoded pixels survive for new bitmaps.
+fn drop_device_resources(state: &mut ViewState) {
+    state.target = None;
+    state.brushes = None;
+    state.images.release_bitmaps();
+}
+
+fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
+    let repaint = match update {
         Update::Unchanged => return,
         Update::Full => {
             reset_layouts(state);
             state.h_scroll.clear();
+            true
         }
         Update::Replaced { old, new } => {
+            let (_, view_height) = view_size(state.hwnd);
+            let view_top = state.scroll_y;
+            let view_bottom = view_top + view_height;
+            let old_top = state.heights.top(old.start);
+            let old_bottom = state.heights.top(old.end);
+            let old_total = state.heights.total();
             state.layouts.splice(old.clone(), new.clone().map(|_| None));
             let all = estimates(state);
             state.heights.splice(old.clone(), &all[new.clone()]);
@@ -479,8 +509,11 @@ fn accept_update(state: &mut ViewState, update: Update) {
             state.hover = None;
             state.pressed = None;
             state.focus = None;
+            let on_screen = old_top < view_bottom && old_bottom >= view_top;
+            let total_changed = (state.heights.total() - old_total).abs() > 0.01;
+            on_screen || old.len() != new.len() || total_changed
         }
-    }
+    };
     let mut slugs = SlugSet::default();
     state.anchors = state
         .document
@@ -494,12 +527,16 @@ fn accept_update(state: &mut ViewState, update: Update) {
         .collect();
     state.stats.block_count = state.document.blocks.len();
     state.stats.revision = state.document.revision;
-    invalidate(state.hwnd);
+    if repaint {
+        state.update_started = Some(started);
+        invalidate(state.hwnd);
+    }
 }
 
 /// Lays out `indices` that have no layout yet; true when any height changed.
 fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
     let ViewState {
+        hwnd,
         graphics,
         brushes,
         fonts,
@@ -527,7 +564,6 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
             let laid = layout_block(&context, &document.blocks[index].kind, *layout_width)?;
             for slot in &laid.images {
                 if let Some(path) = &slot.path
-                    && images.size(path).is_none()
                     && !images.is_failed(path)
                 {
                     requests.push(path.clone());
@@ -538,8 +574,11 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
             changed = true;
         }
     }
+    // Decode at the content width in device pixels. The cache caps that at the natural width and
+    // decodes again only when a wider pane needs more pixels than the last decode has.
+    let pixel_width = (*layout_width * dpi_scale(*hwnd)).ceil().max(1.0) as u32;
     for path in requests {
-        images.request(&path, *layout_width as u32);
+        images.request(&path, pixel_width);
     }
     Ok(changed)
 }
@@ -580,7 +619,16 @@ fn set_scroll(state: &mut ViewState, y: f32, user: bool) {
     }
 }
 
-fn paint(state: &mut ViewState) -> Result<()> {
+/// What `WM_PAINT` must do once the state borrow has ended.
+struct PaintOutcome {
+    /// Scroll bar state for a completed frame. `SetScrollInfo` can send `WM_SIZE` synchronously,
+    /// so it must never run while `ViewState` is borrowed.
+    scroll: Option<SCROLLINFO>,
+    /// Paint again: the device was lost, or a visible block is still without a layout.
+    repaint: bool,
+}
+
+fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
     let hwnd = state.hwnd;
     let mut client = RECT::default();
     unsafe { GetClientRect(hwnd, &mut client) };
@@ -597,7 +645,7 @@ fn paint(state: &mut ViewState) -> Result<()> {
     if state.brushes.is_none() {
         let target = state.target.as_ref().expect("created above");
         state.brushes = Some(Brushes::create(target, &state.colors)?);
-        reset_layouts(state);
+        relayout(state);
     }
     let (view_width, view_height) = view_size(hwnd);
     let (content_left, content_width) = content_frame(view_width, state.centered);
@@ -605,7 +653,7 @@ fn paint(state: &mut ViewState) -> Result<()> {
         && (!state.live_resize || state.layout_width == 0.0)
     {
         state.layout_width = content_width;
-        reset_layouts(state);
+        relayout(state);
     }
     let bar = bar_height(state);
     for _ in 0..3 {
@@ -618,7 +666,17 @@ fn paint(state: &mut ViewState) -> Result<()> {
     }
     state.scroll_y = state.scroll_y.clamp(0.0, max_scroll(state, view_height));
 
-    let visible = visible_indices(state, view_height - bar);
+    let mut visible = visible_indices(state, view_height - bar);
+    if visible.iter().any(|index| state.layouts[*index].is_none()) {
+        // The clamp or the last anchor pass uncovered blocks the loop did not lay out.
+        let anchor = state.heights.anchor(state.scroll_y);
+        if ensure_layouts(state, &visible)? {
+            let restored = state.heights.scroll_for_anchor(anchor);
+            state.scroll_y = restored.clamp(0.0, max_scroll(state, view_height));
+        }
+        visible = visible_indices(state, view_height - bar);
+    }
+    let repaint = visible.iter().any(|index| state.layouts[*index].is_none());
     let tops = visible
         .iter()
         .map(|index| state.heights.top(*index))
@@ -663,10 +721,9 @@ fn paint(state: &mut ViewState) -> Result<()> {
                 && focus_block == *index
                 && let Some(link) = laid.links.get(focus_link)
             {
-                let shift = if link.scrolls { offset } else { 0.0 };
-                for rect in &link.rects {
+                for rect in link.visible_rects(offset) {
                     target.DrawRectangle(
-                        &rect.offset(content_left - shift, y).inflate(2.0).to_d2d(),
+                        &rect.offset(content_left, y).inflate(2.0).to_d2d(),
                         brushes.get(ColorRole::Focus),
                         2.0,
                         None,
@@ -704,12 +761,13 @@ fn paint(state: &mut ViewState) -> Result<()> {
     };
     match result {
         Err(error) if error.code() == D2DERR_RECREATE_TARGET => {
-            state.target = None;
-            state.brushes = None;
-            state.images.release_bitmaps();
-            invalidate(hwnd);
+            drop_device_resources(state);
+            Ok(PaintOutcome {
+                scroll: None,
+                repaint: true,
+            })
         }
-        Err(error) => return Err(crate::preview::dwrite::hresult_error(error)),
+        Err(error) => Err(crate::preview::dwrite::hresult_error(error)),
         Ok(()) => {
             if let Some(opened) = state.opened_at.take() {
                 state.stats.first_frame_micros = opened.elapsed().as_micros().max(1) as u64;
@@ -722,15 +780,17 @@ fn paint(state: &mut ViewState) -> Result<()> {
                 .accessible
                 .write()
                 .unwrap_or_else(|error| error.into_inner()) = links;
+            Ok(PaintOutcome {
+                scroll: Some(scroll_info(state, view_height)),
+                repaint,
+            })
         }
     }
-    update_scrollbar(state, view_height);
-    Ok(())
 }
 
-fn update_scrollbar(state: &mut ViewState, view_height: f32) {
+fn scroll_info(state: &mut ViewState, view_height: f32) -> SCROLLINFO {
     let scale = dpi_scale(state.hwnd);
-    let info = SCROLLINFO {
+    SCROLLINFO {
         cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
         fMask: SIF_ALL,
         nMin: 0,
@@ -738,8 +798,7 @@ fn update_scrollbar(state: &mut ViewState, view_height: f32) {
         nPage: ((view_height - bar_height(state)) * scale).max(0.0) as u32,
         nPos: (state.scroll_y * scale) as i32,
         nTrackPos: 0,
-    };
-    unsafe { SetScrollInfo(state.hwnd, SB_VERT, &info, 1) };
+    }
 }
 
 fn client_point(lparam: LPARAM) -> (i32, i32) {
@@ -763,12 +822,9 @@ fn link_at(state: &mut ViewState, x: i32, y: i32) -> Option<(usize, usize)> {
     laid.links
         .iter()
         .position(|link| {
-            let hit_x = if link.scrolls {
-                block_x + offset
-            } else {
-                block_x
-            };
-            link.rects.iter().any(|rect| rect.contains(hit_x, block_y))
+            link.visible_rects(offset)
+                .iter()
+                .any(|rect| rect.contains(block_x, block_y))
         })
         .map(|link| (index, link))
 }
@@ -838,11 +894,11 @@ fn visible_links(state: &mut ViewState) -> Vec<VisibleLink> {
             continue;
         };
         for link in &laid.links {
-            let Some(rect) = link.rects.first() else {
+            // Links scrolled out of a wide table's clip are not on screen.
+            let Some(rect) = link.visible_rects(offset).first().copied() else {
                 continue;
             };
-            let shift = if link.scrolls { offset } else { 0.0 };
-            let rect = rect.offset(content_left - shift, top);
+            let rect = rect.offset(content_left, top);
             links.push(VisibleLink {
                 text: link.text.clone(),
                 dest: link.dest.clone(),
@@ -858,47 +914,42 @@ fn visible_links(state: &mut ViewState) -> Vec<VisibleLink> {
     links
 }
 
-/// Moves keyboard focus to the next (or previous) link in document order, laying out blocks on
-/// the way, and scrolls it into view.
+/// Moves keyboard focus to the next (or previous) link in document order and scrolls it into view.
+/// Blocks without links are skipped using the model alone; only the block that receives focus is
+/// laid out.
 fn move_focus(state: &mut ViewState, forward: bool) {
     let count = state.document.blocks.len();
     if count == 0 {
         return;
     }
     let (mut block, mut link) = match state.focus {
-        Some((block, link)) => (block, Some(link)),
-        None => (state.heights.index_at(state.scroll_y), None),
+        Some((block, link)) => (block.min(count - 1), Some(link)),
+        None => (state.heights.index_at(state.scroll_y).min(count - 1), None),
     };
-    for _ in 0..count {
-        if ensure_layouts(state, &[block]).is_err() {
-            return;
-        }
-        let links = state.layouts[block]
-            .as_ref()
-            .map_or(0, |laid| laid.links.len());
-        let next = match (link, forward) {
-            (None, true) if links > 0 => Some(0),
-            (None, false) if links > 0 => Some(links - 1),
-            (Some(current), true) if current + 1 < links => Some(current + 1),
-            (Some(current), false) if current > 0 => Some(current - 1),
-            _ => None,
-        };
-        if let Some(next) = next {
-            state.focus = Some((block, next));
-            let top = state.heights.top(block);
-            let rect = state.layouts[block]
-                .as_ref()
-                .and_then(|laid| laid.links[next].rects.first().copied())
-                .unwrap_or_default();
-            let (_, view_height) = view_size(state.hwnd);
-            let visible_height = view_height - bar_height(state);
-            if top + rect.top < state.scroll_y
-                || top + rect.bottom > state.scroll_y + visible_height
-            {
-                set_scroll(state, top + rect.top - visible_height / 3.0, true);
+    // One extra step lets the search wrap back into the block it started from.
+    for _ in 0..=count {
+        if block_has_link(&state.document.blocks[block].kind) {
+            let anchor = state.heights.anchor(state.scroll_y);
+            match ensure_layouts(state, &[block]) {
+                Err(_) => return,
+                // A block above the reading position changed height: keep the view still.
+                Ok(true) => state.scroll_y = state.heights.scroll_for_anchor(anchor),
+                Ok(false) => {}
             }
-            invalidate(state.hwnd);
-            return;
+            let links = state.layouts[block]
+                .as_ref()
+                .map_or(0, |laid| laid.links.len());
+            let next = match (link, forward) {
+                (None, true) if links > 0 => Some(0),
+                (None, false) if links > 0 => Some(links - 1),
+                (Some(current), true) if current + 1 < links => Some(current + 1),
+                (Some(current), false) if current > 0 && current <= links => Some(current - 1),
+                _ => None,
+            };
+            if let Some(next) = next {
+                focus_link(state, block, next);
+                return;
+            }
         }
         link = None;
         block = if forward {
@@ -907,6 +958,43 @@ fn move_focus(state: &mut ViewState, forward: bool) {
             (block + count - 1) % count
         };
     }
+}
+
+/// Focuses a laid-out link and reveals it: horizontally inside a wide table's clip, then
+/// vertically in the view.
+fn focus_link(state: &mut ViewState, block: usize, link: usize) {
+    state.focus = Some((block, link));
+    let Some(laid) = state.layouts.get(block).and_then(Option::as_ref) else {
+        return;
+    };
+    let Some(hit) = laid.links.get(link) else {
+        return;
+    };
+    let rect = hit.rects.first().copied().unwrap_or_default();
+    if hit.scrolls
+        && let Some(clip) = hit.clip
+    {
+        let current = state.h_scroll.get(&block).copied().unwrap_or(0.0);
+        let limit = (laid.scroll_width - clip.width()).max(0.0);
+        let mut offset = current;
+        if rect.right - offset > clip.right {
+            offset = rect.right - clip.right;
+        }
+        if rect.left - offset < clip.left {
+            offset = rect.left - clip.left;
+        }
+        let offset = offset.clamp(0.0, limit);
+        if (offset - current).abs() > 0.01 {
+            state.h_scroll.insert(block, offset);
+        }
+    }
+    let top = state.heights.top(block);
+    let (_, view_height) = view_size(state.hwnd);
+    let visible_height = view_height - bar_height(state);
+    if top + rect.top < state.scroll_y || top + rect.bottom > state.scroll_y + visible_height {
+        set_scroll(state, top + rect.top - visible_height / 3.0, true);
+    }
+    invalidate(state.hwnd);
 }
 
 unsafe extern "system" fn preview_proc(
@@ -925,14 +1013,32 @@ unsafe extern "system" fn preview_proc(
         }
         WM_ERASEBKGND => 1,
         WM_PAINT => {
-            let painted = with_state(hwnd, |state| paint(state).is_ok()).unwrap_or(false);
-            if !painted {
-                with_state(hwnd, |state| {
-                    state.target = None;
-                    state.brushes = None;
-                });
-            }
+            let outcome = with_state(hwnd, |state| match paint(state) {
+                Ok(outcome) if outcome.scroll.is_some() => {
+                    state.paint_retried = false;
+                    outcome
+                }
+                result => {
+                    if result.is_err() {
+                        drop_device_resources(state);
+                    }
+                    // Retry a failed frame once; a device that keeps failing must not spin.
+                    PaintOutcome {
+                        scroll: None,
+                        repaint: !std::mem::replace(&mut state.paint_retried, true),
+                    }
+                }
+            });
             unsafe { ValidateRect(hwnd, std::ptr::null()) };
+            // The state borrow has ended: these calls may send messages back to this window.
+            if let Some(outcome) = outcome {
+                if let Some(info) = outcome.scroll {
+                    unsafe { SetScrollInfo(hwnd, SB_VERT, &info, 1) };
+                }
+                if outcome.repaint {
+                    invalidate(hwnd);
+                }
+            }
             0
         }
         WM_SIZE => {
@@ -948,8 +1054,7 @@ unsafe extern "system" fn preview_proc(
                     }
                     .is_err()
                 {
-                    state.target = None;
-                    state.brushes = None;
+                    drop_device_resources(state);
                 }
             });
             invalidate(hwnd);
@@ -1157,7 +1262,7 @@ mod tests {
     use crate::platform::theme::Theme;
     use crate::preview::colors::preview_colors;
     use crate::preview::render::TestWindow;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_END, VK_ESCAPE};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_END, VK_ESCAPE, VK_TAB};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         MSG, MoveWindow, PM_REMOVE, PeekMessageW, SendMessageW, WM_KEYDOWN, WM_LBUTTONDOWN,
         WM_LBUTTONUP, WM_PAINT,
@@ -1277,6 +1382,62 @@ mod tests {
         assert!(view.scroll_to_anchor("deep-heading"));
         assert!(view.top_line() >= 150);
         assert!(!view.scroll_to_anchor("missing"));
+        view.destroy();
+    }
+
+    fn repaint(view: &PreviewView) {
+        unsafe { SendMessageW(view.hwnd(), WM_PAINT, 0, 0) };
+    }
+
+    #[test]
+    fn width_changes_keep_the_reading_position() {
+        let parent = TestWindow::new(800, 600);
+        let source = (0..200)
+            .map(|index| format!("para {index}\n\n"))
+            .collect::<String>();
+        let view = view_with(&parent, &source);
+        view.scroll_to_line(100);
+        repaint(&view);
+        assert_eq!(view.top_line(), 100);
+        unsafe { MoveWindow(view.hwnd(), 0, 0, 300, 300, 0) };
+        repaint(&view);
+        assert_eq!(view.top_line(), 100);
+        view.destroy();
+    }
+
+    #[test]
+    fn links_clipped_out_of_a_wide_table_are_hidden_until_focus_reveals_them() {
+        let parent = TestWindow::new(800, 600);
+        let wide = "wide ".repeat(40);
+        let view = view_with(
+            &parent,
+            &format!("| {wide} | [far](https://far.dev) |\n|---|---|\n| a | b |\n"),
+        );
+        assert!(view.visible_links().is_empty());
+        assert!(view.accessible_links().read().unwrap().is_empty());
+        unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_TAB as usize, 0) };
+        repaint(&view);
+        let links = view.visible_links();
+        assert_eq!(links.len(), 1, "focus scrolls the table to the link");
+        let mut client = RECT::default();
+        unsafe { GetClientRect(view.hwnd(), &mut client) };
+        assert!(links[0].rect.left >= 0 && links[0].rect.right <= client.right);
+        view.destroy();
+    }
+
+    #[test]
+    fn unchanged_updates_do_not_record_an_update() {
+        let parent = TestWindow::new(800, 600);
+        let source = "# A\n\ntext\n";
+        let view = view_with(&parent, source);
+        let before = view.stats().last_update_micros;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(
+            view.apply_edits(source, &[], Instant::now(), true),
+            Some(Update::Unchanged)
+        );
+        repaint(&view);
+        assert_eq!(view.stats().last_update_micros, before);
         view.destroy();
     }
 }

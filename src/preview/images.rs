@@ -9,7 +9,6 @@ use std::collections::{HashMap, VecDeque};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT,
@@ -31,8 +30,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 pub const MAX_IMAGE_PIXELS: u64 = 64_000_000;
 
 pub struct DecodedImage {
+    /// Decoded pixel size; smaller than the natural size when the decode was scaled down.
     pub width: u32,
     pub height: u32,
+    /// The file's own pixel size, which layout uses so an image's DIP size never depends on how
+    /// large it happened to be decoded.
+    pub natural_width: u32,
+    pub natural_height: u32,
     pub pixels: Vec<u8>,
 }
 
@@ -81,6 +85,7 @@ pub fn decode_image(path: &Path, max_width: u32) -> Result<DecodedImage> {
                 "image is empty or larger than 64 megapixels",
             ));
         }
+        let (natural_width, natural_height) = (width, height);
         let mut source: IWICBitmapSource = frame.cast().map_err(hresult_error)?;
         if max_width > 0 && width > max_width {
             let scaled_height =
@@ -115,6 +120,8 @@ pub fn decode_image(path: &Path, max_width: u32) -> Result<DecodedImage> {
         Ok(DecodedImage {
             width,
             height,
+            natural_width,
+            natural_height,
             pixels,
         })
     }
@@ -127,9 +134,34 @@ enum EntryState {
 }
 
 struct Entry {
-    modified: Option<SystemTime>,
     state: EntryState,
     bitmap: Option<ID2D1Bitmap>,
+    /// The largest `max_width` queued so far (0 = unlimited).
+    requested: u32,
+}
+
+/// Whether a decode limited to `requested` pixels already satisfies a limit of `max_width`.
+fn covers(requested: u32, max_width: u32) -> bool {
+    requested == 0 || (max_width != 0 && requested >= max_width)
+}
+
+impl Entry {
+    /// True when a (new) decode is needed for `max_width` device pixels. A ready image is decoded
+    /// again only when it was scaled below both the natural width and the new limit.
+    fn wants(&self, max_width: u32) -> bool {
+        match &self.state {
+            EntryState::Failed => false,
+            EntryState::Pending => !covers(self.requested, max_width),
+            EntryState::Ready(image) => {
+                let target = if max_width == 0 {
+                    image.natural_width
+                } else {
+                    max_width.min(image.natural_width)
+                };
+                image.width < target && !covers(self.requested, target)
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -157,34 +189,34 @@ impl ImageCache {
         }
     }
 
+    /// Queues a decode of `path` at most `max_width` pixels wide (0 = natural size). Repeated
+    /// requests are free unless the image must be decoded larger than before.
     pub fn request(&mut self, path: &Path, max_width: u32) {
-        let modified = std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        if let Some(entry) = self.entries.get(path)
-            && entry.modified == modified
-        {
-            return;
-        }
-        if modified.is_none() {
+        if let Some(entry) = self.entries.get_mut(path) {
+            if !entry.wants(max_width) {
+                return;
+            }
+            // Keep a ready image (and its size) on screen while the sharper decode runs.
+            entry.requested = max_width;
+        } else {
+            let exists = std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file());
+            let state = if exists {
+                EntryState::Pending
+            } else {
+                EntryState::Failed
+            };
             self.entries.insert(
                 path.to_owned(),
                 Entry {
-                    modified,
-                    state: EntryState::Failed,
+                    state,
                     bitmap: None,
+                    requested: max_width,
                 },
             );
-            return;
+            if !exists {
+                return;
+            }
         }
-        self.entries.insert(
-            path.to_owned(),
-            Entry {
-                modified,
-                state: EntryState::Pending,
-                bitmap: None,
-            },
-        );
         let spawn = {
             let mut shared = self
                 .shared
@@ -233,19 +265,25 @@ impl ImageCache {
         let changed = !done.is_empty();
         for (path, result) in done {
             if let Some(entry) = self.entries.get_mut(&path) {
-                entry.state = match result {
-                    Ok(image) => EntryState::Ready(image),
-                    Err(_) => EntryState::Failed,
-                };
-                entry.bitmap = None;
+                match (result, &entry.state) {
+                    (Ok(image), EntryState::Ready(current)) if image.width <= current.width => {}
+                    (Ok(image), _) => {
+                        entry.state = EntryState::Ready(image);
+                        entry.bitmap = None;
+                    }
+                    // A failed re-decode keeps the smaller image that already works.
+                    (Err(_), EntryState::Ready(_)) => {}
+                    (Err(_), _) => entry.state = EntryState::Failed,
+                }
             }
         }
         changed
     }
 
+    /// The image's natural pixel size once decoded, whatever size it was decoded at.
     pub fn size(&self, path: &Path) -> Option<(u32, u32)> {
         match &self.entries.get(path)?.state {
-            EntryState::Ready(image) => Some((image.width, image.height)),
+            EntryState::Ready(image) => Some((image.natural_width, image.natural_height)),
             _ => None,
         }
     }
@@ -337,7 +375,24 @@ mod tests {
         let path = write_png("scale");
         let image = decode_image(&path, 1).unwrap();
         assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!((image.natural_width, image.natural_height), (2, 2));
         let _ = std::fs::remove_file(path);
+    }
+
+    fn decoded_width(cache: &ImageCache, path: &Path) -> Option<u32> {
+        match &cache.entries.get(path)?.state {
+            EntryState::Ready(image) => Some(image.width),
+            _ => None,
+        }
+    }
+
+    fn wait_for(cache: &mut ImageCache, path: &Path, width: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while decoded_width(cache, path) != Some(width) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cache.drain();
+        }
+        assert_eq!(decoded_width(cache, path), Some(width));
     }
 
     #[test]
@@ -350,15 +405,21 @@ mod tests {
         let path = write_png("cache");
         let missing = PathBuf::from(r"C:\definitely\missing.png");
         let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
-        cache.request(&path, 0);
+        cache.request(&path, 1);
         cache.request(&missing, 0);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while cache.size(&path).is_none() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            cache.drain();
-        }
+        wait_for(&mut cache, &path, 1);
+        // The size is the natural size even though the decode was scaled to one pixel.
         assert_eq!(cache.size(&path), Some((2, 2)));
         assert!(cache.is_failed(&missing));
+        // A narrower request reuses the decode; a wider one decodes again at the larger size.
+        cache.request(&path, 1);
+        assert_eq!(cache.entries[&path].requested, 1);
+        cache.request(&path, 0);
+        wait_for(&mut cache, &path, 2);
+        assert_eq!(cache.size(&path), Some((2, 2)));
+        // Fully decoded images never decode again.
+        cache.request(&path, 8);
+        assert_eq!(cache.entries[&path].requested, 0);
         let _ = std::fs::remove_file(path);
     }
 }

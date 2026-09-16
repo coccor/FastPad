@@ -50,6 +50,17 @@ impl RectF {
         )
     }
 
+    /// The overlap of two rectangles, or `None` when they do not overlap.
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        let rect = Self::new(
+            self.left.max(other.left),
+            self.top.max(other.top),
+            self.right.min(other.right),
+            self.bottom.min(other.bottom),
+        );
+        (rect.left < rect.right && rect.top < rect.bottom).then_some(rect)
+    }
+
     pub fn inflate(&self, by: f32) -> Self {
         Self::new(
             self.left - by,

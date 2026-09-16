@@ -92,6 +92,60 @@ pub struct LinkHit {
     pub range: DWRITE_TEXT_RANGE,
     /// Whether the rects move with the block's horizontal scroll offset.
     pub scrolls: bool,
+    /// For scrolling links, the block-coordinate area they are drawn clipped to.
+    pub clip: Option<RectF>,
+}
+
+impl LinkHit {
+    /// The link's rectangles as currently shown, in block coordinates: shifted by the block's
+    /// horizontal scroll offset and cut to its clip. Parts scrolled out of view are dropped.
+    pub fn visible_rects(&self, h_offset: f32) -> Vec<RectF> {
+        visible_link_rects(&self.rects, self.scrolls, self.clip, h_offset)
+    }
+}
+
+pub fn visible_link_rects(
+    rects: &[RectF],
+    scrolls: bool,
+    clip: Option<RectF>,
+    h_offset: f32,
+) -> Vec<RectF> {
+    if !scrolls {
+        return rects.to_vec();
+    }
+    rects
+        .iter()
+        .filter_map(|rect| {
+            let shifted = rect.offset(-h_offset, 0.0);
+            match clip {
+                Some(clip) => shifted.intersect(&clip),
+                None => Some(shifted),
+            }
+        })
+        .collect()
+}
+
+/// Whether a block contains a link anywhere, including nested lists, quotes, and table cells.
+/// Answers from the model alone, so keyboard navigation can skip link-free blocks unlaid.
+pub fn block_has_link(kind: &BlockKind) -> bool {
+    let rich = |text: &RichText| {
+        text.spans
+            .iter()
+            .any(|span| matches!(span.style, InlineStyle::Link(_)))
+    };
+    match kind {
+        BlockKind::Heading { text, .. } | BlockKind::Paragraph(text) => rich(text),
+        BlockKind::List { items, .. } => items
+            .iter()
+            .any(|item| item.blocks.iter().any(block_has_link)),
+        BlockKind::Quote(blocks) => blocks.iter().any(block_has_link),
+        BlockKind::Table { head, rows, .. } => {
+            head.iter().any(rich) || rows.iter().flatten().any(rich)
+        }
+        BlockKind::Images(_) | BlockKind::Code { .. } | BlockKind::Rule | BlockKind::Html(_) => {
+            false
+        }
+    }
 }
 
 pub struct ImageSlot {
@@ -476,15 +530,18 @@ fn push_laid_text(
                 }
             }
             InlineStyle::Link(dest) => output.links.push(LinkHit {
-                text: String::from_utf16_lossy(
-                    &text.text.encode_utf16().collect::<Vec<_>>()
-                        [span.range.start as usize..span.range.end as usize],
-                ),
+                text: text
+                    .text
+                    .encode_utf16()
+                    .collect::<Vec<_>>()
+                    .get(span.range.start as usize..span.range.end as usize)
+                    .map_or_else(|| dest.clone(), String::from_utf16_lossy),
                 dest: dest.clone(),
                 rects: range_rects(&layout, span.range.start, span.range.end, x, y)?,
                 layout: layout.clone(),
                 range: text_range(span.range.start, span.range.end),
                 scrolls,
+                clip: None,
             }),
             _ => {}
         }
@@ -716,6 +773,11 @@ fn push_table(
         cursor += row_height;
     }
     let clip = RectF::new(x, y, x + width, cursor);
+    if scrolls {
+        for link in &mut table_output.links {
+            link.clip = Some(clip);
+        }
+    }
     output.links.append(&mut table_output.links);
     if scrolls {
         output.scroll_width = output.scroll_width.max(table_width);
@@ -935,6 +997,82 @@ mod tests {
             let code = laid(context, &format!("```\n{wide}{wide}\n```\n"), 200.0);
             assert!(code.scroll_width > 200.0);
         });
+    }
+
+    #[test]
+    fn scrolled_link_rects_are_shifted_and_clipped() {
+        let rects = [RectF::new(300.0, 0.0, 360.0, 20.0)];
+        let clip = Some(RectF::new(0.0, 0.0, 200.0, 40.0));
+        assert!(visible_link_rects(&rects, true, clip, 0.0).is_empty());
+        assert_eq!(
+            visible_link_rects(&rects, true, clip, 130.0),
+            vec![RectF::new(170.0, 0.0, 200.0, 20.0)]
+        );
+        assert_eq!(
+            visible_link_rects(&rects, true, clip, 200.0),
+            vec![RectF::new(100.0, 0.0, 160.0, 20.0)]
+        );
+        assert_eq!(
+            visible_link_rects(&rects, false, None, 500.0),
+            rects.to_vec()
+        );
+    }
+
+    #[test]
+    fn wide_table_links_carry_the_table_clip() {
+        with_context(&no_images, None, |context| {
+            let wide = "wide ".repeat(30);
+            let block = laid(
+                context,
+                &format!(
+                    "| {wide} | [far](https://far.dev) |
+|---|---|
+| a | b |
+"
+                ),
+                200.0,
+            );
+            let link = &block.links[0];
+            assert!(link.scrolls);
+            assert_eq!(
+                link.clip.map(|clip| (clip.left, clip.right)),
+                Some((0.0, 200.0))
+            );
+            assert!(link.visible_rects(0.0).is_empty());
+            let far = link.rects[0].left;
+            assert!(!link.visible_rects(far).is_empty());
+        });
+    }
+
+    #[test]
+    fn link_search_sees_links_in_nested_blocks_only_from_the_model() {
+        let has = |source: &str| {
+            let (blocks, _) = parse_document(source);
+            block_has_link(&blocks[0].kind)
+        };
+        assert!(has("see [a](b)
+"));
+        assert!(has("# [a](b)
+"));
+        assert!(has("- item
+  - [a](b)
+"));
+        assert!(has("> quote
+>
+> - [a](b)
+"));
+        assert!(has("| h |
+|---|
+| [a](b) |
+"));
+        assert!(!has("plain *text*
+"));
+        assert!(!has("```
+[a](b)
+```
+"));
+        assert!(!has("![alt](a.png)
+"));
     }
 
     #[test]
