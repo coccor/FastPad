@@ -338,10 +338,24 @@ struct Fixture {
     directory: PathBuf,
     path: PathBuf,
 }
+/// `TEMP` can be an 8.3 short name -- GitHub's Windows runners report
+/// `C:\Users\RUNNER~1\AppData\Local\Temp` -- while the file dialog hands back the shell's canonical
+/// long-form path. Comparing a document's path against a fixture built from the raw `TEMP` then
+/// fails on the spelling of `TEMP` rather than on the behaviour under test, so resolve the root
+/// once here. `canonicalize` returns a `\\?\` verbatim path, which the shell never produces.
+fn long_form_temp_dir() -> PathBuf {
+    let temp = std::env::temp_dir();
+    let Ok(canonical) = temp.canonicalize() else {
+        return temp;
+    };
+    let text = canonical.to_string_lossy().into_owned();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+}
+
 impl Fixture {
     fn new(bytes: &[u8]) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let directory = std::env::temp_dir().join(format!(
+        let directory = long_form_temp_dir().join(format!(
             "fastpad-open-integration-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
