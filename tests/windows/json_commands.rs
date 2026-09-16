@@ -27,7 +27,7 @@ fn format_json_reformats_with_two_spaces_and_is_undone_in_one_step() {
     }
 
     wait_text(editor, "{\n  \"a\": [\n    1,\n    2\n  ]\n}");
-    assert!(window::take_json_issues().is_empty());
+    assert!(notices(&main).is_empty());
 
     unsafe {
         SendMessageW(main.hwnd, WM_COMMAND, CommandId::Undo as usize, 0);
@@ -50,7 +50,7 @@ fn format_json_on_invalid_json_leaves_the_document_unchanged_and_reports_an_issu
     }
 
     assert_eq!(scintilla_text(editor).unwrap(), "{ bad");
-    let issues = window::take_json_issues();
+    let issues = notices(&main);
     assert_eq!(issues.len(), 1);
     assert!(issues[0].contains("line 1"), "{}", issues[0]);
     // Whether Format JSON itself ever starts an undo action for invalid input (it must not) is
@@ -71,8 +71,9 @@ fn validate_json_reports_success_for_valid_json_and_never_mutates_the_document()
         SendMessageW(main.hwnd, WM_COMMAND, CommandId::ValidateJson as usize, 0);
     }
 
-    assert_eq!(window::take_json_valid_count(), 1);
-    assert!(window::take_json_issues().is_empty());
+    let reported = notices(&main);
+    assert_eq!(reported.len(), 1);
+    assert!(reported[0].contains("valid JSON"), "{reported:?}");
     assert_eq!(scintilla_text(editor).unwrap(), "{\"a\":1}");
 }
 
@@ -87,8 +88,7 @@ fn validate_json_reports_the_line_and_column_for_invalid_json() {
         SendMessageW(main.hwnd, WM_COMMAND, CommandId::ValidateJson as usize, 0);
     }
 
-    assert_eq!(window::take_json_valid_count(), 0);
-    let issues = window::take_json_issues();
+    let issues = notices(&main);
     assert_eq!(issues.len(), 1);
     assert!(
         issues[0].contains("line 2") && issues[0].contains("column 3"),
@@ -96,6 +96,17 @@ fn validate_json_reports_the_line_and_column_for_invalid_json() {
         issues[0]
     );
     assert_eq!(scintilla_text(editor).unwrap(), "{\n  bad\n}");
+}
+
+/// The non-modal notification messages currently queued on the window (spec 239).
+fn notices(main: &TestMain) -> Vec<String> {
+    main.with_app(|app| {
+        app.notifications
+            .pending()
+            .iter()
+            .map(|notice| notice.message.clone())
+            .collect()
+    })
 }
 
 struct TestMain {
@@ -132,6 +143,18 @@ impl TestMain {
             identity,
             _class: class,
         }
+    }
+
+    fn with_app<R>(&self, run: impl FnOnce(&app::App) -> R) -> R {
+        assert!(self.identity.is_live_for(self.hwnd));
+        let raw = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                self.hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+            )
+        } as *const app::App;
+        assert!(!raw.is_null());
+        run(unsafe { &*raw })
     }
 }
 impl Drop for TestMain {

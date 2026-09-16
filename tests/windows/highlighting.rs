@@ -119,11 +119,13 @@ fn missing_lexilla_leaves_the_document_editable_as_plain_text() {
         "expected the JSON file to finish opening even without Lexilla.dll present",
     );
 
-    // The failed activation shows a real, blocking "could not enable syntax highlighting"
-    // MessageBoxW; dismiss it now so it cannot later overlap with the unrelated "unsaved changes"
-    // prompt for the leftover dirty tab from the earlier `type_char(editor, b'x')` deferred-open
-    // unblock (dismissed separately, at close time, by `close_dismissing_the_leftover_tab_prompt`).
-    support::process::wait_and_dismiss_dialog(process.id(), Duration::from_secs(3)).unwrap();
+    // The failed activation is reported in the persistent in-window notification line (spec 239),
+    // so it never blocks the deferred startup chain or the editor with a modal dialog.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !process.has_dialog().unwrap(),
+        "a failed language activation showed a modal dialog"
+    );
     assert!(!process_has_module_loaded(process.id(), LEXILLA_MODULE_NAME).unwrap());
 
     // Plain text editing still works after the failed activation.

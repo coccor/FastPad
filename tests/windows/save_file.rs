@@ -147,9 +147,9 @@ fn save_as_onto_another_open_tabs_path_shows_an_error_and_does_not_overwrite() {
 
     window::save_path_as(main.hwnd, &fixture.path);
 
-    let errors = window::take_save_errors();
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("already open"), "{errors:?}");
+    let reported = notices(&main);
+    assert_eq!(reported.len(), 1);
+    assert!(reported[0].contains("already open"), "{reported:?}");
     assert_eq!(std::fs::read(&fixture.path).unwrap(), b"owned by other tab");
     main.with_app(|app| {
         assert_eq!(app.tabs.len(), 2);
@@ -176,8 +176,9 @@ fn save_as_failure_reverts_the_tabs_path_to_its_original_value() {
 
     window::save_path_as(main.hwnd, &target);
 
-    let errors = window::take_save_errors();
-    assert_eq!(errors.len(), 1);
+    let reported = notices(&main);
+    assert_eq!(reported.len(), 1);
+    assert!(reported[0].contains("could not save"), "{reported:?}");
     assert!(!target.exists());
     main.with_app(|app| {
         assert_eq!(
@@ -278,6 +279,11 @@ fn tab_close_yes_keeps_the_tab_open_when_the_write_fails() {
     }
 
     assert_eq!(scintilla_text(main.editor).unwrap(), edited);
+    let reported = notices(&main);
+    assert!(
+        reported.iter().any(|notice| notice.contains("could not save")),
+        "{reported:?}"
+    );
     main.with_app(|app| {
         assert_eq!(
             app.tabs.active().path.as_deref(),
@@ -407,6 +413,17 @@ fn window_close_cancel_aborts_and_no_discards_without_writing() {
 
     assert_eq!(unsafe { IsWindow(main.hwnd) }, 0);
     assert_eq!(std::fs::read(&fixture.path).unwrap(), b"before");
+}
+
+/// The non-modal notification messages currently queued on the window (spec 239).
+fn notices(main: &TestMain) -> Vec<String> {
+    main.with_app(|app| {
+        app.notifications
+            .pending()
+            .iter()
+            .map(|notice| notice.message.clone())
+            .collect()
+    })
 }
 
 /// Drives a Save/Save As command and immediately cancels the native dialog.

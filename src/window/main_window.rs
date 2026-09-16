@@ -38,10 +38,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_NCMOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
-#[cfg(not(test))]
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MessageBoxW,
-};
 use crate::window::modal::prompt_close_decision;
 #[cfg(test)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW, WM_QUIT};
@@ -883,13 +879,25 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             if identity
                 .as_ref()
                 .is_some_and(|identity| identity.is_live_for(hwnd))
-                && let Ok(Some(path)) = selection
             {
-                let _ = App::open_path(hwnd, &path);
+                match selection {
+                    Ok(Some(path)) => {
+                        if let Err(error) = App::open_path(hwnd, &path) {
+                            report_open_failure(hwnd, &path, &error);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => push_notice(
+                        hwnd,
+                        format!("FastPad could not show the Open dialog: {error}"),
+                    ),
+                }
             }
         }
         CommandId::New => {
-            let _ = create_new_document(hwnd);
+            if let Err(error) = create_new_document(hwnd) {
+                push_notice(hwnd, format!("FastPad could not create a new tab: {error}"));
+            }
         }
         CommandId::CloseTab => close_active_document(hwnd),
         CommandId::Save => {
@@ -975,13 +983,12 @@ fn apply_language(hwnd: HWND, language: crate::document::Language) {
             // Lexer style tables reset every style's font face; restore the configured one.
             apply_editor_settings(hwnd);
         }
-        Some(Err(_)) => {
-            show_language_error(
-                hwnd,
-                "FastPad could not enable syntax highlighting for this file. It will remain in \
-                 plain text.",
-            );
-        }
+        Some(Err(_)) => push_notice(
+            hwnd,
+            "FastPad could not enable syntax highlighting for this file. It will remain in plain \
+             text."
+                .to_owned(),
+        ),
         None => {}
     }
 }
@@ -1237,8 +1244,8 @@ fn validate_active_json(hwnd: HWND) {
         return;
     };
     match crate::languages::validate_json(&text) {
-        Ok(()) => show_json_valid(hwnd),
-        Err(issue) => show_json_issue(hwnd, &json_issue_message(&issue)),
+        Ok(()) => push_notice(hwnd, "This document contains valid JSON.".to_owned()),
+        Err(issue) => push_notice(hwnd, json_issue_message(&issue)),
     }
 }
 
@@ -1276,7 +1283,7 @@ fn format_active_json(hwnd: HWND) {
             let end = floor_char_boundary(&formatted, selection.end.min(new_length));
             let _ = editor.set_selection(start..end);
         }
-        Err(issue) => show_json_issue(hwnd, &json_issue_message(&issue)),
+        Err(issue) => push_notice(hwnd, json_issue_message(&issue)),
     }
 }
 
@@ -1305,98 +1312,6 @@ fn json_issue_message(issue: &crate::languages::JsonIssue) -> String {
     }
 }
 
-// A real MessageBoxW is a blocking, modal native dialog; see `show_save_error`'s longer comment
-// for why the test build records the message instead of showing it.
-#[cfg(not(test))]
-fn show_json_issue(hwnd: HWND, message: &str) {
-    let text = wide_null(message);
-    let caption = wide_null("FastPad");
-    unsafe {
-        MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), MB_ICONERROR | MB_OK);
-    }
-}
-
-#[cfg(test)]
-fn show_json_issue(_hwnd: HWND, message: &str) {
-    JSON_ISSUES.with(|issues| issues.borrow_mut().push(message.to_owned()));
-}
-
-#[cfg(test)]
-thread_local! {
-    static JSON_ISSUES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Test-only accessor for the messages `show_json_issue` would otherwise have shown as a real
-/// MessageBoxW. Clears the recorded list.
-#[cfg(test)]
-pub(crate) fn take_json_issues() -> Vec<String> {
-    JSON_ISSUES.with(|issues| std::mem::take(&mut *issues.borrow_mut()))
-}
-
-#[cfg(not(test))]
-fn show_json_valid(hwnd: HWND) {
-    let text = wide_null("This document contains valid JSON.");
-    let caption = wide_null("FastPad");
-    unsafe {
-        MessageBoxW(
-            hwnd,
-            text.as_ptr(),
-            caption.as_ptr(),
-            MB_ICONINFORMATION | MB_OK,
-        );
-    }
-}
-
-#[cfg(test)]
-fn show_json_valid(_hwnd: HWND) {
-    JSON_VALID_COUNT.with(|count| count.set(count.get() + 1));
-}
-
-#[cfg(test)]
-thread_local! {
-    static JSON_VALID_COUNT: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Test-only accessor for how many times `show_json_valid` would otherwise have shown a real
-/// MessageBoxW. Resets the count.
-#[cfg(test)]
-pub(crate) fn take_json_valid_count() -> usize {
-    JSON_VALID_COUNT.with(|count| count.replace(0))
-}
-
-// A real MessageBoxW is a blocking, modal native dialog; see `show_save_error`'s longer comment
-// for why the test build records the message instead of showing it.
-#[cfg(not(test))]
-fn show_language_error(hwnd: HWND, message: &str) {
-    let text = wide_null(message);
-    let caption = wide_null("FastPad");
-    unsafe {
-        MessageBoxW(
-            hwnd,
-            text.as_ptr(),
-            caption.as_ptr(),
-            MB_ICONWARNING | MB_OK,
-        );
-    }
-}
-
-#[cfg(test)]
-fn show_language_error(_hwnd: HWND, message: &str) {
-    LANGUAGE_ERRORS.with(|errors| errors.borrow_mut().push(message.to_owned()));
-}
-
-#[cfg(test)]
-thread_local! {
-    static LANGUAGE_ERRORS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Test-only accessor for the messages `show_language_error` would otherwise have shown as a real
-/// MessageBoxW. Clears the recorded list.
-#[cfg(test)]
-pub(crate) fn take_language_errors() -> Vec<String> {
-    LANGUAGE_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()))
-}
-
 fn handle_open_request(hwnd: HWND) -> LRESULT {
     let request = unsafe { app_ptr(hwnd) }.and_then(|mut app| {
         let app = unsafe { app.as_mut() };
@@ -1418,8 +1333,10 @@ fn handle_open_request(hwnd: HWND) -> LRESULT {
     };
     match request {
         crate::launch::LaunchRequest::Open(path) => {
-            if App::open_path(hwnd, std::path::Path::new(&path)).is_ok() {
-                return 0;
+            let path = std::path::Path::new(&path);
+            match App::open_path(hwnd, path) {
+                Ok(()) => return 0,
+                Err(error) => report_open_failure(hwnd, path, &error),
             }
         }
         crate::launch::LaunchRequest::New => unsafe {
@@ -1464,8 +1381,9 @@ pub(crate) fn open_path(hwnd: HWND, path: &std::path::Path) -> Result<()> {
 
     // All fallible disk/decode/text validation occurs before touching active state.
     let loaded = crate::file::loader::load(path)?;
+    // A NUL byte cannot round-trip through Scintilla's UTF-8 buffer: the file is unsupported.
     std::ffi::CString::new(loaded.text.as_str())
-        .map_err(|_| crate::FastPadError::Invariant("Scintilla text may not contain NUL bytes"))?;
+        .map_err(|_| crate::FastPadError::UnsupportedEncoding)?;
     let (editor, previous, candidate, active_ids) = {
         let mut app = unsafe { app_ptr(hwnd) }.ok_or(crate::FastPadError::Invariant(
             "main window app state was not available",
@@ -1915,9 +1833,9 @@ fn complete_save(
         match outcome {
             Some(Ok(())) => {}
             Some(Err(_)) => {
-                show_save_error(
+                push_notice(
                     hwnd,
-                    "This file is already open in another tab. Choose a different name.",
+                    "This file is already open in another tab. Choose a different name.".to_owned(),
                 );
                 return false;
             }
@@ -1972,9 +1890,10 @@ fn complete_save(
             if is_save_as {
                 revert_active_path(hwnd, original_path);
             }
-            show_save_error(
+            push_notice(
                 hwnd,
-                "FastPad could not save this file. The previous version on disk was not modified.",
+                "FastPad could not save this file. The previous version on disk was not modified."
+                    .to_owned(),
             );
             false
         }
@@ -1987,40 +1906,6 @@ fn revert_active_path(hwnd: HWND, original_path: Option<std::path::PathBuf>) {
             .tabs
             .revert_active_path(original_path);
     }
-}
-
-// A real MessageBoxW is a blocking, modal native dialog. Driving it deterministically from an
-// automated integration test proved unreliable on this host (see the long comment in
-// tests/windows/save_file.rs), so the test build records the message instead of showing it;
-// production behavior (the real MessageBoxW) is unchanged.
-#[cfg(not(test))]
-fn show_save_error(hwnd: HWND, message: &str) {
-    let text = wide_null(message);
-    let caption = wide_null("FastPad");
-    unsafe {
-        MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), MB_ICONERROR | MB_OK);
-    }
-}
-
-#[cfg(test)]
-fn show_save_error(_hwnd: HWND, message: &str) {
-    SAVE_ERRORS.with(|errors| errors.borrow_mut().push(message.to_owned()));
-}
-
-#[cfg(test)]
-thread_local! {
-    static SAVE_ERRORS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Test-only accessor for the messages `show_save_error` would otherwise have shown as a real
-/// MessageBoxW. Clears the recorded list.
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "consumed by the source-linked save_file integration target"
-)]
-pub(crate) fn take_save_errors() -> Vec<String> {
-    SAVE_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()))
 }
 
 /// Returns the documents explicitly discarded, or `None` when the close was cancelled.
@@ -2362,10 +2247,7 @@ fn handle_ipc_requests(hwnd: HWND) -> LRESULT {
         match request {
             crate::ipc::IpcRequest::Open(path) => {
                 if let Err(error) = App::open_path(hwnd, &path) {
-                    push_notice(
-                        hwnd,
-                        format!("FastPad could not open {}: {error}", path.display()),
-                    );
+                    report_open_failure(hwnd, &path, &error);
                 }
             }
             crate::ipc::IpcRequest::New => execute_command(hwnd, CommandId::New),
@@ -2388,6 +2270,14 @@ fn bring_to_foreground(hwnd: HWND) {
         }
         SetForegroundWindow(hwnd);
     }
+}
+
+/// Reports a rejected Open (missing file, unsupported encoding, NUL bytes) by naming the file.
+fn report_open_failure(hwnd: HWND, path: &std::path::Path, error: &crate::FastPadError) {
+    push_notice(
+        hwnd,
+        format!("FastPad could not open {}: {error}", path.display()),
+    );
 }
 
 fn push_notice(hwnd: HWND, message: String) {
@@ -2699,8 +2589,7 @@ fn store_app(hwnd: HWND, value: Box<App>) {
 mod tests {
     use super::{
         MainWindowClass, WindowCreateContext, execute_command, handle_paint_with,
-        mark_first_paint_complete, take_deferred_start_pending, take_json_issues,
-        take_json_valid_count, take_language_errors,
+        mark_first_paint_complete, take_deferred_start_pending,
     };
     use crate::app::App;
     use crate::document::{CloseDecision, Language, RecoveryId};
@@ -2913,7 +2802,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::LanguageJson);
 
         assert_eq!(
-            take_language_errors(),
+            notices(window.hwnd),
             vec![
                 "FastPad could not enable syntax highlighting for this file. It will remain in \
                  plain text."
@@ -3022,7 +2911,7 @@ mod tests {
             editor.text().unwrap(),
             "{\n  \"a\": [\n    1,\n    2\n  ]\n}"
         );
-        assert!(take_json_issues().is_empty());
+        assert!(notices(window.hwnd).is_empty());
         assert!(editor.can_undo().unwrap());
         editor.undo().unwrap();
         assert_eq!(editor.text().unwrap(), "{\"a\":[1,2]}");
@@ -3043,7 +2932,7 @@ mod tests {
 
         assert_eq!(editor.text().unwrap(), "{ bad");
         assert!(!editor.can_undo().unwrap());
-        let issues = take_json_issues();
+        let issues = notices(window.hwnd);
         assert_eq!(issues.len(), 1);
         assert!(issues[0].contains("line 1"), "{}", issues[0]);
     }
@@ -3119,8 +3008,9 @@ mod tests {
 
         execute_command(window.hwnd, CommandId::ValidateJson);
 
-        assert_eq!(take_json_valid_count(), 1);
-        assert!(take_json_issues().is_empty());
+        let reported = notices(window.hwnd);
+        assert_eq!(reported.len(), 1);
+        assert!(reported[0].contains("valid JSON"), "{reported:?}");
         assert_eq!(editor.text().unwrap(), "{\"a\":1}");
         assert!(!editor.can_undo().unwrap());
     }
@@ -3134,8 +3024,7 @@ mod tests {
 
         execute_command(window.hwnd, CommandId::ValidateJson);
 
-        assert_eq!(take_json_valid_count(), 0);
-        let issues = take_json_issues();
+        let issues = notices(window.hwnd);
         assert_eq!(issues.len(), 1);
         assert!(
             issues[0].contains("line 2") && issues[0].contains("column 3"),
@@ -3391,6 +3280,16 @@ mod tests {
 
     fn app_mut<'a>(hwnd: HWND) -> &'a mut App {
         unsafe { super::app_ptr(hwnd).unwrap().as_mut() }
+    }
+
+    /// The non-modal notification messages currently queued on the window (spec 239).
+    fn notices(hwnd: HWND) -> Vec<String> {
+        app_mut(hwnd)
+            .notifications
+            .pending()
+            .iter()
+            .map(|notice| notice.message.clone())
+            .collect()
     }
 
     fn read_snapshot_text(path: &std::path::Path) -> String {

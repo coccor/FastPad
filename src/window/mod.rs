@@ -22,13 +22,7 @@ pub(crate) use main_window::{
     unused_imports,
     reason = "consumed by the source-linked save_file integration target"
 )]
-pub(crate) use main_window::{save_path_as, take_save_errors, with_test_input_queue_status};
-#[cfg(test)]
-#[allow(
-    unused_imports,
-    reason = "consumed by the source-linked json_commands integration target"
-)]
-pub(crate) use main_window::{take_json_issues, take_json_valid_count};
+pub(crate) use main_window::{save_path_as, with_test_input_queue_status};
 #[cfg(test)]
 #[allow(
     unused_imports,

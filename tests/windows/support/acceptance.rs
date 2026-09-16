@@ -151,9 +151,13 @@ impl AcceptanceHarness {
         unsafe {
             PostMessageW(launch.hwnd, WM_COMMAND, CommandId::ValidateJson as usize, 0);
         }
-        wait_and_dismiss_dialog(launch.process.id(), Duration::from_secs(3))
-            .expect("the explicit Validate JSON command did not report the malformed document");
-        assert_eq!(launch.json_invocation_count(), 1);
+        wait_until("the explicit Validate JSON command to parse", || {
+            launch.json_invocation_count() == 1
+        });
+        assert!(
+            !launch.process.has_dialog().unwrap(),
+            "Validate JSON reported its result with a modal dialog"
+        );
         assert_eq!(scintilla_text(launch.editor).unwrap(), MALFORMED_JSON);
         launch.close_discarding_changes();
     }
