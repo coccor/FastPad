@@ -298,16 +298,18 @@ mod tests {
     use super::*;
     use crate::preview::model::parse_document;
 
-    const FIXTURES: [&str; 6] = [
+    const FIXTURES: [&str; 8] = [
         "# Title\n\nFirst paragraph with *emphasis*.\n\nSecond paragraph.\n",
         "- one\n- two\n\n- three after a blank\n\n  continued item\n\nTail paragraph.\n",
         "> quote line\n> more\n\nlazy\n\n```rust\nfn main() {}\n\nlet x = 1;\n```\n\nafter code\n",
         "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\ntext\n\n    indented code\n\n    more code\n",
         "See [site] and [other][o].\n\n[site]: https://x.dev\n[o]: https://o.dev\n\nEnd.\n",
         "<!-- comment\n\nstill comment -->\n\nParagraph\n\n<div>\nhtml\n</div>\n",
+        "<div align=\"center\">\n\n<img src=\"a.svg\" width=\"96\">\n\n# Title\n\n</div>\n\nText with <kbd>K</kbd>.\n\n<details>\n<summary>More</summary>\n\n- item\n\n</details>\n\nTail\n",
+        "<p align=\"center\">\n  <a href=\"x\"><img src=\"b.png\"></a>\n</p>\n\n<picture>\n<source media=\"(prefers-color-scheme: dark)\" srcset=\"d.png\">\n<img src=\"l.png\">\n</picture>\n\n<!-- note -->\n\nEnd <br> line\n",
     ];
 
-    const INSERTS: [&str; 20] = [
+    const INSERTS: [&str; 28] = [
         "x",
         "\n",
         "\n\n",
@@ -328,6 +330,14 @@ mod tests {
         "===\n",
         "é",
         "😀",
+        "<",
+        ">",
+        "</div>",
+        "<details>",
+        "<summary>",
+        "<div align=\"center\">",
+        "</p>",
+        "<br>",
     ];
 
     /// xorshift64*: deterministic and dependency-free.
@@ -519,5 +529,52 @@ mod tests {
             }],
         );
         assert!(document.revision > first);
+    }
+
+    #[test]
+    fn an_edit_inside_a_div_replaces_only_the_div() {
+        let mut text =
+            String::from("a\n\nb\n\nc\n\n<div>\n\none\n\ntwo\n\n</div>\n\nd\n\ne\n\nf\n");
+        let mut document = PreviewDocument::parse(&text);
+        assert_eq!(document.blocks.len(), 7);
+        let position = text.find("two").unwrap();
+        text.insert(position, 'x');
+        let update = document.apply(
+            text.as_str(),
+            &[Edit {
+                position,
+                removed: 0,
+                inserted: 1,
+                lines_delta: 0,
+            }],
+        );
+        assert_eq!(
+            update,
+            Update::Replaced {
+                old: 3..4,
+                new: 3..4
+            }
+        );
+        assert_eq!(document.blocks, parse_document(&text).0);
+    }
+
+    #[test]
+    fn deleting_a_closing_tag_lets_the_div_take_the_rest_of_the_document() {
+        let mut text = String::from("<div>\n\none\n\n</div>\n\na\n\nb\n");
+        let mut document = PreviewDocument::parse(&text);
+        assert_eq!(document.blocks.len(), 3);
+        let position = text.find("</div>").unwrap();
+        text.replace_range(position..position + "</div>".len(), "");
+        document.apply(
+            text.as_str(),
+            &[Edit {
+                position,
+                removed: "</div>".len(),
+                inserted: 0,
+                lines_delta: 0,
+            }],
+        );
+        assert_eq!(document.blocks, parse_document(&text).0);
+        assert_eq!(document.blocks.len(), 1);
     }
 }
