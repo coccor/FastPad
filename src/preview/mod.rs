@@ -5,6 +5,8 @@ pub mod accessible;
 pub mod colors;
 pub mod dwrite;
 pub mod heights;
+pub mod html;
+mod html_entities;
 pub mod images;
 pub mod incremental;
 pub mod layout;

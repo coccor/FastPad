@@ -54,6 +54,17 @@ fn local_path(dest: &str, document_dir: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
+/// Whether the HTML sanitizer keeps a link or image reference: web and mail links, fragments, and
+/// paths without a scheme. `javascript:`, `data:`, and every other scheme are removed.
+pub fn is_safe_url(dest: &str) -> bool {
+    let dest = dest.trim();
+    let lower = dest.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+        || !has_scheme(dest)
+}
+
 /// `C:\x` and `C:/x` are drive paths, not a one-letter scheme.
 fn has_scheme(dest: &str) -> bool {
     let Some(colon) = dest.find(':') else {
@@ -274,6 +285,30 @@ mod tests {
                 _ => format!("intro-{}", index + 1),
             };
             assert_eq!(slugs.unique("Intro"), expected);
+        }
+    }
+
+    #[test]
+    fn safe_urls_are_web_mail_fragments_and_paths() {
+        for dest in [
+            "https://x.dev",
+            "HTTP://X",
+            "mailto:a@b",
+            "#part",
+            "img/a.png",
+            r"C:\a.png",
+            "",
+        ] {
+            assert!(is_safe_url(dest), "{dest}");
+        }
+        for dest in [
+            "javascript:alert(1)",
+            " JavaScript:x",
+            "data:text/html,x",
+            "file:///C:/x",
+            "vbscript:x",
+        ] {
+            assert!(!is_safe_url(dest), "{dest}");
         }
     }
 }
