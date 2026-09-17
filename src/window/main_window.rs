@@ -84,6 +84,14 @@ impl MainWindowClass {
             // MAKEINTRESOURCEW; a module without the resource (e.g. a test binary) gets null, which
             // falls back to the default window icon.
             hIcon: unsafe { LoadIconW(instance, APP_ICON_RESOURCE_ID as *const u16) },
+            // The tab strip is client area; without a class cursor, hovering it keeps whatever
+            // cursor was last shown (the editor's I-beam, a resize arrow).
+            hCursor: unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::LoadCursorW(
+                    std::ptr::null_mut(),
+                    windows_sys::Win32::UI::WindowsAndMessaging::IDC_ARROW,
+                )
+            },
             lpszClassName: class_name.as_ptr(),
             ..Default::default()
         };
@@ -3703,6 +3711,20 @@ mod tests {
             )
         };
         assert_eq!(String::from_utf16_lossy(&text[..len as usize]), "FastPad");
+    }
+
+    #[test]
+    fn the_main_window_class_resets_the_cursor_over_its_client_area() {
+        // Break caught: without a class cursor, WM_SETCURSOR over the tab strip (HTCLIENT) leaves
+        // whatever cursor was last shown, such as the editor's I-beam or a resize arrow.
+        let window = ProductionWindow::new(make_app());
+        let cursor = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetClassLongPtrW(
+                window.hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::GCLP_HCURSOR,
+            )
+        };
+        assert_ne!(cursor, 0);
     }
 
     #[test]
