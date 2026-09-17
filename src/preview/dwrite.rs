@@ -45,7 +45,7 @@ pub fn hresult_error(error: windows::core::Error) -> FastPadError {
     FastPadError::Win32(error.code().0 as u32)
 }
 
-fn load_system_library(name: &str) -> Result<OwnedModule> {
+pub(crate) fn load_system_library(name: &str) -> Result<OwnedModule> {
     let wide = wide_null(name);
     let raw = unsafe {
         LoadLibraryExW(
@@ -68,23 +68,26 @@ unsafe fn resolve<F: Copy>(module: &OwnedModule, name: &CStr) -> Result<F> {
     Ok(unsafe { std::mem::transmute_copy::<unsafe extern "system" fn() -> isize, F>(&proc) })
 }
 
+/// Creates a Direct2D factory from a loaded `d2d1.dll`. The factory must be dropped before `module`.
+pub(crate) fn create_d2d_factory(
+    module: &OwnedModule,
+    factory_type: D2D1_FACTORY_TYPE,
+) -> Result<ID2D1Factory> {
+    unsafe {
+        let create: D2D1CreateFactoryFn = resolve(module, c"D2D1CreateFactory")?;
+        let mut raw = std::ptr::null_mut();
+        create(factory_type, &ID2D1Factory::IID, std::ptr::null(), &mut raw)
+            .ok()
+            .map_err(hresult_error)?;
+        Ok(ID2D1Factory::from_raw(raw))
+    }
+}
+
 impl Graphics {
     pub fn load() -> Result<Self> {
         let d2d_module = load_system_library("d2d1.dll")?;
         let dwrite_module = load_system_library("dwrite.dll")?;
-        let d2d = unsafe {
-            let create: D2D1CreateFactoryFn = resolve(&d2d_module, c"D2D1CreateFactory")?;
-            let mut raw = std::ptr::null_mut();
-            create(
-                D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                &ID2D1Factory::IID,
-                std::ptr::null(),
-                &mut raw,
-            )
-            .ok()
-            .map_err(hresult_error)?;
-            ID2D1Factory::from_raw(raw)
-        };
+        let d2d = create_d2d_factory(&d2d_module, D2D1_FACTORY_TYPE_SINGLE_THREADED)?;
         let dwrite = unsafe {
             let create: DWriteCreateFactoryFn = resolve(&dwrite_module, c"DWriteCreateFactory")?;
             let mut raw = std::ptr::null_mut();

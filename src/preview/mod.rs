@@ -5,12 +5,17 @@ pub mod accessible;
 pub mod colors;
 pub mod dwrite;
 pub mod heights;
+pub mod html;
+mod html_entities;
 pub mod images;
 pub mod incremental;
+pub mod inline_object;
 pub mod layout;
 pub mod links;
 pub mod model;
+pub mod outline;
 pub mod render;
+pub mod svg;
 pub mod view;
 
 /// How the preview shares the content area with the editor. Owned by the window, not the tab.

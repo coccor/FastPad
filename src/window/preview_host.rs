@@ -616,7 +616,7 @@ pub(crate) fn parsed(hwnd: HWND, lparam: LPARAM) {
     } else {
         editor(hwnd).map(|editor| editor_top_line(&editor))
     };
-    view.replace_document(parsed, folder, started);
+    view.install_parse(parsed, folder, started);
     if let Some(line) = line {
         view.scroll_to_line(line);
     }

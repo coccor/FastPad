@@ -199,7 +199,15 @@ is on the way; until then, every release publishes SHA-256 checksums you can ver
 **Can I use it on Windows on ARM or 32-bit Windows?** Not yet. Current builds are Windows 10 and 11
 x64.
 
-## Help FastPad grow
+The preview renders GitHub-flavored Markdown natively (tables, task lists, strikethrough, code
+blocks, images) and the HTML GitHub allows in READMEs: centred `<div>` and `<p>` blocks, sized
+`<img>` tags, `<picture>` images that follow the light or dark theme, collapsible
+`<details>` sections, and inline tags such as `<kbd>`, `<sup>`, and `<br>`. Local PNG, JPEG, GIF,
+and SVG images are shown; remote images show a placeholder with their alt text, because nothing is
+loaded from the network. It updates shortly after you stop typing, and scrolling either pane scrolls
+the other. Links open when clicked: web and mail links in your default browser, `#anchors` inside
+the preview (opening any collapsed section around them), and local files in a FastPad tab.
+Files larger than 10 MB pause live updates; click the bar at the top of the preview to refresh it.
 
 If FastPad saves you a few seconds a day, **[star it on GitHub](https://github.com/coccor/FastPad)**.
 It's the single best way to help others find it. Found a bug or missing something?
