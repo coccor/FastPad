@@ -1851,4 +1851,62 @@ mod tests {
         );
         assert_eq!(ColorScheme::from_media("print"), None);
     }
+
+    #[test]
+    fn the_readme_fixture_renders_no_literal_markup() {
+        fn collect(kind: &BlockKind, texts: &mut Vec<String>) {
+            match kind {
+                BlockKind::Heading { text, .. } | BlockKind::Paragraph { text, .. } => {
+                    texts.push(text.text.clone())
+                }
+                BlockKind::List { items, .. } => {
+                    for block in items.iter().flat_map(|item| &item.blocks) {
+                        collect(block, texts);
+                    }
+                }
+                BlockKind::Quote(children) | BlockKind::Container { children, .. } => {
+                    for child in children {
+                        collect(child, texts);
+                    }
+                }
+                BlockKind::Details {
+                    summary, children, ..
+                } => {
+                    texts.push(summary.text.clone());
+                    for child in children {
+                        collect(child, texts);
+                    }
+                }
+                BlockKind::Table { head, rows, .. } => texts.extend(
+                    head.iter()
+                        .chain(rows.iter().flatten())
+                        .map(|cell| cell.text.clone()),
+                ),
+                BlockKind::Code { text, .. } => texts.push(text.clone()),
+                BlockKind::Rule => {}
+            }
+        }
+        let source = include_str!("../../tests/fixtures/html-readme.md");
+        let mut texts = Vec::new();
+        for block in parse_document(source).0 {
+            collect(&block.kind, &mut texts);
+        }
+        for text in &texts {
+            for tag in [
+                "div", "img", "details", "summary", "kbd", "b", "br", "picture", "source", "p", "a",
+            ] {
+                assert!(
+                    !text.contains(&format!("<{tag}")) && !text.contains(&format!("</{tag}")),
+                    "literal <{tag}> in {text:?}"
+                );
+            }
+            assert!(!text.contains("<!--"), "literal comment in {text:?}");
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("Other ways to install"))
+        );
+        assert!(texts.iter().any(|text| text == "Back to top"));
+    }
 }

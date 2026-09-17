@@ -454,6 +454,25 @@ impl PreviewView {
         self.with(visible_links).unwrap_or_default()
     }
 
+    /// Each laid-out image with a local path, and whether its pixels are decoded.
+    #[cfg(test)]
+    pub fn image_states(&self) -> Vec<(PathBuf, bool)> {
+        self.with(|state| {
+            state
+                .layouts
+                .iter()
+                .flatten()
+                .flat_map(|laid| &laid.images)
+                .filter_map(|slot| {
+                    let path = slot.path.clone()?;
+                    let ready = state.images.size(&path).is_some();
+                    Some((path, ready))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     pub fn accessible_links(&self) -> Arc<RwLock<Vec<VisibleLink>>> {
         self.with(|state| Arc::clone(&state.accessible))
             .unwrap_or_default()

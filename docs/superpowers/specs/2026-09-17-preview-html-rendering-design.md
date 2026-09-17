@@ -1,6 +1,6 @@
 # FastPad Preview HTML Rendering Design
 
-Status: Approved design (pending written-spec review)  
+Status: Approved design; phase 1 implemented  
 Date: 17 September 2026  
 Amends: `2026-09-16-markdown-preview-design.md` §3 "Out of scope (v1)" (HTML rendering) and §7.6 (images)
 
@@ -471,6 +471,24 @@ Each gets its own plan, amending this spec where the detail changes.
 - Layout extends `push_table` column measurement to spanning cells (distribute the excess width of
   a spanning cell evenly across its columns) and row heights to spanning rows.
 - Horizontal scrolling for wide tables reuses `DrawOp::Scrollable`.
+
+## 11a. Implementation clarifications (phase 1)
+
+Recorded from `docs/superpowers/plans/2026-09-17-preview-html-rendering-phase-1.md`:
+
+- SVG bytes reach Direct2D through an `IWICStream` (WIC is already loaded for images), not
+  `SHCreateMemStream`; `shlwapi.dll` is never loaded and the import guards are unchanged.
+- `Length` holds whole numbers so blocks stay `Eq`; percentage heights are ignored.
+- `ImageSource` stores the first `srcset` candidate as `url`; `Heading` gains `anchor`.
+- `<picture>` is inline builder state, not a block frame.
+- HTML text collapses whitespace and trims trailing spaces.
+- Blocks finished inside one CommonMark HTML block are wrapped in one `Container`; HTML blocks that
+  produce nothing produce no preview block.
+- The sanitizer removes `href`, `src`, and `srcset` values with schemes other than `http`, `https`,
+  and `mailto`.
+- `outline.rs` owns `DetailsKey`, section keys, and anchors; disclosure activation from MSAA reuses
+  `WM_FASTPAD_PREVIEW_ACTIVATE` with `wparam = 1`.
+- Scroll sync needed no new mapping: a collapsed section is a short block.
 
 ## 12. Risks
 
