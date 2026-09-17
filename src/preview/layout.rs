@@ -430,7 +430,10 @@ impl<'a> LayoutContext<'a> {
                 (height * natural_width / natural_height, height, false)
             }
             (None, None, Some(size)) => (size.0, size.1, false),
-            (Some(width), None, None) => (width, self.line_height, false),
+            // Tall enough for one padded line of alt text while there is no natural size.
+            (Some(width), None, None) => {
+                (width, self.line_height + 16.0 * self.fonts.unit(), false)
+            }
             (None, Some(height), None) => (self.chip_width(&alt)?, height, false),
             (None, None, None) => (self.chip_width(&alt)?, self.line_height, true),
         };
@@ -840,11 +843,14 @@ fn push_image_slot(
         DWRITE_FONT_WEIGHT_NORMAL,
         (image.width - 2.0 * padding).max(1.0),
     )?;
-    let alt_top = if image.chip {
+    // A chip, or a sized box too short for the wrapped alt text and its padding, shows one line
+    // centred vertically: text starting at the padding would be clipped by the box.
+    let fits = !image.chip && metrics(&alt)?.height + 2.0 * padding <= image.height;
+    let alt_top = if fits {
+        padding
+    } else {
         unsafe { alt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP) }.map_err(hresult_error)?;
         ((image.height - metrics(&alt)?.height) / 2.0).max(0.0)
-    } else {
-        padding
     };
     output.images.push(ImageSlot {
         path: image.path,
@@ -1561,6 +1567,32 @@ mod tests {
             assert_eq!(slot.rect.height(), context.line_height());
             assert!(slot.rect.width() > 0.0 && slot.rect.width() < 400.0);
             assert!(slot.alt_origin.0 > 0.0);
+        });
+    }
+
+    #[test]
+    fn missing_images_show_their_whole_alt_text_inside_the_placeholder() {
+        // Break caught: a placeholder sized by attributes drew its alt text 8 DIPs below the top
+        // of a box only one line tall, so the text was clipped halfway down.
+        with_context(&no_images, None, |context| {
+            for source in [
+                "<img src=\"missing.png\" alt=\"FastPad logo\" width=\"160\">\n",
+                "<img src=\"missing.png\" alt=\"FastPad logo\" width=\"160\" height=\"24\">\n",
+                "<img src=\"missing.png\" alt=\"FastPad logo\" width=\"40\" height=\"40\">\n",
+                "![FastPad logo](missing.png)\n",
+            ] {
+                let block = laid(context, source, 400.0);
+                let slot = &block.images[0];
+                let alt = metrics(&slot.alt).unwrap();
+                assert!(slot.alt_origin.1 >= 0.0, "{source}: {:?}", slot.alt_origin);
+                assert!(
+                    slot.alt_origin.1 + alt.height <= slot.rect.height() + 0.5,
+                    "{source}: alt text {} tall at {} in a box {} tall",
+                    alt.height,
+                    slot.alt_origin.1,
+                    slot.rect.height()
+                );
+            }
         });
     }
 
