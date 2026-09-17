@@ -223,6 +223,16 @@ pub fn draw_ops(
                     },
                     brushes.get(*role),
                 ),
+                DrawOp::RoundedStroke { rect, radius, role } => target.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: rect.offset(x, y).inflate(-0.5).to_d2d(),
+                        radiusX: *radius,
+                        radiusY: *radius,
+                    },
+                    brushes.get(*role),
+                    1.0,
+                    None,
+                ),
                 DrawOp::Stroke { rect, role } => target.DrawRectangle(
                     &rect.offset(x, y).inflate(-0.5).to_d2d(),
                     brushes.get(*role),
@@ -268,15 +278,17 @@ pub fn draw_ops(
                                 1.0,
                                 None,
                             );
+                            target.PushAxisAlignedClip(&rect.to_d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
                             target.DrawTextLayout(
                                 Vector2 {
-                                    X: rect.left + 8.0,
-                                    Y: rect.top + 8.0,
+                                    X: rect.left + slot.alt_origin.0,
+                                    Y: rect.top + slot.alt_origin.1,
                                 },
                                 &slot.alt,
                                 brushes.get(ColorRole::Muted),
                                 D2D1_DRAW_TEXT_OPTIONS_NONE,
                             );
+                            target.PopAxisAlignedClip();
                         }
                     }
                 }

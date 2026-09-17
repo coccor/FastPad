@@ -18,10 +18,12 @@ pub enum ColorRole {
     QuoteBar,
     TableStripe,
     Focus,
+    Mark,
+    KbdBorder,
 }
 
 impl ColorRole {
-    pub const ALL: [ColorRole; 10] = [
+    pub const ALL: [ColorRole; 12] = [
         Self::Background,
         Self::Text,
         Self::Muted,
@@ -32,6 +34,8 @@ impl ColorRole {
         Self::QuoteBar,
         Self::TableStripe,
         Self::Focus,
+        Self::Mark,
+        Self::KbdBorder,
     ];
 }
 
@@ -47,6 +51,8 @@ pub struct PreviewColors {
     pub quote_bar: u32,
     pub table_stripe: u32,
     pub focus: u32,
+    pub mark: u32,
+    pub kbd_border: u32,
 }
 
 impl PreviewColors {
@@ -62,7 +68,15 @@ impl PreviewColors {
             ColorRole::QuoteBar => self.quote_bar,
             ColorRole::TableStripe => self.table_stripe,
             ColorRole::Focus => self.focus,
+            ColorRole::Mark => self.mark,
+            ColorRole::KbdBorder => self.kbd_border,
         }
+    }
+
+    /// Whether the preview background is dark, for `<picture>` sources that depend on the scheme.
+    pub fn is_dark(&self) -> bool {
+        let channel = |shift: u32| (self.background >> shift) & 0xFF;
+        299 * channel(0) + 587 * channel(8) + 114 * channel(16) < 128_000
     }
 }
 
@@ -77,6 +91,8 @@ const GITHUB_LIGHT: PreviewColors = PreviewColors {
     quote_bar: rgb(209, 217, 224),
     table_stripe: rgb(246, 248, 250),
     focus: rgb(9, 105, 218),
+    mark: rgb(255, 248, 197),
+    kbd_border: rgb(209, 217, 224),
 };
 
 const GITHUB_DARK: PreviewColors = PreviewColors {
@@ -90,6 +106,8 @@ const GITHUB_DARK: PreviewColors = PreviewColors {
     quote_bar: rgb(61, 68, 77),
     table_stripe: rgb(37, 37, 38),
     focus: rgb(68, 147, 248),
+    mark: rgb(69, 56, 25),
+    kbd_border: rgb(61, 68, 77),
 };
 
 const fn catppuccin_colors(flavor: &Flavor) -> PreviewColors {
@@ -104,6 +122,8 @@ const fn catppuccin_colors(flavor: &Flavor) -> PreviewColors {
         quote_bar: flavor.surface1,
         table_stripe: catppuccin::blend(flavor.surface0, flavor.base, 96),
         focus: flavor.blue,
+        mark: catppuccin::blend(flavor.yellow, flavor.base, 64),
+        kbd_border: flavor.surface1,
     }
 }
 
@@ -131,6 +151,8 @@ pub fn preview_colors(theme: Theme, high_contrast: bool) -> PreviewColors {
             quote_bar: palette.editor_foreground,
             table_stripe: palette.editor_background,
             focus: palette.selection_background,
+            mark: palette.editor_background,
+            kbd_border: palette.editor_foreground,
         };
     }
     let colors = match theme {
@@ -195,5 +217,22 @@ mod tests {
         let colors = preview_colors(Theme::Light, false);
         assert_eq!(colors.get(ColorRole::Link), colors.link);
         assert_eq!(ColorRole::ALL[ColorRole::Focus as usize], ColorRole::Focus);
+    }
+
+    #[test]
+    fn mark_and_keyboard_roles_stand_out_on_every_theme() {
+        for theme in Theme::ALL {
+            let colors = preview_colors(theme, false);
+            assert_ne!(colors.mark, colors.background, "{theme:?}");
+            assert_ne!(colors.kbd_border, colors.background, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn darkness_follows_the_background() {
+        assert!(!preview_colors(Theme::Light, false).is_dark());
+        assert!(preview_colors(Theme::Dark, false).is_dark());
+        assert!(preview_colors(Theme::CatppuccinMocha, false).is_dark());
+        assert!(!preview_colors(Theme::CatppuccinLatte, false).is_dark());
     }
 }

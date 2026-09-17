@@ -58,15 +58,21 @@ impl Drop for ComScope {
 
 pub fn decode_image(path: &Path, max_width: u32) -> Result<DecodedImage> {
     let _com = ComScope::enter();
+    let factory: IWICImagingFactory =
+        unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
+            .map_err(hresult_error)?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    {
+        return crate::preview::svg::decode_svg(&factory, path, max_width);
+    }
     let wide = path
         .as_os_str()
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<u16>>();
     unsafe {
-        let factory: IWICImagingFactory =
-            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
-                .map_err(hresult_error)?;
         let decoder = factory
             .CreateDecoderFromFilename(
                 PCWSTR(wide.as_ptr()),
@@ -421,5 +427,18 @@ mod tests {
         cache.request(&path, 8);
         assert_eq!(cache.entries[&path].requested, 0);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_cache_decodes_svg_files_and_decodes_them_larger_on_request() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("fastpad-icon.svg");
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&path, 16);
+        wait_for(&mut cache, &path, 16);
+        assert_eq!(cache.size(&path), Some((256, 256)));
+        cache.request(&path, 64);
+        wait_for(&mut cache, &path, 64);
     }
 }

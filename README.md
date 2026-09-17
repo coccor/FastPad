@@ -105,11 +105,14 @@ menu and command palette have the same commands. Esc in the full-width preview r
 side. Drag the divider to resize the panes (double-click resets it).
 
 The preview renders GitHub-flavored Markdown natively (tables, task lists, strikethrough, code
-blocks, images) and updates shortly after you stop typing. Scrolling either pane scrolls the other.
-Only local images are shown. Links open when clicked: web and mail links in your default browser,
-`#anchors` inside the preview, and local files in a FastPad tab. Nothing is loaded from the
-network. Files larger than 10 MB pause live updates; click the bar at the top of the preview to
-refresh it.
+blocks, images) and the HTML GitHub allows in READMEs: centred `<div>` and `<p>` blocks, sized
+`<img>` tags, `<picture>` images that follow the light or dark theme, collapsible
+`<details>` sections, and inline tags such as `<kbd>`, `<sup>`, and `<br>`. Local PNG, JPEG, GIF,
+and SVG images are shown; remote images show a placeholder with their alt text, because nothing is
+loaded from the network. It updates shortly after you stop typing, and scrolling either pane scrolls
+the other. Links open when clicked: web and mail links in your default browser, `#anchors` inside
+the preview (opening any collapsed section around them), and local files in a FastPad tab.
+Files larger than 10 MB pause live updates; click the bar at the top of the preview to refresh it.
 
 The preview's graphics libraries load only when a preview is first opened, so startup is unchanged.
 

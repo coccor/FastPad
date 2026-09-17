@@ -50,6 +50,21 @@ Release binary size (`FastPad.exe`, release profile with `release-package`, as `
 builds it): 511,488 bytes before the preview, 957,440 bytes with it (+445,952 bytes). A plain
 `cargo build --release` binary with the preview is 960,512 bytes.
 
+HTML rendering (phase 1), measured 2026-09-17 on the same machine against `origin/main` (ef32e96):
+
+- HTML-heavy 100 KB preview open: 16.9 ms p95 (the Markdown-only 100 KB open measured 17.1 ms in
+  the same run).
+- One-paragraph update in a 1 MB document: 1.67 ms and 1.50 ms p95 in two quiet runs; the baseline
+  build measured 1.62 ms. A run while other work shared the machine measured 2.27 ms.
+- Update inside a `<div>` spanning a 1 MB document: 1.38 s p95. No target: the element makes the
+  whole document one block, so every edit parses it again and lays out that one block in full.
+- SVG decode of `assets/fastpad-icon.svg` at 256 px: median 8.0 ms, max 9.6 ms (a second run
+  measured median 13.1 ms, max 17.3 ms).
+- Release binary with `release-package`: 1,008,128 bytes before, 1,111,552 bytes after
+  (+103,424 bytes).
+- Startup with `benchmarks/fixtures/sample.md` (100 runs each, `fastpad-bench compare`): no
+  milestone regressed; every p95 delta was between -4.9 ms and -1.3 ms.
+
 Deviations from the design spec, recorded without a ruling:
 
 - The image cache is keyed by path only, not by path and modification time. An image edited while

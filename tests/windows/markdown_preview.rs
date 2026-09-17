@@ -10,7 +10,7 @@ use crate::window::commands::CommandId;
 use std::time::{Duration, Instant};
 use support::acceptance::AcceptanceHarness;
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, VK_ESCAPE, VK_RETURN, VK_TAB};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, IsWindowVisible, MSG, PM_QS_INPUT, PM_REMOVE, PeekMessageW, SendMessageW,
     TranslateMessage, WM_COMMAND, WM_KEYDOWN,
@@ -672,17 +672,15 @@ fn sample_markdown(bytes: usize) -> String {
         .map_or_else(String::new, |(text, _)| format!("{text}\n"))
 }
 
-fn p95(mut samples: Vec<u64>) -> u64 {
-    samples.sort_unstable();
-    samples[(samples.len() * 95 / 100).min(samples.len() - 1)]
+fn html_markdown(bytes: usize) -> String {
+    let section = "<div align=\"center\">\n\n<img src=\"https://x.dev/badge.svg\" alt=\"badge\" width=\"96\">\n\n## Heading\n\n</div>\n\nPress <kbd>Ctrl</kbd>+<kbd>S</kbd> in <b>bold</b> text with a [link](https://x.dev).\n\n<details>\n<summary>More</summary>\n\n| a | b |\n|---|---|\n| 1<br>2 | <code>x</code> |\n\n</details>\n\n";
+    section.repeat(bytes / section.len() + 1)[..bytes]
+        .rsplit_once("\n\n")
+        .map_or_else(String::new, |(text, _)| format!("{text}\n"))
 }
 
-#[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
-fn opening_a_100_kb_preview_renders_within_50_ms_p95() {
-    let _scintilla = support::win32::WindowHarness::new().unwrap();
-    let main = TestMain::new();
-    main.make_markdown(&sample_markdown(100_000));
+fn preview_open_p95(main: &TestMain, text: &str) -> u64 {
+    main.make_markdown(text);
     let mut samples = Vec::new();
     for _ in 0..30 {
         main.command(CommandId::MarkdownPreviewSide);
@@ -693,17 +691,11 @@ fn opening_a_100_kb_preview_renders_within_50_ms_p95() {
         samples.push(view.stats().first_frame_micros);
         main.command(CommandId::MarkdownPreviewClose);
     }
-    let p95 = p95(samples);
-    println!("preview open p95: {p95} us");
-    assert!(p95 < 50_000);
+    p95(samples)
 }
 
-#[test]
-#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
-fn one_paragraph_updates_in_a_1_mb_document_within_2_ms_p95() {
-    let _scintilla = support::win32::WindowHarness::new().unwrap();
-    let main = TestMain::new();
-    main.make_markdown(&sample_markdown(1_000_000));
+fn one_paragraph_update_p95(main: &TestMain, text: &str) -> u64 {
+    main.make_markdown(text);
     main.command(CommandId::MarkdownPreviewSide);
     let view = main.view().unwrap();
     pump_until("initial render", Duration::from_secs(10), || {
@@ -713,7 +705,7 @@ fn one_paragraph_updates_in_a_1_mb_document_within_2_ms_p95() {
         SendMessageW(
             main.editor,
             crate::editor::scintilla_constants::SCI_GOTOPOS,
-            500_000,
+            text.len() / 2,
             0,
         )
     };
@@ -745,7 +737,30 @@ fn one_paragraph_updates_in_a_1_mb_document_within_2_ms_p95() {
         pump_for(Duration::from_millis(20));
         samples.push(view.stats().last_update_micros);
     }
-    let p95 = p95(samples);
+    p95(samples)
+}
+
+fn p95(mut samples: Vec<u64>) -> u64 {
+    samples.sort_unstable();
+    samples[(samples.len() * 95 / 100).min(samples.len() - 1)]
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+fn opening_a_100_kb_preview_renders_within_50_ms_p95() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let p95 = preview_open_p95(&main, &sample_markdown(100_000));
+    println!("preview open p95: {p95} us");
+    assert!(p95 < 50_000);
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+fn one_paragraph_updates_in_a_1_mb_document_within_2_ms_p95() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let p95 = one_paragraph_update_p95(&main, &sample_markdown(1_000_000));
     println!("incremental update p95: {p95} us");
     assert!(p95 < 2_000);
 }
@@ -891,4 +906,72 @@ fn launching_with_a_markdown_file_loads_no_preview_graphics_library() {
     }
     process.close().unwrap();
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_html_readme_fixture_renders_its_svg_and_toggles_its_section() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let icon = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("fastpad-icon.svg");
+    let fixture = include_str!("../fixtures/html-readme.md")
+        .replace("assets/fastpad-icon.svg", icon.to_str().unwrap());
+    main.make_markdown(&fixture);
+    main.command(CommandId::MarkdownPreviewSide);
+    let view = main.view().unwrap();
+    pump_until("the SVG icon decodes", Duration::from_secs(10), || {
+        view.image_states()
+            .iter()
+            .any(|(path, ready)| path.ends_with("fastpad-icon.svg") && *ready)
+    });
+    let disclosure = || {
+        view.accessible_links()
+            .read()
+            .unwrap()
+            .iter()
+            .find_map(|link| {
+                link.disclosure
+                    .as_ref()
+                    .map(|disclosure| (disclosure.expanded, link.focused))
+            })
+    };
+    for _ in 0..20 {
+        if disclosure().is_some_and(|(_, focused)| focused) {
+            break;
+        }
+        unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_TAB as usize, 0) };
+        pump_pending();
+    }
+    assert_eq!(disclosure(), Some((false, true)), "Tab reaches the section");
+    let collapsed = view.stats().content_height;
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_RETURN as usize, 0) };
+    pump_until("the section expands", Duration::from_secs(3), || {
+        disclosure() == Some((true, true)) && view.stats().content_height > collapsed
+    });
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_RETURN as usize, 0) };
+    pump_until("the section collapses", Duration::from_secs(3), || {
+        disclosure() == Some((false, true))
+    });
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+fn opening_a_100_kb_html_heavy_preview_renders_within_50_ms_p95() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let p95 = preview_open_p95(&main, &html_markdown(100_000));
+    println!("HTML-heavy preview open p95: {p95} us");
+    assert!(p95 < 50_000);
+}
+
+#[test]
+#[ignore = "performance measurement: cargo test --release --test markdown_preview -- --ignored --test-threads=1"]
+fn one_paragraph_update_inside_a_div_spanning_1_mb_is_recorded() {
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let text = format!("<div>\n\n{}\n</div>\n", sample_markdown(1_000_000));
+    let p95 = one_paragraph_update_p95(&main, &text);
+    // No target: an element spanning the document reparses whole on every edit (spec §4.5).
+    println!("update inside a 1 MB div p95: {p95} us");
 }
