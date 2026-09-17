@@ -14,6 +14,14 @@ fn main() {
     {
         return;
     }
+    // `cfg!` in a build script describes the host. A non-Windows host (CI's Linux Clippy
+    // type-check of the MSVC target) has no rc.exe and never links, so the icon is not needed.
+    if !cfg!(windows) {
+        println!(
+            "cargo:warning=skipping the icon resource: rc.exe needs a Windows host (type-check only)"
+        );
+        return;
+    }
 
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));

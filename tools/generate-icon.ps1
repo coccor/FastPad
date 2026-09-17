@@ -10,6 +10,48 @@ $ErrorActionPreference = "Stop"
 
 Add-Type -AssemblyName System.Drawing
 
+# Frames below 256 px are uncompressed 32-bit DIBs. USER32 decodes a PNG-compressed icon frame through
+# WIC, so a PNG frame picked by LoadIconW at startup loads windowscodecs.dll into FastPad (a startup
+# cost, and the Markdown preview's zero-startup-cost guard). Only the 256 px frame, read by Explorer
+# in its own process, stays PNG to keep the executable small.
+function ConvertTo-IconFrame {
+    param([Parameter(Mandatory = $true)] [System.Drawing.Bitmap]$Bitmap)
+
+    $size = $Bitmap.Width
+    $stream = [System.IO.MemoryStream]::new()
+    if ($size -ge 256) {
+        $Bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+        return , $stream.ToArray()
+    }
+    $maskStride = [int][Math]::Floor(($size + 31) / 32) * 4
+    $writer = [System.IO.BinaryWriter]::new($stream)
+    # BITMAPINFOHEADER: the height covers the XOR (color) and AND (mask) bitmaps together.
+    $writer.Write([uint32]40)
+    $writer.Write([int32]$size)
+    $writer.Write([int32]($size * 2))
+    $writer.Write([uint16]1)
+    $writer.Write([uint16]32)
+    $writer.Write([uint32]0)
+    $writer.Write([uint32]($size * $size * 4 + $maskStride * $size))
+    $writer.Write([int32]0)
+    $writer.Write([int32]0)
+    $writer.Write([uint32]0)
+    $writer.Write([uint32]0)
+    # Bottom-up BGRA rows; the alpha channel carries transparency, so the AND mask stays all zero.
+    for ($y = $size - 1; $y -ge 0; $y--) {
+        for ($x = 0; $x -lt $size; $x++) {
+            $pixel = $Bitmap.GetPixel($x, $y)
+            $writer.Write([byte]$pixel.B)
+            $writer.Write([byte]$pixel.G)
+            $writer.Write([byte]$pixel.R)
+            $writer.Write([byte]$pixel.A)
+        }
+    }
+    $writer.Write([byte[]]::new($maskStride * $size))
+    $writer.Flush()
+    return , $stream.ToArray()
+}
+
 function Find-Edge {
     $candidates = @(
         (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"),
@@ -60,9 +102,7 @@ try {
         foreach ($size in $Sizes) {
             $frame = $sheet.Clone([System.Drawing.Rectangle]::new($x, $gap, $size, $size), [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
             try {
-                $stream = [System.IO.MemoryStream]::new()
-                $frame.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-                $entries += [pscustomobject]@{ Size = $size; Png = $stream.ToArray() }
+                $entries += [pscustomobject]@{ Size = $size; Data = (ConvertTo-IconFrame -Bitmap $frame) }
             } finally {
                 $frame.Dispose()
             }
@@ -72,7 +112,7 @@ try {
         $sheet.Dispose()
     }
 
-    # ICO container with PNG-compressed frames (supported since Windows Vista).
+    # ICO container: DIB frames below 256 px, a PNG-compressed 256 px frame (supported since Vista).
     $file = [System.IO.MemoryStream]::new()
     $writer = [System.IO.BinaryWriter]::new($file)
     $writer.Write([uint16]0)
@@ -87,12 +127,12 @@ try {
         $writer.Write([byte]0)
         $writer.Write([uint16]1)
         $writer.Write([uint16]32)
-        $writer.Write([uint32]$entry.Png.Length)
+        $writer.Write([uint32]$entry.Data.Length)
         $writer.Write([uint32]$offset)
-        $offset += $entry.Png.Length
+        $offset += $entry.Data.Length
     }
     foreach ($entry in $entries) {
-        $writer.Write($entry.Png)
+        $writer.Write($entry.Data)
     }
     $writer.Flush()
     [System.IO.File]::WriteAllBytes($outputPath, $file.ToArray())

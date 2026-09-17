@@ -1,0 +1,110 @@
+name: release
+
+# Push a tag named v<Cargo.toml version> (for example v0.1.0) to build, verify, and attach the portable
+# ZIP and the per-user installer to a draft GitHub release. Publishing that draft triggers
+# publish-manifests.yml (Scoop and winget).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      # Code signing turns on when the repository variable ARTIFACT_SIGNING_ACCOUNT is set; see
+      # docs/distribution.md.
+      SIGNING: ${{ vars.ARTIFACT_SIGNING_ACCOUNT != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the Cargo.toml version
+        id: version
+        shell: pwsh
+        run: |
+          . ./tools/package-layout.ps1
+          if ("${{ github.ref_name }}" -ne "v$PackageVersion") {
+            throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $PackageVersion (expected v$PackageVersion)."
+          }
+          "version=$PackageVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Cache pinned native source archives
+        uses: actions/cache@v4
+        with:
+          path: native/cache
+          key: native-archives-${{ hashFiles('native/dependencies.json') }}
+
+      - name: Configure Azure Artifact Signing
+        if: env.SIGNING == 'true'
+        shell: pwsh
+        env:
+          CLIENT_VERSION: "1.0.128"
+          ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "artifact-signing"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $package = Join-Path $root "client.zip"
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.ArtifactSigning.Client/$env:CLIENT_VERSION" -OutFile $package
+          Expand-Archive -LiteralPath $package -DestinationPath (Join-Path $root "client")
+          $metadata = Join-Path $root "metadata.json"
+          @{ Endpoint = $env:ENDPOINT; CodeSigningAccountName = $env:ACCOUNT; CertificateProfileName = $env:PROFILE } |
+            ConvertTo-Json | Set-Content -LiteralPath $metadata -Encoding utf8NoBOM
+          "FASTPAD_SIGNING_DLIB=$(Join-Path $root 'client\bin\x64\Azure.CodeSigning.Dlib.dll')" >> $env:GITHUB_ENV
+          "FASTPAD_SIGNING_METADATA=$metadata" >> $env:GITHUB_ENV
+
+      - name: Build portable ZIP
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: ./tools/package.ps1
+
+      - name: Verify portable ZIP
+        shell: pwsh
+        run: ./tools/verify-package.ps1 -RequireSignature:$${{ env.SIGNING }}
+
+      - name: Ensure Inno Setup is available
+        shell: pwsh
+        run: ./tools/install-inno-setup.ps1
+
+      - name: Build per-user installer
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: ./tools/package-installer.ps1
+
+      - name: Verify per-user installer
+        shell: pwsh
+        run: ./tools/verify-installer.ps1 -RequireSignature:$${{ env.SIGNING }}
+
+      - name: Create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $zip = "dist/FastPad-$env:VERSION-windows-x64.zip"
+          $setup = "dist/FastPad-$env:VERSION-windows-x64-setup.exe"
+          $sums = "dist/SHA256SUMS.txt"
+          $lines = foreach ($file in @($zip, $setup)) {
+            "$((Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant())  $(Split-Path -Leaf $file)"
+          }
+          Set-Content -LiteralPath $sums -Value $lines -Encoding utf8NoBOM
+          $flags = @("--draft", "--verify-tag", "--generate-notes", "--title", "FastPad $env:VERSION")
+          if ($env:VERSION -match '-') { $flags += "--prerelease" }
+          gh release create "${{ github.ref_name }}" @flags $zip $setup $sums
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed." }

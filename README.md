@@ -5,13 +5,45 @@ Win32 application written in Rust on top of Scintilla and Lexilla, with no UI fr
 runtime, no background service, and no network access. The window accepts typing before optional
 work such as settings, file loading, syntax highlighting, and crash recovery has finished.
 
-## Portable ZIP
+FastPad is released under the MIT License (`LICENSE`).
 
-`FastPad-0.1.0-windows-x64.zip` contains:
+## Install
+
+Every [GitHub release](https://github.com/coccor/FastPad/releases) has the same build in two forms,
+plus `SHA256SUMS.txt`. Pick one:
+
+| Method | Command or download | What you get |
+|---|---|---|
+| winget | `winget install coccor.FastPad` | The per-user installer, run silently; `winget upgrade` updates it |
+| Scoop | `scoop bucket add fastpad https://github.com/coccor/FastPad`<br>`scoop install fastpad/fastpad` | The portable ZIP in `~\scoop\apps`, a Start menu shortcut, and a `fastpad` command |
+| Installer | `FastPad-<version>-windows-x64-setup.exe` | Per-user install, no administrator prompt (see below) |
+| Portable | `FastPad-<version>-windows-x64.zip` | Extract anywhere and run `FastPad.exe` |
+
+Settings and crash-recovery snapshots always live in `%LocalAppData%\FastPad`, so switching between
+methods keeps them, and uninstalling does not delete them.
+
+### Per-user installer
+
+Installs into `%LocalAppData%\Programs\FastPad` without elevation and writes only per-user registry
+keys: an uninstall entry, a Start menu shortcut, `fastpad` for Win+R, and FastPad in the "Open with"
+list for `.txt`, `.md`, `.markdown`, `.json`, `.log`, and `.ini` files (your default apps are not
+changed). Optional tasks add a desktop shortcut and "Edit with FastPad" to every file's context menu.
+Uninstall it from Settings > Apps. For unattended installs:
+
+```powershell
+FastPad-<version>-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /TASKS="contextmenu"
+```
+
+`/ALLUSERS` installs for every user into Program Files instead (requires elevation).
+
+### Portable ZIP
+
+`FastPad-<version>-windows-x64.zip` contains:
 
 - `FastPad.exe`
 - `Scintilla.dll` and `Lexilla.dll` (built from the pinned Scintilla 5.6.6 and Lexilla 5.5.3 sources)
-- `README.md`, `LICENSES.md`, and `licenses\` (Scintilla, Lexilla, and linked Rust crate license texts)
+- `README.md`, `LICENSE`, `LICENSES.md`, and `licenses\` (Scintilla, Lexilla, and linked Rust crate
+  license texts)
 
 Extract the ZIP to any folder and run `FastPad.exe`. Keep the two DLLs beside the executable;
 FastPad loads them only from its own folder. Nothing is installed and no registry keys are written.
@@ -92,10 +124,12 @@ pwsh -File tools/build-native.ps1           # build the DLLs into native\out\x64
 cargo build --release
 cargo test -- --test-threads=1              # Windows integration tests must run serially
 pwsh -File tools/audit-dependencies.ps1     # allow only the windows-sys/serde_json closure
-pwsh -File tools/package.ps1                # dist\FastPad-0.1.0-windows-x64.zip
+pwsh -File tools/package.ps1                # dist\FastPad-<version>-windows-x64.zip
 pwsh -File tools/verify-package.ps1         # add -RequireSignature for signed release builds
+pwsh -File tools/package-installer.ps1      # dist\FastPad-<version>-windows-x64-setup.exe (Inno Setup 6)
+pwsh -File tools/verify-installer.ps1       # silent install, registration checks, uninstall
 ```
 
-`tools/package.ps1` signs the binaries when `FASTPAD_SIGNING_CERTIFICATE` is set to a certificate
-thumbprint or PFX path (`FASTPAD_SIGNING_PASSWORD` and `FASTPAD_TIMESTAMP_URL` are optional).
-Startup benchmarking is described in `benchmarks/README.md`.
+The version comes from `Cargo.toml`. Code signing is configured through environment variables
+described in `tools/signing.ps1`. Releasing, signing, and the Scoop and winget manifests are covered
+in `docs/distribution.md`. Startup benchmarking is described in `benchmarks/README.md`.

@@ -2,9 +2,8 @@
 
 ## FastPad
 
-FastPad source code and `FastPad.exe`: no license has been declared yet (`Cargo.toml` has no
-`license` field). All rights are reserved by the FastPad authors until the project owner publishes a
-license.
+FastPad source code and `FastPad.exe`: MIT License, Copyright (c) 2026 Cocioaba Cornel. The full
+text is in `LICENSE`.
 
 ## Native components
 

@@ -1,12 +1,30 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$PackageName = "FastPad-0.1.0-windows-x64"
+function Get-FastPadVersion {
+    $manifest = Join-Path (Split-Path -Parent $PSScriptRoot) "Cargo.toml"
+    $inPackage = $false
+    foreach ($line in [System.IO.File]::ReadAllLines($manifest)) {
+        if ($line -match '^\s*\[(.+)\]\s*$') {
+            $inPackage = $Matches[1] -eq "package"
+        }
+        elseif ($inPackage -and $line -match '^\s*version\s*=\s*"([^"]+)"') {
+            return $Matches[1]
+        }
+    }
+    throw "No [package] version was found in '$manifest'."
+}
+
+# Cargo.toml is the single source of the release version.
+$PackageVersion = Get-FastPadVersion
+$PackageName = "FastPad-$PackageVersion-windows-x64"
+$InstallerName = "FastPad-$PackageVersion-windows-x64-setup"
 $PackageFiles = @(
     "FastPad.exe",
     "Scintilla.dll",
     "Lexilla.dll",
     "README.md",
+    "LICENSE",
     "LICENSES.md",
     "licenses\Scintilla.txt",
     "licenses\Lexilla.txt",

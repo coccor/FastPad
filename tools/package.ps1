@@ -10,6 +10,7 @@ $ErrorActionPreference = "Stop"
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "msvc.ps1")
 . (Join-Path $PSScriptRoot "package-layout.ps1")
+. (Join-Path $PSScriptRoot "signing.ps1")
 
 $Target = "x86_64-pc-windows-msvc"
 $DistRoot = Join-Path $RepositoryRoot "dist"
@@ -57,6 +58,7 @@ $Sources = [ordered]@{
     "Scintilla.dll"          = Join-Path $NativeOutput "Scintilla.dll"
     "Lexilla.dll"            = Join-Path $NativeOutput "Lexilla.dll"
     "README.md"              = Join-Path $RepositoryRoot "README.md"
+    "LICENSE"                = Join-Path $RepositoryRoot "LICENSE"
     "LICENSES.md"            = Join-Path $RepositoryRoot "LICENSES.md"
     "licenses\Scintilla.txt" = Join-Path $RepositoryRoot "licenses\Scintilla.txt"
     "licenses\Lexilla.txt"   = Join-Path $RepositoryRoot "licenses\Lexilla.txt"
@@ -95,42 +97,18 @@ foreach ($binary in $PackageBinaries) {
     Assert-NoDynamicCrtImports -Dumpbin $Dumpbin -Path (Join-Path $StageRoot $binary)
 }
 
-if ($env:FASTPAD_SIGNING_CERTIFICATE) {
-    $signTool = Find-SignTool
-    $signArguments = @("sign", "/fd", "SHA256")
-    if ($env:FASTPAD_SIGNING_CERTIFICATE -match '^[0-9A-Fa-f]{40}$') {
-        $signArguments += @("/sha1", $env:FASTPAD_SIGNING_CERTIFICATE)
-    }
-    elseif (Test-Path -LiteralPath $env:FASTPAD_SIGNING_CERTIFICATE -PathType Leaf) {
-        $signArguments += @("/f", $env:FASTPAD_SIGNING_CERTIFICATE)
-        if ($env:FASTPAD_SIGNING_PASSWORD) {
-            $signArguments += @("/p", $env:FASTPAD_SIGNING_PASSWORD)
-        }
-    }
-    else {
-        throw "FASTPAD_SIGNING_CERTIFICATE must be a certificate SHA-1 thumbprint or a PFX file path."
-    }
-    if ($env:FASTPAD_TIMESTAMP_URL) {
-        $signArguments += @("/tr", $env:FASTPAD_TIMESTAMP_URL, "/td", "SHA256")
-    }
-    $binaries = @($PackageBinaries | ForEach-Object { Join-Path $StageRoot $_ })
-    & $signTool @signArguments @binaries
-    if ($LASTEXITCODE -ne 0) {
-        throw "signtool sign failed."
-    }
-    & $signTool verify /pa @binaries
-    if ($LASTEXITCODE -ne 0) {
-        throw "signtool verify failed after signing."
-    }
+$Signed = Test-CodeSigningConfigured
+if ($Signed) {
+    Invoke-CodeSigning -Paths @($PackageBinaries | ForEach-Object { Join-Path $StageRoot $_ })
 }
 else {
-    Write-Warning "FASTPAD_SIGNING_CERTIFICATE is not set; the package binaries are unsigned."
+    Write-Warning "No code signing is configured (see tools/signing.ps1); the package binaries are unsigned."
 }
 
 $hashLines = foreach ($relative in $PackageFiles) {
     $staged = Join-Path $StageRoot $relative
     $stagedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $staged).Hash.ToLowerInvariant()
-    if (-not ($PackageBinaries -contains $relative) -or -not $env:FASTPAD_SIGNING_CERTIFICATE) {
+    if (-not ($PackageBinaries -contains $relative) -or -not $Signed) {
         $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Sources[$relative]).Hash.ToLowerInvariant()
         if ($stagedHash -ne $sourceHash) {
             throw "Staged '$relative' does not match its source hash."

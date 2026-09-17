@@ -2,6 +2,9 @@
 name = "fastpad"
 version = "0.1.0"
 edition = "2024"
+description = "A startup-latency-first text editor for Windows"
+license = "MIT"
+repository = "https://github.com/coccor/FastPad"
 
 [dependencies]
 serde_json = "=1.0.151"
