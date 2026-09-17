@@ -1,34 +1,66 @@
+<div align="center">
+
+<img src="assets/fastpad-icon.svg" alt="FastPad" width="96" height="96">
+
 # FastPad
 
-FastPad is a startup-latency-first text editor for Windows 10 and Windows 11 x64. It is a native
-Win32 application written in Rust on top of Scintilla and Lexilla, with no UI framework, no browser
-runtime, no background service, and no network access. The window accepts typing before optional
-work such as settings, file loading, syntax highlighting, and crash recovery has finished.
+**The text editor that's ready before you are.**
 
-FastPad is released under the MIT License (`LICENSE`).
+Click it, type. No splash screen, no spinner, no "loading extensions".
+A native Windows editor for the notes, logs, configs, JSON and Markdown you open fifty times a day.
 
-## Install
+[![Latest release](https://img.shields.io/github/v/release/coccor/FastPad?label=release)](https://github.com/coccor/FastPad/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Windows 10 | 11 x64](https://img.shields.io/badge/Windows-10%20%7C%2011%20x64-0078D4)
+[![Downloads](https://img.shields.io/github/downloads/coccor/FastPad/total)](https://github.com/coccor/FastPad/releases)
 
-Every [GitHub release](https://github.com/coccor/FastPad/releases) has the same build in two forms,
-plus `SHA256SUMS.txt`. Pick one:
+[**Download**](https://github.com/coccor/FastPad/releases/latest) · [Install](#install-in-10-seconds) · [Features](#everything-you-reach-for-nothing-you-dont) · [Shortcuts](#keyboard-shortcuts)
 
-| Method | Command or download | What you get |
+<img src="docs/images/hero.png" alt="FastPad editing Markdown with the live preview open side by side" width="900">
+
+</div>
+
+## Why FastPad
+
+Most editors make you wait for everything before you can do anything. FastPad turns that around:
+the window takes your keystrokes first, and settings, file loading, syntax highlighting and crash
+recovery catch up behind you.
+
+- **Typing in about 60 ms.** From launch to your first character on screen, measured over repeated
+  warm launches on a 2014 Intel Core i5-4590 desktop ([how we measure](benchmarks/README.md)).
+- **About 2 MB of memory at idle.** Leave it open all day and forget it's there.
+- **A 1.7 MB download.** One executable and two DLLs. No runtime, no framework, no Electron.
+- **Your text never leaves your PC.** No network access, no telemetry, no account, no background
+  service. Links you click open in your browser; nothing else goes online.
+- **Never lose a word.** Unsaved work is snapshotted while you type and comes back after a crash or
+  power cut.
+
+Written in Rust directly on Win32, with the battle-tested
+[Scintilla](https://www.scintilla.org/) editing engine underneath.
+
+## Install in 10 seconds
+
+```powershell
+winget install coccor.FastPad
+```
+
+<details>
+<summary><b>Other ways to install</b>: Scoop, installer, portable ZIP</summary>
+
+| Method | How | What you get |
 |---|---|---|
-| winget | `winget install coccor.FastPad` | The per-user installer, run silently; `winget upgrade` updates it |
-| Scoop | `scoop bucket add fastpad https://github.com/coccor/FastPad`<br>`scoop install fastpad/fastpad` | The portable ZIP in `~\scoop\apps`, a Start menu shortcut, and a `fastpad` command |
-| Installer | `FastPad-<version>-windows-x64-setup.exe` | Per-user install, no administrator prompt (see below) |
-| Portable | `FastPad-<version>-windows-x64.zip` | Extract anywhere and run `FastPad.exe` |
+| **winget** | `winget install coccor.FastPad` | Per-user install; `winget upgrade` keeps it current |
+| **Scoop** | `scoop bucket add fastpad https://github.com/coccor/FastPad`<br>`scoop install fastpad/fastpad` | Portable install, Start menu shortcut, `fastpad` command |
+| **Installer** | [`FastPad-<version>-windows-x64-setup.exe`](https://github.com/coccor/FastPad/releases/latest) | Per-user install, no administrator prompt |
+| **Portable** | [`FastPad-<version>-windows-x64.zip`](https://github.com/coccor/FastPad/releases/latest) | Extract anywhere, run `FastPad.exe`; nothing written to the registry |
 
-Settings and crash-recovery snapshots always live in `%LocalAppData%\FastPad`, so switching between
-methods keeps them, and uninstalling does not delete them.
+Every release publishes `SHA256SUMS.txt` so you can verify what you downloaded.
 
-### Per-user installer
-
-Installs into `%LocalAppData%\Programs\FastPad` without elevation and writes only per-user registry
-keys: an uninstall entry, a Start menu shortcut, `fastpad` for Win+R, and FastPad in the "Open with"
-list for `.txt`, `.md`, `.markdown`, `.json`, `.log`, and `.ini` files (your default apps are not
-changed). Optional tasks add a desktop shortcut and "Edit with FastPad" to every file's context menu.
-Uninstall it from Settings > Apps. For unattended installs:
+**The installer** puts FastPad in `%LocalAppData%\Programs\FastPad` and only touches your own user
+registry: an uninstall entry, a Start menu shortcut, `fastpad` for Win+R, and FastPad in the
+"Open with" list for `.txt`, `.md`, `.markdown`, `.json`, `.log` and `.ini`. Your default apps are
+never changed. Optional extras: a desktop shortcut and "Edit with FastPad" on every file's right-click
+menu. Uninstall from Settings > Apps. Unattended install:
 
 ```powershell
 FastPad-<version>-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /TASKS="contextmenu"
@@ -36,17 +68,110 @@ FastPad-<version>-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /TASKS="co
 
 `/ALLUSERS` installs for every user into Program Files instead (requires elevation).
 
-### Portable ZIP
+**The portable ZIP** holds `FastPad.exe`, `Scintilla.dll` and `Lexilla.dll` (keep them together),
+plus `README.md`, `LICENSE`, `LICENSES.md` and `licenses\`.
 
-`FastPad-<version>-windows-x64.zip` contains:
+Settings and recovery snapshots live in `%LocalAppData%\FastPad` whichever way you install, so you
+can switch methods without losing them, and uninstalling keeps them.
 
-- `FastPad.exe`
-- `Scintilla.dll` and `Lexilla.dll` (built from the pinned Scintilla 5.6.6 and Lexilla 5.5.3 sources)
-- `README.md`, `LICENSE`, `LICENSES.md`, and `licenses\` (Scintilla, Lexilla, and linked Rust crate
-  license texts)
+</details>
 
-Extract the ZIP to any folder and run `FastPad.exe`. Keep the two DLLs beside the executable;
-FastPad loads them only from its own folder. Nothing is installed and no registry keys are written.
+> **"Windows protected your PC"?** Current releases aren't code-signed yet, so SmartScreen may warn
+> on first run. Choose **More info > Run anyway**, or check the file against `SHA256SUMS.txt` first.
+
+## Everything you reach for. Nothing you don't.
+
+### Markdown with a live preview
+
+<img src="docs/images/markdown-preview.png" alt="Markdown source and rendered preview side by side" width="800">
+
+Write on the left, see it rendered on the right. FastPad draws GitHub-flavored Markdown natively
+(tables, task lists, strikethrough, code blocks and local images) and updates moments after you stop
+typing. Both panes scroll together.
+
+- **Ctrl+Shift+V** cycles between no preview, side by side and full width.
+- Drag the divider to resize; double-click it to reset.
+- Links just work: web links open in your browser, `#headings` jump inside the preview, and links to
+  local files open in a new FastPad tab.
+- Privacy by design: only local images are shown, and nothing is fetched from the internet.
+- The preview's graphics stack loads the first time you open a preview, so it never slows startup.
+
+### JSON you can trust
+
+<img src="docs/images/json.png" alt="A formatted JSON document with syntax highlighting" width="800">
+
+Syntax highlighting as soon as you open a `.json` file. **Validate JSON** points to the exact line
+and column of a mistake; **Format JSON** (Ctrl+Shift+F) pretty-prints the whole document in one step you can undo. Neither will touch a
+file that doesn't parse.
+
+### Tabs, done right
+
+Open as many files as you like in one window. **Ctrl+Tab** and **Ctrl+1…9** to jump, double-click
+the empty tab bar for a new tab, scroll the wheel over the tabs to browse them. Open a file from
+Explorer or the command line and it lands as a tab in the FastPad window you already have open, not
+in a new window.
+
+### A command palette for everything
+
+<img src="docs/images/command-palette.png" alt="The command palette filtering theme commands" width="800">
+
+**Ctrl+Shift+P** and start typing. Switch theme, toggle word wrap or line numbers, change font size
+or tab width, all without leaving the keyboard. Every change is saved instantly.
+
+### Themes that match your desk
+
+<img src="docs/images/themes.png" alt="FastPad in light, dark and Catppuccin Mocha themes" width="800">
+
+Light, dark, or **System** to follow Windows as it switches. Plus all four
+[Catppuccin](https://catppuccin.com/) flavors (Latte, Frappé, Macchiato, Mocha), or plain
+`catppuccin` to pick Latte by day and Mocha by night. Windows high contrast is always respected.
+
+### Crash recovery that just works
+
+FastPad quietly snapshots unsaved documents every 30 seconds while you edit. If your PC crashes,
+loses power or reboots for an update, the next launch brings your work back as unsaved tabs. Saving
+or discarding a recovered tab cleans up after itself.
+
+### And the details you'd expect
+
+- **Safe saves.** Files are written to a temporary copy and swapped into place, so a failed save never
+  leaves you with a half-written file.
+- **Encodings preserved.** UTF-8, UTF-8 with BOM, UTF-16 LE and UTF-16 BE are detected on open and
+  kept on save.
+- **Find and replace**, zoom, word wrap, line numbers, and left-to-right or right-to-left text.
+- **Screen-reader friendly links.** Links in the Markdown preview are exposed to assistive
+  technology and can be followed from it.
+
+## Keyboard shortcuts
+
+| Action | Shortcut | | Action | Shortcut |
+|---|---|---|---|---|
+| New tab | `Ctrl+N` or `Ctrl+T` | | Command palette | `Ctrl+Shift+P` |
+| Open | `Ctrl+O` | | Markdown preview modes | `Ctrl+Shift+V` |
+| Save | `Ctrl+S` | | Format JSON | `Ctrl+Shift+F` |
+| Save as | `Ctrl+Shift+S` | | Word wrap | `Alt+Z` |
+| Find | `Ctrl+F` | | Zoom in / out / reset | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
+| Replace | `Ctrl+H` | | Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Undo / redo | `Ctrl+Z` / `Ctrl+Y` | | Go to tab 1–9 | `Ctrl+1` … `Ctrl+9` |
+| Left-to-right text | `Ctrl+L` | | Right-to-left text | `Ctrl+R` |
+
+## Make it yours
+
+Everything in the command palette is saved to `%LocalAppData%\FastPad\fastpad.ini`. You can also
+edit it by hand: one `key=value` per line. A typo never blocks startup; FastPad points out the bad
+line in a notification and applies the rest.
+
+| Key | Values | Default |
+|---|---|---|
+| `font_face` | Any installed font name | `Consolas` |
+| `font_size` | Points (positive integer) | `11` |
+| `tab_width` | 1–255 | `4` |
+| `word_wrap` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
+| `line_numbers` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
+| `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
+| `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
+
+Hand edits keep your comments and other lines; the palette rewrites only the line it changes.
 
 ## Command line
 
@@ -54,64 +179,31 @@ FastPad loads them only from its own folder. Nothing is installed and no registr
 FastPad.exe [--new-window] [path]
 ```
 
-- With no flags, a launch hands its file (if any) to an already-running FastPad window in the same
-  Windows session and exits. If no FastPad is running, it becomes the new primary window.
-- `--new-window` always starts an independent FastPad process and window.
-- `path` opens one file after the window is ready for input. JSON (`.json`) and Markdown (`.md`)
-  files get syntax highlighting.
-- `--diagnostic` is used by the startup benchmark harness and is not needed for normal use.
+- `FastPad.exe notes.md` opens the file in your running FastPad window, or starts FastPad if none is
+  open.
+- `--new-window` always starts a separate, independent window.
+- `--diagnostic` is for the startup benchmark harness; you don't need it.
 
-## Settings
+## FAQ
 
-Settings are read after the window appears from `%LocalAppData%\FastPad\fastpad.ini`. The file is
-optional; each line is `key=value`. Invalid or unknown lines are reported in a non-blocking
-notification and every valid line still applies.
+**Is it really free?** Yes. FastPad is open source under the MIT License, with no paid tier, no ads
+and no data collection.
 
-| Key | Values | Default |
-|---|---|---|
-| `font_face` | Any non-empty font name | `Consolas` |
-| `font_size` | Positive integer (points) | `11` |
-| `tab_width` | Integer 1-255 | `4` |
-| `word_wrap` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
-| `line_numbers` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
-| `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
-| `recovery_interval_seconds` | Positive integer | `30` |
+**Does it replace Notepad?** It sits alongside it. The installer adds FastPad to "Open with" for
+common text formats without taking over your defaults, and you can make it the default for any file
+type from Windows Settings.
 
-`system` and `catppuccin` follow the Windows light/dark app setting (`catppuccin` uses Latte when
-light and Mocha when dark); the other themes are fixed. Windows high contrast always overrides the
-configured theme.
+**Why the SmartScreen warning?** New, unsigned apps have no reputation with Microsoft yet. Code signing
+is on the way; until then, every release publishes SHA-256 checksums you can verify.
 
-The command palette (Ctrl+Shift+P) changes the theme, word wrap (also Alt+Z), line numbers, font
-size (6-72 pt) and tab width (2, 4 or 8) while FastPad runs. Each change is written back to
-`fastpad.ini` immediately, rewriting only that key's line; comments and other lines are kept.
+**Can I use it on Windows on ARM or 32-bit Windows?** Not yet. Current builds are Windows 10 and 11
+x64.
 
-## Crash recovery
+## Help FastPad grow
 
-While you edit, FastPad periodically writes snapshots of unsaved documents to
-`%LocalAppData%\FastPad\Recovery` (`*.fps` files). After a crash, the next launch reopens them as
-unsaved tabs. Saving or discarding a recovered tab removes its snapshot; malformed snapshots are
-renamed with an `.invalid` suffix instead of being opened.
-
-## JSON tools
-
-Validate JSON and Format JSON run only when you choose them. They never modify a document that does
-not parse, and formatting is a single undo step.
-
-## Markdown preview
-
-Markdown tabs show two buttons at the right of the title strip: **Open Preview to the Side** and
-**Open Preview**. Ctrl+Shift+V cycles between no preview, side by side, and full width; the View
-menu and command palette have the same commands. Esc in the full-width preview returns to side by
-side. Drag the divider to resize the panes (double-click resets it).
-
-The preview renders GitHub-flavored Markdown natively (tables, task lists, strikethrough, code
-blocks, images) and updates shortly after you stop typing. Scrolling either pane scrolls the other.
-Only local images are shown. Links open when clicked: web and mail links in your default browser,
-`#anchors` inside the preview, and local files in a FastPad tab. Nothing is loaded from the
-network. Files larger than 10 MB pause live updates; click the bar at the top of the preview to
-refresh it.
-
-The preview's graphics libraries load only when a preview is first opened, so startup is unchanged.
+If FastPad saves you a few seconds a day, **[star it on GitHub](https://github.com/coccor/FastPad)**.
+It's the single best way to help others find it. Found a bug or missing something?
+[Open an issue](https://github.com/coccor/FastPad/issues).
 
 ## Building from source
 
@@ -130,6 +222,11 @@ pwsh -File tools/package-installer.ps1      # dist\FastPad-<version>-windows-x64
 pwsh -File tools/verify-installer.ps1       # silent install, registration checks, uninstall
 ```
 
-The version comes from `Cargo.toml`. Code signing is configured through environment variables
-described in `tools/signing.ps1`. Releasing, signing, and the Scoop and winget manifests are covered
-in `docs/distribution.md`. Startup benchmarking is described in `benchmarks/README.md`.
+The version comes from `Cargo.toml`. Releasing, code signing, and the Scoop and winget manifests are
+covered in [`docs/distribution.md`](docs/distribution.md); startup benchmarking in
+[`benchmarks/README.md`](benchmarks/README.md).
+
+## License
+
+FastPad is released under the [MIT License](LICENSE). Scintilla, Lexilla and the Rust crates it
+links are listed with their licenses in [`LICENSES.md`](LICENSES.md).
