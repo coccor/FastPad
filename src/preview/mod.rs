@@ -13,6 +13,7 @@ pub mod inline_object;
 pub mod layout;
 pub mod links;
 pub mod model;
+pub mod outline;
 pub mod render;
 pub mod svg;
 pub mod view;

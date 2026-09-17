@@ -446,6 +446,8 @@ mod tests {
                 text: "site".into(),
                 dest: "https://x.dev".into(),
                 rect,
+                disclosure: None,
+                focused: false,
             },
             VisibleLink {
                 text: "notes".into(),
@@ -455,6 +457,8 @@ mod tests {
                     bottom: 60,
                     ..rect
                 },
+                disclosure: None,
+                focused: false,
             },
         ]))
     }

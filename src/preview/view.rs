@@ -10,10 +10,9 @@ use crate::preview::heights::{HeightIndex, estimate_height, line_for_offset, off
 use crate::preview::images::ImageCache;
 use crate::preview::incremental::{Edit, PreviewDocument, SourceText, Update};
 use crate::preview::layout::{
-    LaidBlock, LayoutContext, PreviewFonts, block_has_link, layout_block,
+    LaidBlock, LayoutContext, PreviewFonts, Target, TargetKind, block_has_target, layout_block,
 };
-use crate::preview::links::SlugSet;
-use crate::preview::model::BlockKind;
+use crate::preview::outline::{self, DetailsKey, Outline, details_open_attribute, has_details};
 use crate::preview::render::{Brushes, color_f, create_hwnd_target, draw_ops};
 use crate::window::{
     WM_FASTPAD_PREVIEW_ACTIVATE, WM_FASTPAD_PREVIEW_ESCAPE, WM_FASTPAD_PREVIEW_HOVER,
@@ -39,7 +38,7 @@ use windows_sys::Win32::UI::Controls::{SetScrollInfo, SetWindowTheme, WM_MOUSELE
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_TAB, VK_UP,
+    VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DLGC_WANTALLKEYS, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
@@ -69,15 +68,29 @@ pub struct PreviewStats {
     pub last_update_micros: u64,
     /// Updates whose frame has been painted; `last_update_micros` belongs to the latest one.
     pub painted_updates: u64,
+    /// The document's laid-out height in DIPs as of the last paint.
+    pub content_height: f32,
 }
 
-/// `Debug`, `PartialEq`, and `Eq` are written by hand: windows-sys `RECT` derives none of them.
+/// A disclosure's identity and state, as a snapshot for accessibility clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disclosure {
+    pub key: DetailsKey,
+    pub expanded: bool,
+}
+
+/// A link or disclosure on screen. `Debug`, `PartialEq`, and `Eq` are written by hand: windows-sys
+/// `RECT` derives none of them.
 #[derive(Clone)]
 pub struct VisibleLink {
     pub text: String,
+    /// Empty for a disclosure.
     pub dest: String,
-    /// Client pixels of the link's first line.
+    /// Client pixels of the target's first line.
     pub rect: RECT,
+    pub disclosure: Option<Disclosure>,
+    /// Whether keyboard focus is on this target.
+    pub focused: bool,
 }
 
 impl std::fmt::Debug for VisibleLink {
@@ -93,6 +106,8 @@ impl std::fmt::Debug for VisibleLink {
             .field("text", &self.text)
             .field("dest", &self.dest)
             .field("rect", &(left, top, right, bottom))
+            .field("disclosure", &self.disclosure)
+            .field("focused", &self.focused)
             .finish()
     }
 }
@@ -100,7 +115,11 @@ impl std::fmt::Debug for VisibleLink {
 impl PartialEq for VisibleLink {
     fn eq(&self, other: &Self) -> bool {
         let rect = |rect: &RECT| (rect.left, rect.top, rect.right, rect.bottom);
-        self.text == other.text && self.dest == other.dest && rect(&self.rect) == rect(&other.rect)
+        self.text == other.text
+            && self.dest == other.dest
+            && rect(&self.rect) == rect(&other.rect)
+            && self.disclosure == other.disclosure
+            && self.focused == other.focused
     }
 }
 
@@ -141,9 +160,11 @@ struct ViewState {
     live_resize: bool,
     /// Set after a failed paint schedules its one retry; cleared by the next successful paint.
     paint_retried: bool,
-    /// Heading slugs and their block indices; `None` until an anchor lookup needs them after the
-    /// document changed.
-    anchors: Option<Vec<(String, usize)>>,
+    /// Section keys and heading anchors; `None` until something needs them after the document
+    /// changed.
+    outline: Option<Outline>,
+    /// `<details>` sections the user toggled away from their `open` attribute.
+    details_overrides: HashMap<DetailsKey, bool>,
     stats: PreviewStats,
     opened_at: Option<Instant>,
     update_started: Option<Instant>,
@@ -191,7 +212,8 @@ impl PreviewView {
             paused: false,
             live_resize: false,
             paint_retried: false,
-            anchors: None,
+            outline: None,
+            details_overrides: HashMap::new(),
             stats: PreviewStats::default(),
             opened_at: None,
             update_started: None,
@@ -223,6 +245,7 @@ impl PreviewView {
             state.document = document;
             state.document_dir = document_dir;
             state.scroll_y = 0.0;
+            state.details_overrides.clear();
             // The snapshot describes the old document until the next paint; accessibility clients
             // must not see its links in the meantime.
             state
@@ -342,14 +365,47 @@ impl PreviewView {
 
     pub fn scroll_to_anchor(&self, anchor: &str) -> bool {
         self.with(|state| {
-            let Some(index) = anchors(state)
+            let Some(found) = outline(state)
+                .anchors
                 .iter()
-                .find(|(slug, _)| slug == anchor)
-                .map(|(_, index)| *index)
+                .find(|entry| entry.slug == anchor)
+                .cloned()
             else {
                 return false;
             };
-            let top = state.heights.top(index);
+            // Chrome and Edge open every section around the target before scrolling to it.
+            let keys = outline(state).details[found.block].clone();
+            let mut opened = false;
+            for &index in &found.enclosing {
+                let default =
+                    details_open_attribute(&state.document.blocks[found.block].kind, index)
+                        .unwrap_or(false);
+                if !state
+                    .details_overrides
+                    .get(&keys[index])
+                    .copied()
+                    .unwrap_or(default)
+                {
+                    set_details_open(state, &keys[index], default, true);
+                    opened = true;
+                }
+            }
+            if opened {
+                state.layouts[found.block] = None;
+            }
+            let reading = state.heights.anchor(state.scroll_y);
+            if matches!(ensure_layouts(state, &[found.block]), Ok(true)) {
+                state.scroll_y = state.heights.scroll_for_anchor(reading);
+            }
+            let within = state.layouts[found.block]
+                .as_ref()
+                .and_then(|laid| {
+                    laid.headings
+                        .iter()
+                        .find(|(heading, _)| *heading == found.heading)
+                })
+                .map_or(0.0, |(_, y)| *y);
+            let top = state.heights.top(found.block) + within;
             set_scroll(state, top, true);
             true
         })
@@ -369,7 +425,8 @@ impl PreviewView {
             state.hover = None;
             state.pressed = None;
             state.focus = None;
-            state.anchors = None;
+            state.outline = None;
+            state.details_overrides = HashMap::new();
             state.update_started = None;
             state.stats.block_count = 0;
             state.images.clear();
@@ -478,20 +535,10 @@ fn estimates(state: &ViewState, range: std::ops::Range<usize>) -> Vec<f32> {
         .collect()
 }
 
-fn anchors(state: &mut ViewState) -> &[(String, usize)] {
-    state.anchors.get_or_insert_with(|| {
-        let mut slugs = SlugSet::default();
-        state
-            .document
-            .blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, block)| match &block.kind {
-                BlockKind::Heading { text, .. } => Some((slugs.unique(text.plain_text()), index)),
-                _ => None,
-            })
-            .collect()
-    })
+fn outline(state: &mut ViewState) -> &Outline {
+    state
+        .outline
+        .get_or_insert_with(|| outline::build(&state.document.blocks))
 }
 
 /// Forgets every layout for a new document: heights fall back to estimates.
@@ -570,9 +617,8 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
             on_screen || old.len() != new.len() || total_changed
         }
     };
-    // Rebuilt on the next anchor lookup: slugging every heading on every keystroke's update is
-    // O(document).
-    state.anchors = None;
+    // Rebuilt on the next lookup: walking every block on every keystroke's update is O(document).
+    state.outline = None;
     state.stats.block_count = state.document.blocks.len();
     state.stats.revision = state.document.revision;
     if repaint {
@@ -583,6 +629,20 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
 
 /// Lays out `indices` that have no layout yet; true when any height changed.
 fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
+    // Section keys need a walk of the whole document, so only blocks holding a section pay for it.
+    let sectioned = indices
+        .iter()
+        .copied()
+        .filter(|&index| {
+            state.layouts.get(index).is_some_and(Option::is_none)
+                && has_details(&state.document.blocks[index].kind)
+        })
+        .collect::<Vec<_>>();
+    let keys = sectioned
+        .into_iter()
+        .map(|index| (index, outline(state).details[index].clone()))
+        .collect::<HashMap<_, _>>();
+    let dark = state.colors.is_dark();
     let ViewState {
         hwnd,
         graphics,
@@ -594,6 +654,7 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
         layouts,
         heights,
         layout_width,
+        details_overrides,
         ..
     } = state;
     let Some(brushes) = brushes.as_ref() else {
@@ -603,13 +664,26 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
     let mut changed = false;
     {
         let sizes = |path: &Path| images.size(path);
-        let context =
-            LayoutContext::new(graphics, brushes, fonts, document_dir.as_deref(), &sizes)?;
+        let context = LayoutContext::new(
+            graphics,
+            brushes,
+            fonts,
+            document_dir.as_deref(),
+            &sizes,
+            dark,
+            details_overrides,
+        )?;
         for &index in indices {
             if index >= document.blocks.len() || layouts[index].is_some() {
                 continue;
             }
-            let laid = layout_block(&context, &document.blocks[index].kind, *layout_width)?;
+            let block_keys = keys.get(&index).map_or(&[][..], Vec::as_slice);
+            let laid = layout_block(
+                &context,
+                &document.blocks[index].kind,
+                *layout_width,
+                block_keys,
+            )?;
             for slot in &laid.images {
                 if let Some(path) = &slot.path
                     && !images.is_failed(path)
@@ -779,7 +853,7 @@ fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             );
             if let Some((focus_block, focus_link)) = *focus
                 && focus_block == *index
-                && let Some(link) = laid.links.get(focus_link)
+                && let Some(link) = laid.targets.get(focus_link)
             {
                 for rect in link.visible_rects(offset) {
                     target.DrawRectangle(
@@ -836,6 +910,7 @@ fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                 state.stats.last_update_micros = started.elapsed().as_micros().max(1) as u64;
                 state.stats.painted_updates += 1;
             }
+            state.stats.content_height = state.heights.total();
             let links = visible_links(state);
             *state
                 .accessible
@@ -869,7 +944,7 @@ fn client_point(lparam: LPARAM) -> (i32, i32) {
     )
 }
 
-fn link_at(state: &mut ViewState, x: i32, y: i32) -> Option<(usize, usize)> {
+fn target_at(state: &mut ViewState, x: i32, y: i32) -> Option<(usize, usize)> {
     let scale = dpi_scale(state.hwnd);
     let (view_width, _) = view_size(state.hwnd);
     let (content_left, _) = content_frame(view_width, state.centered);
@@ -880,36 +955,95 @@ fn link_at(state: &mut ViewState, x: i32, y: i32) -> Option<(usize, usize)> {
     let block_x = x as f32 / scale - content_left;
     let block_y = document_y - top;
     let offset = state.h_scroll.get(&index).copied().unwrap_or(0.0);
-    laid.links
+    let hit = |target: &Target| {
+        target
+            .visible_rects(offset)
+            .iter()
+            .any(|rect| rect.contains(block_x, block_y))
+    };
+    // A link inside a summary wins over the row's disclosure.
+    laid.targets
         .iter()
-        .position(|link| {
-            link.visible_rects(offset)
-                .iter()
-                .any(|rect| rect.contains(block_x, block_y))
-        })
-        .map(|link| (index, link))
+        .position(|target| matches!(target.kind, TargetKind::Link(_)) && hit(target))
+        .or_else(|| laid.targets.iter().position(hit))
+        .map(|target| (index, target))
 }
 
-fn link_dest(state: &ViewState, (block, link): (usize, usize)) -> Option<String> {
-    Some(
-        state
-            .layouts
-            .get(block)?
-            .as_ref()?
-            .links
-            .get(link)?
-            .dest
-            .clone(),
-    )
+fn target_dest(state: &ViewState, (block, target): (usize, usize)) -> Option<String> {
+    state
+        .layouts
+        .get(block)?
+        .as_ref()?
+        .targets
+        .get(target)?
+        .dest()
+        .map(str::to_owned)
 }
 
 fn set_underline(state: &ViewState, target: Option<(usize, usize)>, underline: bool) {
-    if let Some((block, link)) = target
+    if let Some((block, index)) = target
         && let Some(Some(laid)) = state.layouts.get(block)
-        && let Some(link) = laid.links.get(link)
+        && let Some(target) = laid.targets.get(index)
+        && matches!(target.kind, TargetKind::Link(_))
     {
-        let _ = unsafe { link.layout.SetUnderline(underline, link.range) };
+        let _ = unsafe { target.layout.SetUnderline(underline, target.range) };
     }
+}
+
+/// Follows a link or toggles a section.
+fn activate(state: &mut ViewState, (block, index): (usize, usize)) {
+    let Some(kind) = state
+        .layouts
+        .get(block)
+        .and_then(Option::as_ref)
+        .and_then(|laid| laid.targets.get(index))
+        .map(|target| target.kind.clone())
+    else {
+        return;
+    };
+    match kind {
+        TargetKind::Link(dest) => post_link(state.hwnd, dest),
+        TargetKind::Disclosure { key, .. } => toggle_details(state, &key),
+    }
+}
+
+fn set_details_open(state: &mut ViewState, key: &DetailsKey, default: bool, open: bool) {
+    if open == default {
+        state.details_overrides.remove(key);
+    } else {
+        state.details_overrides.insert(key.clone(), open);
+    }
+}
+
+/// Expands or collapses a section. Only its top-level block is laid out again, and the block at the
+/// top of the view stays where it is.
+fn toggle_details(state: &mut ViewState, key: &DetailsKey) {
+    let found = outline(state)
+        .details
+        .iter()
+        .enumerate()
+        .find_map(|(block, keys)| {
+            keys.iter()
+                .position(|candidate| candidate == key)
+                .map(|index| (block, index))
+        });
+    // A stale key (its summary was edited since) toggles nothing.
+    let Some((block, index)) = found else {
+        return;
+    };
+    let default =
+        details_open_attribute(&state.document.blocks[block].kind, index).unwrap_or(false);
+    let open = state.details_overrides.get(key).copied().unwrap_or(default);
+    set_details_open(state, key, default, !open);
+    set_underline(state, state.hover, false);
+    state.hover = None;
+    state.pressed = None;
+    let reading = state.heights.anchor(state.scroll_y);
+    state.layouts[block] = None;
+    if matches!(ensure_layouts(state, &[block]), Ok(true)) {
+        state.scroll_y = state.heights.scroll_for_anchor(reading);
+    }
+    invalidate(state.hwnd);
 }
 
 fn post_link(hwnd: HWND, dest: String) {
@@ -954,28 +1088,36 @@ fn visible_links(state: &mut ViewState) -> Vec<VisibleLink> {
         let Some(Some(laid)) = state.layouts.get(index) else {
             continue;
         };
-        for link in &laid.links {
-            // Links scrolled out of a wide table's clip are not on screen.
-            let Some(rect) = link.visible_rects(offset).first().copied() else {
+        for (target_index, target) in laid.targets.iter().enumerate() {
+            // Targets scrolled out of a wide table's clip are not on screen.
+            let Some(rect) = target.visible_rects(offset).first().copied() else {
                 continue;
             };
             let rect = rect.offset(content_left, top);
             links.push(VisibleLink {
-                text: link.text.clone(),
-                dest: link.dest.clone(),
+                text: target.text.clone(),
+                dest: target.dest().unwrap_or_default().to_owned(),
                 rect: RECT {
                     left: (rect.left * scale) as i32,
                     top: (rect.top * scale) as i32,
                     right: (rect.right * scale) as i32,
                     bottom: (rect.bottom * scale) as i32,
                 },
+                disclosure: match &target.kind {
+                    TargetKind::Link(_) => None,
+                    TargetKind::Disclosure { key, expanded } => Some(Disclosure {
+                        key: key.clone(),
+                        expanded: *expanded,
+                    }),
+                },
+                focused: state.focus == Some((index, target_index)),
             });
         }
     }
     links
 }
 
-/// Moves keyboard focus to the next (or previous) link in document order and scrolls it into view.
+/// Moves keyboard focus to the next (or previous) link or disclosure in document order and scrolls it into view.
 /// Blocks without links are skipped using the model alone; only the block that receives focus is
 /// laid out.
 fn move_focus(state: &mut ViewState, forward: bool) {
@@ -989,7 +1131,7 @@ fn move_focus(state: &mut ViewState, forward: bool) {
     };
     // One extra step lets the search wrap back into the block it started from.
     for _ in 0..=count {
-        if block_has_link(&state.document.blocks[block].kind) {
+        if block_has_target(&state.document.blocks[block].kind) {
             let anchor = state.heights.anchor(state.scroll_y);
             match ensure_layouts(state, &[block]) {
                 Err(_) => return,
@@ -999,7 +1141,7 @@ fn move_focus(state: &mut ViewState, forward: bool) {
             }
             let links = state.layouts[block]
                 .as_ref()
-                .map_or(0, |laid| laid.links.len());
+                .map_or(0, |laid| laid.targets.len());
             let next = match (link, forward) {
                 (None, true) if links > 0 => Some(0),
                 (None, false) if links > 0 => Some(links - 1),
@@ -1028,7 +1170,7 @@ fn focus_link(state: &mut ViewState, block: usize, link: usize) {
     let Some(laid) = state.layouts.get(block).and_then(Option::as_ref) else {
         return;
     };
-    let Some(hit) = laid.links.get(link) else {
+    let Some(hit) = laid.targets.get(link) else {
         return;
     };
     let rect = hit.rects.first().copied().unwrap_or_default();
@@ -1208,8 +1350,22 @@ unsafe extern "system" fn preview_proc(
                         move_focus(state, !backward);
                     }
                     VK_RETURN => {
-                        if let Some(dest) = state.focus.and_then(|focus| link_dest(state, focus)) {
-                            post_link(hwnd, dest);
+                        if let Some(focus) = state.focus {
+                            activate(state, focus);
+                        }
+                    }
+                    VK_SPACE => {
+                        if let Some((block, index)) = state.focus
+                            && state
+                                .layouts
+                                .get(block)
+                                .and_then(Option::as_ref)
+                                .and_then(|laid| laid.targets.get(index))
+                                .is_some_and(|target| {
+                                    matches!(target.kind, TargetKind::Disclosure { .. })
+                                })
+                        {
+                            activate(state, (block, index));
                         }
                     }
                     _ => {}
@@ -1229,12 +1385,12 @@ unsafe extern "system" fn preview_proc(
                     };
                     state.tracking_mouse = unsafe { TrackMouseEvent(&mut track) } != 0;
                 }
-                let hovered = link_at(state, x, y);
+                let hovered = target_at(state, x, y);
                 if hovered != state.hover {
                     set_underline(state, state.hover, false);
                     set_underline(state, hovered, true);
                     state.hover = hovered;
-                    post_hover(hwnd, hovered.and_then(|link| link_dest(state, link)));
+                    post_hover(hwnd, hovered.and_then(|target| target_dest(state, target)));
                     invalidate(hwnd);
                 }
             });
@@ -1265,7 +1421,7 @@ unsafe extern "system" fn preview_proc(
         WM_LBUTTONDOWN => {
             unsafe { SetFocus(hwnd) };
             let (x, y) = client_point(lparam);
-            with_state(hwnd, |state| state.pressed = link_at(state, x, y));
+            with_state(hwnd, |state| state.pressed = target_at(state, x, y));
             0
         }
         WM_LBUTTONUP => {
@@ -1275,12 +1431,12 @@ unsafe extern "system" fn preview_proc(
                     unsafe { PostMessageW(GetParent(hwnd), WM_FASTPAD_PREVIEW_REFRESH, 0, 0) };
                     return;
                 }
-                let released = link_at(state, x, y);
+                let released = target_at(state, x, y);
                 if released.is_some()
                     && released == state.pressed.take()
-                    && let Some(dest) = released.and_then(|link| link_dest(state, link))
+                    && let Some(released) = released
                 {
-                    post_link(hwnd, dest);
+                    activate(state, released);
                 }
             });
             0
@@ -1326,7 +1482,9 @@ mod tests {
     use crate::platform::theme::Theme;
     use crate::preview::colors::preview_colors;
     use crate::preview::render::TestWindow;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_END, VK_ESCAPE, VK_TAB};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_END, VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         MSG, MoveWindow, PM_REMOVE, PeekMessageW, SendMessageW, WM_KEYDOWN, WM_LBUTTONDOWN,
         WM_LBUTTONUP, WM_PAINT,
@@ -1625,6 +1783,147 @@ mod tests {
         assert_eq!(view.top_line(), 100);
         assert!(view.scroll_to_anchor("deep-heading"));
         assert!(view.top_line() >= 152);
+        view.destroy();
+    }
+
+    fn click(view: &PreviewView, rect: RECT) {
+        let point =
+            (((rect.top + rect.bottom) / 2) << 16 | ((rect.left + rect.right) / 2)) as isize;
+        unsafe {
+            SendMessageW(view.hwnd(), WM_LBUTTONDOWN, 0, point);
+            SendMessageW(view.hwnd(), WM_LBUTTONUP, 0, point);
+        }
+    }
+
+    fn visible_target(view: &PreviewView, disclosure: bool) -> VisibleLink {
+        view.visible_links()
+            .into_iter()
+            .find(|link| link.disclosure.is_some() == disclosure)
+            .expect("a visible target")
+    }
+
+    fn paragraphs(count: usize) -> String {
+        (0..count)
+            .map(|index| format!("para {index}\n\n"))
+            .collect()
+    }
+
+    const SECTION: &str = "<details>\n<summary>More</summary>\n\nHidden body\n\n</details>\n";
+
+    #[test]
+    fn clicking_a_disclosure_expands_and_collapses_it() {
+        let parent = TestWindow::new(800, 600);
+        let view = view_with(&parent, SECTION);
+        let collapsed = view.stats().content_height;
+        click(&view, visible_target(&view, true).rect);
+        repaint(&view);
+        assert!(view.stats().content_height > collapsed);
+        assert_eq!(
+            visible_target(&view, true).disclosure.map(|d| d.expanded),
+            Some(true)
+        );
+        click(&view, visible_target(&view, true).rect);
+        repaint(&view);
+        assert_eq!(view.stats().content_height, collapsed);
+        assert!(take_posted(&parent, WM_FASTPAD_PREVIEW_LINK).is_none());
+        view.destroy();
+    }
+
+    #[test]
+    fn tab_enter_and_space_toggle_a_focused_disclosure() {
+        let parent = TestWindow::new(800, 600);
+        let view = view_with(&parent, SECTION);
+        // The first paint hides the scrollbar this short document does not need; the widened
+        // content lays out again on the next paint, which would drop keyboard focus.
+        repaint(&view);
+        let collapsed = view.stats().content_height;
+        unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_TAB as usize, 0) };
+        repaint(&view);
+        assert!(visible_target(&view, true).focused);
+        unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_RETURN as usize, 0) };
+        repaint(&view);
+        assert!(view.stats().content_height > collapsed);
+        unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, VK_SPACE as usize, 0) };
+        repaint(&view);
+        assert_eq!(view.stats().content_height, collapsed);
+        view.destroy();
+    }
+
+    #[test]
+    fn a_link_in_a_summary_is_followed_without_toggling() {
+        let parent = TestWindow::new(800, 600);
+        let view = view_with(
+            &parent,
+            "<details>\n<summary>See <a href=\"https://x.dev\">site</a></summary>\n\nBody\n\n</details>\n",
+        );
+        let collapsed = view.stats().content_height;
+        click(&view, visible_target(&view, false).rect);
+        let message = take_posted(&parent, WM_FASTPAD_PREVIEW_LINK).expect("link message");
+        let dest = unsafe { Box::from_raw(message.lParam as *mut String) };
+        assert_eq!(*dest, "https://x.dev");
+        repaint(&view);
+        assert_eq!(view.stats().content_height, collapsed);
+        view.destroy();
+    }
+
+    #[test]
+    fn anchors_inside_collapsed_sections_open_them_first() {
+        let parent = TestWindow::new(800, 600);
+        // Paragraphs after the section keep the scroll from clamping at the end of the document.
+        let source = paragraphs(100)
+            + "<details>\n<summary>More</summary>\n\n## Deep Heading\n\nBody\n\n</details>\n\n"
+            + &paragraphs(40);
+        let view = view_with(&parent, &source);
+        assert!(view.scroll_to_anchor("deep-heading"));
+        repaint(&view);
+        assert_eq!(
+            visible_target(&view, true).disclosure.map(|d| d.expanded),
+            Some(true)
+        );
+        assert!(view.top_line() >= 200);
+        view.destroy();
+    }
+
+    #[test]
+    fn a_collapsed_section_maps_its_source_lines_to_its_disclosure_row() {
+        let parent = TestWindow::new(800, 600);
+        let mut source = paragraphs(60);
+        let details_line = source.lines().count();
+        source.push_str("<details>\n<summary>More</summary>\n\n");
+        source.push_str(
+            &(0..40)
+                .map(|index| format!("hidden {index}\n\n"))
+                .collect::<String>(),
+        );
+        source.push_str("</details>\n\n");
+        source.push_str(&paragraphs(60));
+        let view = view_with(&parent, &source);
+        view.scroll_to_line(details_line + 30);
+        repaint(&view);
+        view.scroll_to_line(details_line + 30);
+        let (top, height, scroll) = with_state(view.hwnd(), |state| {
+            let index = state
+                .document
+                .blocks
+                .iter()
+                .position(|block| {
+                    matches!(block.kind, crate::preview::model::BlockKind::Details { .. })
+                })
+                .unwrap();
+            (
+                state.heights.top(index),
+                state.heights.height(index),
+                state.scroll_y,
+            )
+        })
+        .unwrap();
+        assert!(
+            scroll >= top && scroll <= top + height,
+            "{scroll} is outside the section at {top}..{}",
+            top + height
+        );
+        with_state(view.hwnd(), |state| set_scroll(state, top, true));
+        assert_eq!(view.top_line(), details_line);
         view.destroy();
     }
 }
