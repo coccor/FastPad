@@ -67,8 +67,8 @@ fn discard_on_window_close(process: &FastPadProcess, hwnd: HWND) {
     unsafe {
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
     }
-    wait_and_dismiss_dialog(process.id(), Duration::from_secs(3)).unwrap();
-    wait_for_process_exit(process.id(), Duration::from_secs(3)).unwrap();
+    wait_and_dismiss_dialog(process.id(), Duration::from_secs(10)).unwrap();
+    wait_for_process_exit(process.id(), Duration::from_secs(10)).unwrap();
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn discarding_a_recovered_tab_removes_its_source_snapshot() {
     unsafe {
         PostMessageW(hwnd, WM_COMMAND, CommandId::CloseTab as usize, 0);
     }
-    wait_and_dismiss_dialog(process.id(), Duration::from_secs(3)).unwrap();
+    wait_and_dismiss_dialog(process.id(), Duration::from_secs(10)).unwrap();
 
     wait_until("source snapshot removal", || !source.exists());
     wait_until("the remaining untitled tab", || {

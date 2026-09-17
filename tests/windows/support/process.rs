@@ -26,8 +26,8 @@ use windows_sys::Win32::System::Threading::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_CLICK, EnumChildWindows, EnumWindows, GetClassNameW, GetWindowTextW,
-    GetWindowThreadProcessId, PostMessageW, SendMessageW, WM_CLOSE,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetDlgCtrlID, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindow, PostMessageW, WM_CLOSE, WM_COMMAND,
 };
 #[cfg(windows)]
 use windows_sys::core::BOOL;
@@ -232,16 +232,31 @@ pub fn process_has_module_loaded(process_id: u32, module_file_name: &str) -> Tes
 /// overlap with a second dialog `close()` may need to show/dismiss reentrantly (nested modal
 /// `MessageBoxW` calls on the same thread are surprising to reason about; avoiding the overlap in
 /// the first place is simpler than making `close()` robust to it).
+///
+/// Returns only once the dialog window is gone: a slow runner can list the `#32770` window before
+/// its buttons exist, so a single dismissal attempt could silently do nothing.
 #[cfg(windows)]
 pub fn wait_and_dismiss_dialog(process_id: u32, timeout: Duration) -> TestResult<()> {
     let deadline = Deadline::after(timeout);
+    let mut dismissed = None;
     loop {
-        if let Some(dialog) = find_unsaved_changes_dialog(process_id)? {
-            dismiss_dialog(dialog);
-            return Ok(());
+        match dismissed {
+            Some(dialog) if unsafe { IsWindow(dialog) } == 0 => return Ok(()),
+            Some(_) => {}
+            None => {
+                if let Some(dialog) = find_unsaved_changes_dialog(process_id)?
+                    && dismiss_dialog(dialog)
+                {
+                    dismissed = Some(dialog);
+                    continue;
+                }
+            }
         }
         if deadline.expired() {
-            return Err("timed out waiting for a dialog to appear".into());
+            return Err(match dismissed {
+                Some(_) => "timed out waiting for a dismissed dialog to close".into(),
+                None => "timed out waiting for a dialog to appear".into(),
+            });
         }
         deadline.sleep_step();
     }
@@ -326,8 +341,12 @@ unsafe extern "system" fn enum_main_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
 /// Clicks whichever of the "No" (discard, for the "Save changes?" prompt) or "OK" (for a plain
 /// warning, e.g. a failed language activation) buttons a standard `MessageBoxW` actually has.
+/// Returns false while the buttons do not exist yet.
+///
+/// The button's command goes straight to the dialog: `BM_CLICK` is documented to fail when the
+/// dialog is not the active window, which is routine on a CI desktop.
 #[cfg(windows)]
-fn dismiss_dialog(dialog: HWND) {
+fn dismiss_dialog(dialog: HWND) -> bool {
     let mut search = ButtonSearch { hwnd: None };
     unsafe {
         EnumChildWindows(
@@ -336,11 +355,14 @@ fn dismiss_dialog(dialog: HWND) {
             &mut search as *mut ButtonSearch as isize,
         );
     }
-    if let Some(button) = search.hwnd {
-        unsafe {
-            SendMessageW(button, BM_CLICK, 0, 0);
-        }
+    let Some(button) = search.hwnd else {
+        return false;
+    };
+    let id = unsafe { GetDlgCtrlID(button) };
+    if id == 0 {
+        return false;
     }
+    unsafe { PostMessageW(dialog, WM_COMMAND, id as usize, button as isize) != 0 }
 }
 
 #[cfg(windows)]

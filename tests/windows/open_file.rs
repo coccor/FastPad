@@ -163,7 +163,7 @@ fn select_file(owner: HWND, path: &Path) {
         // Wait for the preconfigured filename to be visibly installed before activating Open.
         let filename = unsafe { GetDlgItem(dialog, 1148) };
         let edit = find_child_by_class(filename, "Edit").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let current = scintilla_text(edit).unwrap();
             if current == expected
@@ -182,7 +182,7 @@ fn select_file(owner: HWND, path: &Path) {
         unsafe {
             assert_ne!(PostMessageW(GetDlgItem(dialog, IDOK), BM_CLICK, 0, 0), 0);
         }
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(dialog) } != 0 {
             if Instant::now() >= deadline {
                 unsafe {
@@ -270,7 +270,7 @@ impl Drop for TestMain {
 }
 
 fn wait_text(editor: HWND, expected: &str) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if scintilla_text(editor).unwrap() == expected {
             return;
@@ -283,7 +283,7 @@ fn wait_text(editor: HWND, expected: &str) {
     }
 }
 fn wait_dialog_closed(dialog: HWND) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(dialog) } != 0 {
         assert!(
             Instant::now() < deadline,
@@ -314,7 +314,7 @@ fn wait_dialog(pid: u32) -> HWND {
         }
         1
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let mut search = Search {
             pid,
