@@ -13,6 +13,11 @@ pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_STRIKETHROUGH)
     .union(Options::ENABLE_TASKLISTS);
 
+/// Open inline styles beyond this depth apply no style.
+const MAX_OPEN_STYLES: usize = 64;
+/// HTML block elements nested deeper than this are ignored.
+const MAX_FRAME_DEPTH: usize = 64;
+
 /// The character an inline image occupies in `RichText::text`.
 pub const OBJECT_REPLACEMENT: char = '\u{FFFC}';
 
@@ -421,6 +426,9 @@ impl TextBuilder {
     }
 
     fn open(&mut self, style: Option<InlineStyle>, tag: Option<&str>) {
+        // Deeper HTML nesting still pairs its end tags but styles nothing more: thousands of
+        // nested `<mark>` tags would otherwise draw thousands of fills per line.
+        let style = style.filter(|_| tag.is_none() || self.open.len() < MAX_OPEN_STYLES);
         self.open.push(OpenStyle {
             style,
             start: self.utf16_len,
@@ -1055,7 +1063,9 @@ impl Builder {
     /// An HTML block element. Inside Markdown inline content the tag does nothing and its content
     /// flows into that text: paragraphs, headings, and table cells hold only inline content.
     fn html_block_frame(&mut self, frame: Frame) {
-        if !self.in_markdown_inline() {
+        // Beyond this depth block tags do nothing, so layout and the outline never recurse deep
+        // enough to exhaust the UI thread's stack.
+        if !self.in_markdown_inline() && self.stack.len() < MAX_FRAME_DEPTH {
             self.push_block_frame(frame);
         }
     }
@@ -1724,6 +1734,27 @@ mod tests {
                 para(plain("after")),
             ]
         );
+    }
+
+    #[test]
+    fn deep_html_nesting_is_capped() {
+        let source = "<mark>".repeat(1_000) + "x\n";
+        let styled = kinds(&source);
+        let [BlockKind::Paragraph { text, .. }] = styled.as_slice() else {
+            panic!("expected one paragraph");
+        };
+        assert_eq!(text.spans.len(), MAX_OPEN_STYLES);
+        fn depth(kind: &BlockKind) -> usize {
+            match kind {
+                BlockKind::Details { children, .. } => {
+                    1 + children.iter().map(depth).max().unwrap_or(0)
+                }
+                _ => 0,
+            }
+        }
+        let nested = "<details>".repeat(10_000) + "\n";
+        let blocks = kinds(&nested);
+        assert!(blocks.iter().map(depth).max().unwrap_or(0) <= MAX_FRAME_DEPTH);
     }
 
     #[test]

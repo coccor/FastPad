@@ -57,7 +57,13 @@ pub fn tokenize(html: &str) -> Vec<Token> {
             index += 1;
             continue;
         }
-        let parsed = if html[index..].starts_with("<!--") {
+        let rest = &html[index..];
+        let parsed = if rest.starts_with("<!-->") {
+            // HTML's abrupt empty comments.
+            Some((Token::Comment, index + 5))
+        } else if rest.starts_with("<!--->") {
+            Some((Token::Comment, index + 6))
+        } else if rest.starts_with("<!--") {
             let end = html[index + 4..]
                 .find("-->")
                 .map_or(bytes.len(), |found| index + 4 + found + 3);
@@ -72,11 +78,25 @@ pub fn tokenize(html: &str) -> Vec<Token> {
                 index = end;
                 text_start = end;
             }
+            // A tag name that runs out of input before its `>`: the rest is text. Retrying from
+            // every later `<` would rescan to the end each time, quadratic in malformed input.
+            None if starts_tag_name(bytes, index) => break,
             None => index += 1,
         }
     }
     push_text(&mut tokens, &html[text_start..]);
     tokens
+}
+
+/// Whether `<` at `index` is followed by a tag name, which `parse_tag` only rejects at the end of
+/// the input.
+fn starts_tag_name(bytes: &[u8], index: usize) -> bool {
+    let name = if bytes.get(index + 1) == Some(&b'/') {
+        index + 2
+    } else {
+        index + 1
+    };
+    bytes.get(name).is_some_and(u8::is_ascii_alphabetic)
 }
 
 fn push_text(tokens: &mut Vec<Token>, raw: &str) {
@@ -107,6 +127,8 @@ fn parse_tag(html: &str, start: usize) -> Option<(Token, usize)> {
     }
     let name = html[name_start..index].to_ascii_lowercase();
     let mut attrs: Vec<(String, String)> = Vec::new();
+    // A set, not a scan of `attrs`: a tag with thousands of attributes must stay linear.
+    let mut seen = std::collections::HashSet::new();
     let mut self_closing = false;
     loop {
         while index < bytes.len() && bytes[index].is_ascii_whitespace() {
@@ -167,7 +189,7 @@ fn parse_tag(html: &str, start: usize) -> Option<(Token, usize)> {
                         }
                     }
                 }
-                if !attrs.iter().any(|(existing, _)| *existing == attr_name) {
+                if seen.insert(attr_name.clone()) {
                     attrs.push((attr_name, value));
                 }
             }
@@ -386,6 +408,32 @@ mod tests {
         ] {
             assert_eq!(tokenize(source), vec![text(source)], "{source}");
         }
+    }
+
+    #[test]
+    fn abrupt_empty_comments_end_immediately() {
+        assert_eq!(
+            tokenize("<!-->a<!--->b"),
+            vec![Token::Comment, text("a"), Token::Comment, text("b")]
+        );
+    }
+
+    #[test]
+    fn malformed_markup_is_tokenized_in_linear_time() {
+        // Break caught: every `<` of an unterminated tag rescanned to the end of the input.
+        let unterminated = "<div>\n".to_owned() + &"<a b ".repeat(60_000);
+        let many_attributes = format!(
+            "<b {}>",
+            (0..60_000)
+                .map(|index| format!("a{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let started = std::time::Instant::now();
+        let tokens = tokenize(&unterminated);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokenize(&many_attributes).len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

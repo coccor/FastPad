@@ -37,6 +37,8 @@ const SMALL_SCALE: f32 = 0.875;
 /// `<sub>` and `<sup>`. DirectWrite cannot shift the baseline, so glyphs a font has no subscript or
 /// superscript form for render smaller on the baseline.
 const SCRIPT_SCALE: f32 = 0.75;
+/// The tallest an image box may be, in DIPs.
+const MAX_IMAGE_HEIGHT: f32 = 16_384.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreviewFonts {
@@ -436,6 +438,8 @@ impl<'a> LayoutContext<'a> {
             box_height *= available / box_width;
             box_width = available;
         }
+        // An absurd `height` must not produce a block taller than scrolling can address.
+        box_height = box_height.min(MAX_IMAGE_HEIGHT);
         Ok(ImageBox {
             position,
             width: box_width.max(1.0),

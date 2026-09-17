@@ -168,6 +168,9 @@ struct ViewState {
     outline: Option<Outline>,
     /// `<details>` sections the user toggled away from their `open` attribute.
     details_overrides: HashMap<DetailsKey, bool>,
+    /// Per block, whether it holds a `<details>` section. Kept in step with the document so an
+    /// edit can tell whether section keys after it changed without walking every block.
+    sectioned: Vec<bool>,
     /// A section toggled since the last paint; its accessible child raises a state change once the
     /// snapshot shows the new state.
     state_change: Option<DetailsKey>,
@@ -220,6 +223,7 @@ impl PreviewView {
             paint_retried: false,
             outline: None,
             details_overrides: HashMap::new(),
+            sectioned: Vec::new(),
             state_change: None,
             stats: PreviewStats::default(),
             opened_at: None,
@@ -248,11 +252,22 @@ impl PreviewView {
         document_dir: Option<PathBuf>,
         started: Instant,
     ) {
+        self.with(|state| state.details_overrides.clear());
+        self.install_parse(document, document_dir, started);
+    }
+
+    /// Installs a worker parse of the document already shown. Unlike `replace_document`, the
+    /// sections the user expanded or collapsed stay that way.
+    pub fn install_parse(
+        &self,
+        document: PreviewDocument,
+        document_dir: Option<PathBuf>,
+        started: Instant,
+    ) {
         self.with(|state| {
             state.document = document;
             state.document_dir = document_dir;
             state.scroll_y = 0.0;
-            state.details_overrides.clear();
             // The snapshot describes the old document until the next paint; accessibility clients
             // must not see its links in the meantime.
             state
@@ -394,6 +409,7 @@ impl PreviewView {
                     .unwrap_or(default)
                 {
                     set_details_open(state, &keys[index], default, true);
+                    state.state_change = Some(keys[index].clone());
                     opened = true;
                 }
             }
@@ -434,6 +450,7 @@ impl PreviewView {
             state.focus = None;
             state.outline = None;
             state.details_overrides = HashMap::new();
+            state.sectioned = Vec::new();
             state.state_change = None;
             state.update_started = None;
             state.stats.block_count = 0;
@@ -602,6 +619,12 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
     let repaint = match update {
         Update::Unchanged => return,
         Update::Full => {
+            state.sectioned = state
+                .document
+                .blocks
+                .iter()
+                .map(|block| has_details(&block.kind))
+                .collect();
             reset_layouts(state);
             state.h_scroll.clear();
             true
@@ -619,6 +642,26 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
                 .sum::<f32>();
             let old_bottom = old_top + old_height;
             state.layouts.splice(old.clone(), new.clone().map(|_| None));
+            let new_sectioned = state.document.blocks[new.clone()]
+                .iter()
+                .map(|block| has_details(&block.kind))
+                .collect::<Vec<_>>();
+            let keys_shift = new_sectioned.contains(&true)
+                || state
+                    .sectioned
+                    .get(old.clone())
+                    .is_some_and(|old| old.contains(&true));
+            state.sectioned.splice(old.clone(), new_sectioned);
+            if keys_shift {
+                // Section keys count repeated summaries in document order, so a section added,
+                // removed, or renamed here renumbers the sections after it. Their kept layouts
+                // hold the old keys and would toggle the wrong section.
+                for index in new.end..state.layouts.len() {
+                    if state.sectioned.get(index).copied().unwrap_or(false) {
+                        state.layouts[index] = None;
+                    }
+                }
+            }
             let new_estimates = estimates(state, new.clone());
             let new_height = new_estimates.iter().sum::<f32>();
             state.heights.splice(old.clone(), &new_estimates);
@@ -662,7 +705,7 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
         .copied()
         .filter(|&index| {
             state.layouts.get(index).is_some_and(Option::is_none)
-                && has_details(&state.document.blocks[index].kind)
+                && state.sectioned.get(index).copied().unwrap_or(false)
         })
         .collect::<Vec<_>>();
     let keys = sectioned
@@ -2004,6 +2047,64 @@ mod tests {
                 .as_ref()
                 .map(|d| d.expanded),
             Some(true)
+        );
+        view.destroy();
+    }
+
+    #[test]
+    fn a_section_added_above_renumbers_the_kept_layouts_below_it() {
+        // Break caught: kept layouts held the old section keys, so clicking the lower section
+        // after typing a same-named section above it toggled the new one instead.
+        let parent = TestWindow::new(800, 600);
+        let mut source = format!("a\n\nb\n\nc\n\n{SECTION}\n{}", paragraphs(20));
+        let view = view_with(&parent, &source);
+        repaint(&view);
+        let inserted = "<details>\n<summary>More</summary>\n\nNew\n\n</details>\n\n";
+        let position = source.find("c\n").unwrap();
+        source.insert_str(position, inserted);
+        let update = view.apply_edits(
+            source.as_str(),
+            &[Edit {
+                position,
+                removed: 0,
+                inserted: inserted.len(),
+                lines_delta: inserted.matches('\n').count() as isize,
+            }],
+            Instant::now(),
+            false,
+        );
+        assert!(
+            matches!(update, Some(Update::Replaced { .. })),
+            "{update:?}"
+        );
+        repaint(&view);
+        let mut occurrences = view
+            .visible_links()
+            .into_iter()
+            .filter_map(|link| link.disclosure.map(|disclosure| disclosure.key.occurrence))
+            .collect::<Vec<_>>();
+        occurrences.sort_unstable();
+        assert_eq!(occurrences, vec![0, 1]);
+        view.destroy();
+    }
+
+    #[test]
+    fn a_worker_parse_of_the_same_document_keeps_expanded_sections() {
+        let parent = TestWindow::new(800, 600);
+        let view = view_with(&parent, SECTION);
+        click(&view, visible_target(&view, true).rect);
+        repaint(&view);
+        view.install_parse(PreviewDocument::parse(SECTION), None, Instant::now());
+        repaint(&view);
+        assert_eq!(
+            visible_target(&view, true).disclosure.map(|d| d.expanded),
+            Some(true)
+        );
+        view.replace_document(PreviewDocument::parse(SECTION), None, Instant::now());
+        repaint(&view);
+        assert_eq!(
+            visible_target(&view, true).disclosure.map(|d| d.expanded),
+            Some(false)
         );
         view.destroy();
     }
