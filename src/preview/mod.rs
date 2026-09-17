@@ -9,6 +9,7 @@ pub mod html;
 mod html_entities;
 pub mod images;
 pub mod incremental;
+pub mod inline_object;
 pub mod layout;
 pub mod links;
 pub mod model;
