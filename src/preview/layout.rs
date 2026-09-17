@@ -5,8 +5,7 @@
 use crate::Result;
 use crate::preview::colors::ColorRole;
 use crate::preview::dwrite::{Graphics, hresult_error};
-use crate::preview::links::resolve_image_path;
-use crate::preview::model::{BlockKind, CellAlign, ImageRef, InlineStyle, ListItem, RichText};
+use crate::preview::model::{BlockKind, CellAlign, InlineStyle, ListItem, RichText};
 use crate::preview::render::{Brushes, RectF};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -134,17 +133,21 @@ pub fn block_has_link(kind: &BlockKind) -> bool {
             .any(|span| matches!(span.style, InlineStyle::Link(_)))
     };
     match kind {
-        BlockKind::Heading { text, .. } | BlockKind::Paragraph(text) => rich(text),
+        BlockKind::Heading { text, .. } | BlockKind::Paragraph { text, .. } => rich(text),
         BlockKind::List { items, .. } => items
             .iter()
             .any(|item| item.blocks.iter().any(block_has_link)),
-        BlockKind::Quote(blocks) => blocks.iter().any(block_has_link),
+        BlockKind::Quote(blocks)
+        | BlockKind::Container {
+            children: blocks, ..
+        } => blocks.iter().any(block_has_link),
+        BlockKind::Details {
+            summary, children, ..
+        } => rich(summary) || children.iter().any(block_has_link),
         BlockKind::Table { head, rows, .. } => {
             head.iter().any(rich) || rows.iter().flatten().any(rich)
         }
-        BlockKind::Images(_) | BlockKind::Code { .. } | BlockKind::Rule | BlockKind::Html(_) => {
-            false
-        }
+        BlockKind::Code { .. } | BlockKind::Rule => false,
     }
 }
 
@@ -168,7 +171,9 @@ pub struct LayoutContext<'a> {
     graphics: &'a Graphics,
     brushes: &'a Brushes,
     fonts: &'a PreviewFonts,
+    #[allow(dead_code)] // Read again by inline image layout (Part 6).
     document_dir: Option<&'a Path>,
+    #[allow(dead_code)]
     image_size: &'a dyn Fn(&Path) -> Option<(u32, u32)>,
     formats: RefCell<HashMap<(bool, u32, i32), IDWriteTextFormat>>,
     line_height: f32,
@@ -270,11 +275,7 @@ impl<'a> LayoutContext<'a> {
                     InlineStyle::Link(_) => {
                         layout.SetDrawingEffect(self.brushes.get(ColorRole::Link), range)
                     }
-                    InlineStyle::ImageAlt => layout
-                        .SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range)
-                        .and_then(|()| {
-                            layout.SetDrawingEffect(self.brushes.get(ColorRole::Muted), range)
-                        }),
+                    _ => Ok(()),
                 }
             }
             .map_err(hresult_error)?;
@@ -347,7 +348,7 @@ fn layout_kind(
         16.0 * unit
     };
     match kind {
-        BlockKind::Paragraph(text) => {
+        BlockKind::Paragraph { text, .. } => {
             let height = push_rich_text(
                 context,
                 text,
@@ -365,7 +366,7 @@ fn layout_kind(
                 margin,
             })
         }
-        BlockKind::Heading { level, text } => {
+        BlockKind::Heading { level, text, .. } => {
             let size = context.fonts.body_size * HEADING_SCALE[usize::from(*level).clamp(1, 6) - 1];
             let role = match (style.role, *level) {
                 (ColorRole::Text, 5 | 6) => ColorRole::Muted,
@@ -407,17 +408,6 @@ fn layout_kind(
             width,
             ColorRole::Text,
             true,
-            output,
-            margin,
-        ),
-        BlockKind::Html(html) => push_code(
-            context,
-            html,
-            x,
-            y,
-            width,
-            ColorRole::Muted,
-            false,
             output,
             margin,
         ),
@@ -466,7 +456,17 @@ fn layout_kind(
         } => push_table(
             context, alignments, head, rows, x, y, width, style.role, output, margin,
         ),
-        BlockKind::Images(images) => push_images(context, images, x, y, width, output, margin),
+        BlockKind::Container { children, .. } => Ok(Extent {
+            content: layout_children(context, children, x, y, width, style, output)?,
+            margin,
+        }),
+        BlockKind::Details {
+            open,
+            summary,
+            children,
+        } => push_details(
+            context, *open, summary, children, x, y, width, style, output, margin,
+        ),
     }
 }
 
@@ -795,60 +795,64 @@ fn push_table(
     })
 }
 
-fn push_images(
+/// A `<details>` section: a disclosure triangle and the summary, then the children when open.
+#[allow(clippy::too_many_arguments)]
+fn push_details(
     context: &LayoutContext<'_>,
-    images: &[ImageRef],
+    open: bool,
+    summary: &RichText,
+    children: &[BlockKind],
     x: f32,
     y: f32,
     width: f32,
+    style: Style,
     output: &mut Output,
     margin: f32,
 ) -> Result<Extent> {
     let unit = context.fonts.unit();
-    let gap = 8.0 * unit;
-    let mut cursor = y;
-    for image in images {
-        let path = resolve_image_path(&image.dest, context.document_dir);
-        let size = path.as_deref().and_then(|path| (context.image_size)(path));
-        let rect = match size {
-            Some((image_width, image_height)) if image_width > 0 => {
-                let scale = (width / image_width as f32).min(1.0);
-                RectF::new(
-                    x,
-                    cursor,
-                    x + image_width as f32 * scale,
-                    cursor + image_height as f32 * scale,
-                )
-            }
-            _ => RectF::new(
-                x,
-                cursor,
-                x + (240.0 * unit).min(width),
-                cursor + 48.0 * unit,
-            ),
-        };
-        let alt_text = if image.alt.is_empty() {
-            "image"
-        } else {
-            &image.alt
-        };
-        let alt = context.plain_layout(
-            alt_text,
-            false,
-            context.fonts.body_size,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            (rect.width() - 16.0 * unit).max(1.0),
+    let marker = context.plain_layout(
+        if open { "\u{25BE}" } else { "\u{25B8}" },
+        false,
+        context.fonts.body_size,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        100.0,
+    )?;
+    let marker_width = metrics(&marker)?.widthIncludingTrailingWhitespace + 4.0 * unit;
+    let summary_height = push_rich_text(
+        context,
+        summary,
+        context.fonts.body_size,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        x + marker_width,
+        y,
+        (width - marker_width).max(1.0),
+        style.role,
+        false,
+        output,
+    )?;
+    output.ops.push(DrawOp::Text {
+        layout: marker,
+        x,
+        y,
+        role: style.role,
+    });
+    let row_height = summary_height.max(context.line_height);
+    let mut content = row_height;
+    if open && !children.is_empty() {
+        let indent = 16.0 * unit;
+        let top = y + row_height + 8.0 * unit;
+        let inner = layout_children(
+            context,
+            children,
+            x + indent,
+            top,
+            (width - indent).max(1.0),
+            style,
+            output,
         )?;
-        output.images.push(ImageSlot { path, rect, alt });
-        output.ops.push(DrawOp::Image {
-            slot: output.images.len() - 1,
-        });
-        cursor = rect.bottom + gap;
+        content = top - y + inner;
     }
-    Ok(Extent {
-        content: (cursor - y - gap).max(0.0),
-        margin,
-    })
+    Ok(Extent { content, margin })
 }
 
 fn alignment(align: CellAlign) -> DWRITE_TEXT_ALIGNMENT {
