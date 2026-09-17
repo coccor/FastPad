@@ -39,6 +39,9 @@ Rejected alternatives: WebView2 (browser runtime, memory, first-open latency, au
 
 ### Out of scope (v1)
 
+> Amended 17 September 2026: HTML rendering and SVG images are brought into scope by
+> `2026-09-17-preview-html-rendering-design.md`.
+
 Text selection and copy inside the preview, syntax highlighting in code blocks, remote images, HTML rendering, math, Mermaid, footnote rendering beyond literal text, clickable task-list checkboxes, persisting the divider ratio or preview mode, UI Automation text pattern for the rendered content.
 
 ## 4. Architecture
