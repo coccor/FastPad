@@ -1,8 +1,8 @@
 //! MSAA for the preview: a document object named "Markdown preview" whose children are the links
-//! currently on screen. It reads the view's link snapshot (safe from any thread) and activates a
+//! and section disclosures currently on screen. It reads the view's link snapshot (safe from any thread) and activates a
 //! link by posting to the preview window, which follows it on the UI thread.
 
-use crate::preview::view::VisibleLink;
+use crate::preview::view::{ACTIVATE_DISCLOSURE, VisibleLink};
 use crate::window::WM_FASTPAD_PREVIEW_ACTIVATE;
 use crate::window::accessibility::{
     AccessibleVtable, IID_IACCESSIBLE, IID_IDISPATCH, IID_IUNKNOWN, RawVariant, VariantValue,
@@ -19,11 +19,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows_sys::Win32::UI::Accessibility::{
-    LresultFromObject, ROLE_SYSTEM_DOCUMENT, ROLE_SYSTEM_LINK,
+    LresultFromObject, ROLE_SYSTEM_DOCUMENT, ROLE_SYSTEM_LINK, ROLE_SYSTEM_OUTLINEBUTTON,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GetClientRect, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId,
-    PostMessageW,
+    PostMessageW, STATE_SYSTEM_COLLAPSED, STATE_SYSTEM_EXPANDED,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -244,6 +244,7 @@ unsafe extern "system" fn role(
     }
     let role = match target(unsafe { item(this) }, &child) {
         Some(None) => ROLE_SYSTEM_DOCUMENT,
+        Some(Some(link)) if link.disclosure.is_some() => ROLE_SYSTEM_OUTLINEBUTTON,
         Some(Some(_)) => ROLE_SYSTEM_LINK,
         None => return E_INVALIDARG,
     };
@@ -269,7 +270,19 @@ unsafe extern "system" fn state(
             };
             STATE_SYSTEM_READONLY | STATE_SYSTEM_FOCUSABLE | focused
         }
-        Some(Some(_)) => STATE_SYSTEM_LINKED | STATE_SYSTEM_FOCUSABLE,
+        Some(Some(link)) => {
+            let focused = if link.focused && has_focus(item) {
+                STATE_SYSTEM_FOCUSED
+            } else {
+                0
+            };
+            let kind = match &link.disclosure {
+                Some(disclosure) if disclosure.expanded => STATE_SYSTEM_EXPANDED,
+                Some(_) => STATE_SYSTEM_COLLAPSED,
+                None => STATE_SYSTEM_LINKED,
+            };
+            kind | STATE_SYSTEM_FOCUSABLE | focused
+        }
         None => return E_INVALIDARG,
     };
     unsafe { *output = RawVariant::integer(state as i32) };
@@ -303,7 +316,14 @@ unsafe extern "system" fn default_action(
     output: *mut BSTR,
 ) -> HRESULT {
     match target(unsafe { item(this) }, &child) {
-        Some(Some(_)) => unsafe { allocate_bstr("Jump", output) },
+        Some(Some(link)) => {
+            let action = match &link.disclosure {
+                Some(disclosure) if disclosure.expanded => "Collapse",
+                Some(_) => "Expand",
+                None => "Jump",
+            };
+            unsafe { allocate_bstr(action, output) }
+        }
         Some(None) => unsafe { allocate_bstr("", output) },
         None => E_INVALIDARG,
     }
@@ -404,21 +424,39 @@ unsafe extern "system" fn hit_test(
 
 unsafe extern "system" fn do_default_action(this: *mut c_void, child: RawVariant) -> HRESULT {
     let item = unsafe { item(this) };
-    match target(item, &child) {
-        Some(Some(link)) => {
-            // Post the destination itself: the window's snapshot may change before the message is
-            // handled, and an index would then name another link.
-            let payload = Box::into_raw(Box::new(link.dest));
-            if unsafe { PostMessageW(item.hwnd, WM_FASTPAD_PREVIEW_ACTIVATE, 0, payload as isize) }
-                == 0
-            {
+    let Some(Some(link)) = target(item, &child) else {
+        return E_INVALIDARG;
+    };
+    // Post the destination or section key itself: the window's snapshot may change before the
+    // message is handled, and an index would then name another target.
+    let posted = match link.disclosure {
+        Some(disclosure) => {
+            let payload = Box::into_raw(Box::new(disclosure.key));
+            let posted = unsafe {
+                PostMessageW(
+                    item.hwnd,
+                    WM_FASTPAD_PREVIEW_ACTIVATE,
+                    ACTIVATE_DISCLOSURE,
+                    payload as isize,
+                )
+            } != 0;
+            if !posted {
                 drop(unsafe { Box::from_raw(payload) });
-                return E_FAIL;
             }
-            S_OK
+            posted
         }
-        _ => E_INVALIDARG,
-    }
+        None => {
+            let payload = Box::into_raw(Box::new(link.dest));
+            let posted = unsafe {
+                PostMessageW(item.hwnd, WM_FASTPAD_PREVIEW_ACTIVATE, 0, payload as isize)
+            } != 0;
+            if !posted {
+                drop(unsafe { Box::from_raw(payload) });
+            }
+            posted
+        }
+    };
+    if posted { S_OK } else { E_FAIL }
 }
 
 unsafe extern "system" fn put_text(
@@ -460,6 +498,23 @@ mod tests {
                 disclosure: None,
                 focused: false,
             },
+            VisibleLink {
+                text: "More".into(),
+                dest: String::new(),
+                rect: RECT {
+                    top: 70,
+                    bottom: 90,
+                    ..rect
+                },
+                disclosure: Some(crate::preview::view::Disclosure {
+                    key: crate::preview::outline::DetailsKey {
+                        summary: "More".into(),
+                        occurrence: 0,
+                    },
+                    expanded: false,
+                }),
+                focused: false,
+            },
         ]))
     }
 
@@ -494,7 +549,7 @@ mod tests {
             );
             assert_eq!(*Box::from_raw(msg.lParam as *mut String), "notes.md");
             assert_eq!(
-                (PREVIEW_VTABLE.acc_do_default_action)(provider, RawVariant::integer(3)),
+                (PREVIEW_VTABLE.acc_do_default_action)(provider, RawVariant::integer(4)),
                 E_INVALIDARG
             );
             (PREVIEW_VTABLE.release)(provider);
@@ -534,7 +589,7 @@ mod tests {
         unsafe {
             let mut count = 0;
             assert_eq!((table.get_acc_child_count)(provider, &mut count), S_OK);
-            assert_eq!(count, 2);
+            assert_eq!(count, 3);
 
             let mut name: BSTR = std::ptr::null();
             assert_eq!(
@@ -575,9 +630,62 @@ mod tests {
             assert_eq!(read_bstr(action), "Jump");
 
             assert_eq!(
-                (table.get_acc_name)(provider, RawVariant::integer(3), &mut name),
+                (table.get_acc_name)(provider, RawVariant::integer(4), &mut name),
                 E_INVALIDARG
             );
+            (table.release)(provider);
+        }
+    }
+
+    #[test]
+    fn disclosures_are_outline_buttons_that_post_their_section_key() {
+        use crate::preview::render::TestWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW};
+        let window = TestWindow::new(100, 100);
+        let provider = create_provider(window.0, links());
+        let table = &PREVIEW_VTABLE;
+        unsafe {
+            let mut role = RawVariant::empty();
+            assert_eq!(
+                (table.get_acc_role)(provider, RawVariant::integer(3), &mut role),
+                S_OK
+            );
+            assert_eq!(role.child_id(), Some(ROLE_SYSTEM_OUTLINEBUTTON as i32));
+
+            let mut state = RawVariant::empty();
+            assert_eq!(
+                (table.get_acc_state)(provider, RawVariant::integer(3), &mut state),
+                S_OK
+            );
+            let flags = state.child_id().unwrap() as u32;
+            assert_ne!(flags & STATE_SYSTEM_COLLAPSED, 0);
+            assert_eq!(flags & STATE_SYSTEM_LINKED, 0);
+
+            let mut action: BSTR = std::ptr::null();
+            assert_eq!(
+                (table.get_acc_default_action)(provider, RawVariant::integer(3), &mut action),
+                S_OK
+            );
+            assert_eq!(read_bstr(action), "Expand");
+
+            assert_eq!(
+                (table.acc_do_default_action)(provider, RawVariant::integer(3)),
+                S_OK
+            );
+            let mut msg = MSG::default();
+            assert_ne!(
+                PeekMessageW(
+                    &mut msg,
+                    window.0,
+                    WM_FASTPAD_PREVIEW_ACTIVATE,
+                    WM_FASTPAD_PREVIEW_ACTIVATE,
+                    PM_REMOVE,
+                ),
+                0
+            );
+            assert_eq!(msg.wParam, ACTIVATE_DISCLOSURE);
+            let key = Box::from_raw(msg.lParam as *mut crate::preview::outline::DetailsKey);
+            assert_eq!(key.summary, "More");
             (table.release)(provider);
         }
     }

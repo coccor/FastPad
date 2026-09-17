@@ -52,6 +52,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const CLASS_NAME: &str = "FastPadPreview";
+/// `WM_FASTPAD_PREVIEW_ACTIVATE` `wparam` for a disclosure: `lparam` is a `Box<DetailsKey>`. Links use
+/// `wparam` 0 with a `Box<String>`.
+pub const ACTIVATE_DISCLOSURE: usize = 1;
 /// `MK_SHIFT` from WinUser.h; its windows-sys home needs a feature FastPad does not enable.
 const MK_SHIFT: u32 = 0x0004;
 const PADDING: f32 = 16.0;
@@ -165,6 +168,9 @@ struct ViewState {
     outline: Option<Outline>,
     /// `<details>` sections the user toggled away from their `open` attribute.
     details_overrides: HashMap<DetailsKey, bool>,
+    /// A section toggled since the last paint; its accessible child raises a state change once the
+    /// snapshot shows the new state.
+    state_change: Option<DetailsKey>,
     stats: PreviewStats,
     opened_at: Option<Instant>,
     update_started: Option<Instant>,
@@ -214,6 +220,7 @@ impl PreviewView {
             paint_retried: false,
             outline: None,
             details_overrides: HashMap::new(),
+            state_change: None,
             stats: PreviewStats::default(),
             opened_at: None,
             update_started: None,
@@ -427,6 +434,7 @@ impl PreviewView {
             state.focus = None;
             state.outline = None;
             state.details_overrides = HashMap::new();
+            state.state_change = None;
             state.update_started = None;
             state.stats.block_count = 0;
             state.images.clear();
@@ -748,6 +756,8 @@ struct PaintOutcome {
     scroll: Option<SCROLLINFO>,
     /// Paint again: the device was lost, or a visible block is still without a layout.
     repaint: bool,
+    /// Accessible child id of a disclosure whose state changed, raised once the borrow has ended.
+    state_change: Option<i32>,
 }
 
 fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
@@ -899,6 +909,7 @@ fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             Ok(PaintOutcome {
                 scroll: None,
                 repaint: true,
+                state_change: None,
             })
         }
         Err(error) => Err(crate::preview::dwrite::hresult_error(error)),
@@ -912,6 +923,12 @@ fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             }
             state.stats.content_height = state.heights.total();
             let links = visible_links(state);
+            let state_change = state.state_change.take().and_then(|key| {
+                links
+                    .iter()
+                    .position(|link| link.disclosure.as_ref().is_some_and(|d| d.key == key))
+                    .map(|index| index as i32 + 1)
+            });
             *state
                 .accessible
                 .write()
@@ -919,6 +936,7 @@ fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             Ok(PaintOutcome {
                 scroll: Some(scroll_info(state, view_height)),
                 repaint,
+                state_change,
             })
         }
     }
@@ -1043,6 +1061,7 @@ fn toggle_details(state: &mut ViewState, key: &DetailsKey) {
     if matches!(ensure_layouts(state, &[block]), Ok(true)) {
         state.scroll_y = state.heights.scroll_for_anchor(reading);
     }
+    state.state_change = Some(key.clone());
     invalidate(state.hwnd);
 }
 
@@ -1229,6 +1248,7 @@ unsafe extern "system" fn preview_proc(
                     PaintOutcome {
                         scroll: None,
                         repaint: !std::mem::replace(&mut state.paint_retried, true),
+                        state_change: None,
                     }
                 }
             });
@@ -1240,6 +1260,16 @@ unsafe extern "system" fn preview_proc(
                 }
                 if outcome.repaint {
                     invalidate(hwnd);
+                }
+                if let Some(child) = outcome.state_change {
+                    unsafe {
+                        windows_sys::Win32::UI::Accessibility::NotifyWinEvent(
+                            windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_STATECHANGE,
+                            hwnd,
+                            windows_sys::Win32::UI::WindowsAndMessaging::OBJID_CLIENT,
+                            child,
+                        )
+                    };
                 }
             }
             0
@@ -1451,11 +1481,16 @@ unsafe extern "system" fn preview_proc(
             }
         }
         WM_FASTPAD_PREVIEW_ACTIVATE => {
-            // The accessibility provider resolved the destination against the snapshot the client
-            // saw; resolving an index here could land on another link after a repaint.
+            // The accessibility provider resolved the target against the snapshot the client saw;
+            // resolving an index here could land on another target after a repaint.
             if lparam != 0 {
-                let dest = *unsafe { Box::from_raw(lparam as *mut String) };
-                post_link(hwnd, dest);
+                if wparam == ACTIVATE_DISCLOSURE {
+                    let key = *unsafe { Box::from_raw(lparam as *mut DetailsKey) };
+                    with_state(hwnd, |state| toggle_details(state, &key));
+                } else {
+                    let dest = *unsafe { Box::from_raw(lparam as *mut String) };
+                    post_link(hwnd, dest);
+                }
             }
             0
         }
@@ -1924,6 +1959,33 @@ mod tests {
         );
         with_state(view.hwnd(), |state| set_scroll(state, top, true));
         assert_eq!(view.top_line(), details_line);
+        view.destroy();
+    }
+
+    #[test]
+    fn accessible_activation_toggles_a_disclosure_and_reports_the_change_once() {
+        let parent = TestWindow::new(800, 600);
+        let view = view_with(&parent, SECTION);
+        let key = visible_target(&view, true).disclosure.unwrap().key;
+        let payload = Box::into_raw(Box::new(key));
+        unsafe {
+            SendMessageW(
+                view.hwnd(),
+                WM_FASTPAD_PREVIEW_ACTIVATE,
+                ACTIVATE_DISCLOSURE,
+                payload as isize,
+            )
+        };
+        assert!(with_state(view.hwnd(), |state| state.state_change.is_some()).unwrap());
+        repaint(&view);
+        assert!(with_state(view.hwnd(), |state| state.state_change.is_none()).unwrap());
+        assert_eq!(
+            view.accessible_links().read().unwrap()[0]
+                .disclosure
+                .as_ref()
+                .map(|d| d.expanded),
+            Some(true)
+        );
         view.destroy();
     }
 }
