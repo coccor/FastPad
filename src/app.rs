@@ -71,6 +71,10 @@ pub struct App {
     menu_alt_pending: bool,
     pub(crate) recovery_root: Option<std::path::PathBuf>,
     pub(crate) recovery_owner: Option<crate::platform::OwnedHandle>,
+    /// `session.ini` for a primary window, resolved on first use; tests pre-seed it.
+    pub(crate) session_path: Option<std::path::PathBuf>,
+    /// Present while the last session's entries are still being reopened.
+    pub(crate) session_restore: Option<crate::session::SessionRestore>,
     // Declared before `instance_mutex` so an emergency drop closes the pipe before releasing the
     // mutex: a new primary must never claim the session while this server still exists.
     pub(crate) ipc: Option<crate::ipc::IpcServer>,
@@ -121,6 +125,8 @@ impl App {
             menu_alt_pending: false,
             recovery_root: None,
             recovery_owner: None,
+            session_path: None,
+            session_restore: None,
             ipc: None,
             instance_mutex: None,
             ipc_requests: Vec::new(),
