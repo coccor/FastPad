@@ -31,6 +31,44 @@
   - Run the full suite once, in Task 9.
 - In a git worktree, copy `native/out` (Scintilla/Lexilla DLLs) from the main checkout before running tests. Window tests need `--test-threads=1`.
 
+## Execution Batches
+
+The 9 tasks run as **3 batches**. Each batch has one test run, one review and one commit. Within a batch, follow each task's steps in order, but **skip the per-task "Run" and "Commit" steps**. The batch checkpoint replaces them.
+
+Checkpoint procedure for every batch:
+1. `cargo clippy --all-targets --all-features -- -D warnings` (this is the compile check).
+2. Run the batch's test command once.
+3. Review the whole batch diff (one reviewer pass for spec compliance and code quality).
+4. Commit once with the batch's message.
+
+If step 2 fails, fix the failure and re-run only the failing filter, not the whole command.
+
+### Batch A: Foundations (Tasks 1-5)
+
+Pure or small, independent changes: the setting, the manifest module, the deferred unit (pass-through), the toggle command, and the recovery helpers, titles and claimed-snapshot check. Nothing here changes close or startup behaviour yet.
+
+- **Test command** (`cargo test` takes one name filter per run, so loop over them):
+  ```bash
+  for f in config:: session:: window::messages window::commands window::command_palette window::menus bootstrap:: recovery:: document:: session_toggle recovery_never_reopens; do cargo test --lib "$f" -- --test-threads=1 -q || break; done
+  ```
+- **Commit:** `feat(session): setting, manifest, startup unit, toggle and recovery helpers`
+
+### Batch B: Behaviour (Tasks 6-7)
+
+Save on close and restore at startup. They share helpers (`session_path`, `enable_session`, `write_session`) and only make sense reviewed together.
+
+- **Test command:**
+  ```bash
+  for f in session_ recover window::main_window::tests::clos; do cargo test --lib "$f" -- --test-threads=1 -q || break; done
+  ```
+- **Commit:** `feat(window): save the session on close and reopen it after first paint`
+
+### Batch C: End to end and release checks (Tasks 8-9)
+
+The integration test, the primary-instance test audit, the README, and the final full verification. This batch's test run is Task 9's full suite: `cargo fmt --check`, clippy, then `cargo test -- --test-threads=1` once. That run already covers Task 8's `--test session` and the audited binaries, so do not run them separately beforehand. The exception is when fixing an audit failure, which is re-run with its own `--test <name>`.
+
+- **Commit:** `test: session relaunch end to end; docs: session restore`
+
 ## File Structure
 
 | File | Change | Responsibility |
