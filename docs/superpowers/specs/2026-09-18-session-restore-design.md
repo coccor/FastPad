@@ -110,11 +110,15 @@ Snapshots for dirty tabs stay in the normal `Recovery` folder. If the manifest w
 ### Behaviour
 
 1. On the first pass, if the setting is off, the process is not primary, or `read` returns `None`, post the next step at once.
+   A primary with the setting off also deletes any stale `session.ini` here (and again at close). Its snapshots come back through crash recovery instead.
 2. Otherwise, keep the parsed `Session` and a cursor in `App` (`pending_session: Option<SessionRestore>`), then delete `session.ini`. A crash during or after restore is then handled by crash recovery alone, and the manifest is never used twice.
+   - The single-instance pipe binds at this first restore pass, not at `START_IPC` (which then does nothing). A launch made during a long restore is forwarded to this window instead of timing out and opening a separate one.
+   - Forwarded opens are held in the queue until the restore finishes. The last pass posts the IPC drain, so a forwarded file opens after every restored tab and ends up active. A close during the restore still handles held requests before its review.
 3. Each pass restores one entry:
    - **`File(path)`** goes through `window::open_path`, so it reuses the loader, encoding detection and replacement of the clean initial untitled tab. A failure is counted and not reported yet, so it does not produce one notice per file.
    - **`Snapshot(id)`** reads `snapshot_path(recovery_root, id)` with the existing decoder. It opens through a variant of `open_recovered_snapshot` that binds the tab to `snapshot.original_path` when that path exists. The tab has `path = Some(original_path)`, is dirty, and has `recovery_origin` set to the session snapshot. That makes Ctrl+S save to the original file and then remove the snapshot, as the existing code already does after a save. Untitled snapshots open as untitled tabs, as they do today. A missing or invalid snapshot counts as a failure.
    - If a file-backed snapshot's path is already open in a tab, it opens as untitled with the recovery origin. `Tabs::push` rejects duplicate paths, so this keeps the unsaved text anyway.
+   - Right after a snapshot entry opens, its text is written to the tab's own snapshot (owned by this live process) and the source snapshot, owned by the exited process, is deleted. Other FastPad processes would otherwise treat the source as a crash leftover. If that write fails, the source stays.
    - After loading an entry, apply its language right away (`apply_detected_language`). A posted language step could otherwise run after the next entry had become active.
 4. After the last entry:
    - Close the empty startup tab if it is still clean, untitled and empty, and at least one entry was restored.
@@ -125,11 +129,13 @@ Snapshots for dirty tabs stay in the normal `Recovery` folder. If the manifest w
 
 ### Titles
 
-`RecoveryOrigin` gets a `from_session: bool`. A session-restored untitled tab is titled "Untitled", not "Recovered: Untitled", because nothing crashed.
+`RecoveryOrigin` gets a `from_session: bool`. A session-restored untitled tab is titled "Untitled", not "Recovered: Untitled", because nothing crashed. A session tab reopened untitled because its file was already open keeps the file's name as its title.
 
 ### Relation to crash recovery
 
 `recover_snapshots` runs after restore. It must skip any snapshot a restored tab already owns. Add that check where it tests `owns_recovery_id`: skip candidates whose snapshot path equals the `recovery_origin.snapshot_path` of an open document. That snapshot's owner process has exited, so without the check it would be treated as a crash snapshot and opened twice. The check also stops a later Ctrl+O from reopening an already-recovered crash snapshot, because every open re-runs the recovery step.
+
+While `restore_session` is on, every window (primary or not) also skips snapshots named by an existing `session.ini`: they wait for the primary's next restore. With the setting off they are recovered like any other.
 
 Every file open posts the language step, which carries on through the recovery step. `recover_snapshots` therefore returns early while a session restore is still in progress. It runs for real after `OPEN_REQUEST`, which always posts the language step again.
 

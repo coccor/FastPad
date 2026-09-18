@@ -717,7 +717,8 @@ fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
     if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_START_IPC) {
         recover_snapshots(hwnd);
     }
-    // Only `WM_FASTPAD_START_IPC` processed with no input pending produces this action.
+    // Only `WM_FASTPAD_START_IPC` processed with no input pending produces this action. A session
+    // restore has already bound the pipe, and binding again is a no-op.
     if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_BUILD_CHROME) {
         start_ipc_server_with(hwnd, crate::ipc::bind_session_server);
     }
@@ -2825,13 +2826,10 @@ fn review_dirty_documents(hwnd: HWND) -> Option<Vec<DocumentId>> {
 }
 
 fn start_recovery_timer(hwnd: HWND) {
-    let Some(interval) = (unsafe { app_ptr(hwnd) }).map(|mut app| {
-        let app = unsafe { app.as_mut() };
-        if app.recovery_owner.is_none() {
-            app.recovery_owner = crate::recovery::create_owner_mutex(app.recovery_owner_id()).ok();
-        }
-        app.settings.recovery_interval_seconds
-    }) else {
+    ensure_recovery_owner(hwnd);
+    let Some(interval) = (unsafe { app_ptr(hwnd) })
+        .map(|app| unsafe { app.as_ref() }.settings.recovery_interval_seconds)
+    else {
         return;
     };
     unsafe {
@@ -2841,6 +2839,17 @@ fn start_recovery_timer(hwnd: HWND) {
             crate::recovery::timer_period_ms(interval),
             None,
         );
+    }
+}
+
+/// Holds the named mutex that tells other FastPad processes this one's snapshots are live, not
+/// crash leftovers. Creating it again is a no-op once held.
+fn ensure_recovery_owner(hwnd: HWND) {
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        let app = unsafe { app.as_mut() };
+        if app.recovery_owner.is_none() {
+            app.recovery_owner = crate::recovery::create_owner_mutex(app.recovery_owner_id()).ok();
+        }
     }
 }
 
@@ -3045,6 +3054,12 @@ fn restore_session_step(hwnd: HWND) -> RestoreStep {
 /// the empty startup tab so it can be closed. False when there is nothing to restore.
 fn begin_session_restore(hwnd: HWND) -> bool {
     let Some(path) = session_path(hwnd) else {
+        // With the setting off this primary never restores the manifest, and its snapshots come
+        // back through crash recovery instead. Left in place, it would reopen them a second time
+        // once the setting is turned back on, and keep hiding them from other windows' recovery.
+        if let Some(stale) = disabled_session_path(hwnd) {
+            crate::session::remove(&stale);
+        }
         return false;
     };
     let Some(session) = crate::session::read(&path) else {
@@ -3055,12 +3070,26 @@ fn begin_session_restore(hwnd: HWND) -> bool {
         return false;
     }
     let placeholder = empty_startup_tab(hwnd);
+    // Restored snapshots are rewritten under this process's IDs, which only count as live while
+    // it holds the owner mutex. `load_settings` has normally created it already.
+    ensure_recovery_owner(hwnd);
     let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
         return false;
     };
     unsafe { app.as_mut() }.session_restore =
         Some(crate::session::SessionRestore::new(session, placeholder));
+    bind_ipc_for_restore(hwnd);
     true
+}
+
+/// A launch made while a long session is reopening must reach this window, not time out and
+/// open a separate one. `handle_ipc_requests` holds what it forwards until the restore is done.
+/// Tests never bind the real single-instance pipe.
+fn bind_ipc_for_restore(hwnd: HWND) {
+    #[cfg(not(test))]
+    start_ipc_server_with(hwnd, crate::ipc::bind_session_server);
+    #[cfg(test)]
+    let _ = hwnd;
 }
 
 /// The active tab when it is still the empty, untouched untitled tab every launch starts with.
@@ -3088,10 +3117,57 @@ fn restore_session_entry(hwnd: HWND, entry: &crate::session::SessionEntry) -> Op
             let snapshot = crate::recovery::Snapshot::decode(&std::fs::read(&path).ok()?).ok()?;
             let candidate = crate::recovery::SnapshotCandidate { path, snapshot };
             open_snapshot_tab(hwnd, &identity, candidate, SnapshotTab::Session).ok()?;
+            adopt_restored_snapshot(hwnd, &identity, &root);
         }
     }
     apply_detected_language(hwnd);
     unsafe { app_ptr(hwnd) }.and_then(|app| Some(unsafe { app.as_ref() }.tabs.active()?.id))
+}
+
+/// The snapshot a session tab was just restored from belongs to the previous, exited process, so
+/// every other FastPad process would take it for a crash leftover and offer it as "Recovered".
+/// Rewriting the text under the tab's own ID, owned by this live process, and then removing the
+/// source closes that gap. A failed write keeps the source, so the text is always in some file.
+fn adopt_restored_snapshot(hwnd: HWND, identity: &WindowIdentity, root: &std::path::Path) {
+    let job = unsafe { app_ptr(hwnd) }.and_then(|app| {
+        let app = unsafe { app.as_ref() };
+        let editor = app.editor.clone()?;
+        let document = app.tabs.active()?;
+        let origin = document.recovery_origin.as_ref()?;
+        Some((
+            editor,
+            document.id,
+            document.generation,
+            document.recovery_id,
+            document
+                .path
+                .clone()
+                .or_else(|| origin.original_path.clone()),
+            document.encoding,
+            origin.snapshot_path.clone(),
+        ))
+    });
+    let Some((editor, id, generation, recovery_id, original_path, encoding, source)) = job else {
+        return;
+    };
+    let Ok(text) = editor.text() else {
+        return;
+    };
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
+    let snapshot = crate::recovery::Snapshot::new(recovery_id, original_path, encoding, text);
+    let Ok(written) = crate::recovery::write_snapshot(root, &snapshot) else {
+        return;
+    };
+    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+        unsafe { app.as_mut() }
+            .tabs
+            .record_recovery_generation(id, generation);
+    }
+    if written != source {
+        crate::recovery::remove_snapshot_files(&[source]);
+    }
 }
 
 /// Closes the empty startup tab once something replaced it, shows the saved active tab with its
@@ -3130,6 +3206,11 @@ fn finish_session_restore(hwnd: HWND) {
     if restore.failed > 0 {
         push_notice(hwnd, crate::session::restore_failure_notice(restore.failed));
     }
+    // Launches forwarded during the restore were held in the queue. They open now, after every
+    // restored tab, so the file the user just asked for ends up active.
+    unsafe {
+        PostMessageW(hwnd, crate::window::WM_FASTPAD_IPC_REQUEST, 0, 0);
+    }
 }
 
 /// A reused startup tab now has a path, and a typed-in one is dirty. Neither may be closed.
@@ -3157,6 +3238,31 @@ fn apply_view_state(hwnd: HWND, entry: &crate::session::SessionEntry) {
     let _ = editor.set_first_visible_line(entry.first_line);
 }
 
+/// Snapshot files a saved `session.ini` still names. They are waiting for the primary window's
+/// next restore, not left by a crash, so no window recovers them while session restore is on,
+/// primary or not. With it off they come back through crash recovery like any other.
+fn saved_session_snapshots(hwnd: HWND, root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let enabled = unsafe { app_ptr(hwnd) }
+        .is_some_and(|app| unsafe { app.as_ref() }.settings.restore_session);
+    let Some(session) = enabled
+        .then(|| session_manifest_path(hwnd))
+        .flatten()
+        .and_then(|path| crate::session::read(&path))
+    else {
+        return Vec::new();
+    };
+    session
+        .entries
+        .iter()
+        .filter_map(|entry| match entry.source {
+            crate::session::SessionSource::Snapshot(id) => {
+                Some(crate::recovery::snapshot::snapshot_path(root, id))
+            }
+            crate::session::SessionSource::File(_) => None,
+        })
+        .collect()
+}
+
 /// Opens every valid foreign snapshot as a recovered tab and reports them with one notice.
 fn recover_snapshots(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
@@ -3177,8 +3283,12 @@ fn recover_snapshots(hwnd: HWND) {
     else {
         return;
     };
+    let saved = saved_session_snapshots(hwnd, &root);
     let mut recovered = 0;
     for candidate in candidates {
+        if saved.contains(&candidate.path) {
+            continue;
+        }
         // This process's own snapshots, and ones an open tab was already recovered or restored
         // from, are held by a live tab rather than left behind by a crash.
         let claimed = unsafe { app_ptr(hwnd) }.is_none_or(|app| {
@@ -3294,6 +3404,18 @@ pub(crate) fn service_ipc(hwnd: HWND, identity: &WindowIdentity) {
 }
 
 fn handle_ipc_requests(hwnd: HWND) -> LRESULT {
+    // The pipe is bound as soon as a session restore starts. A forwarded file opened now would
+    // be buried under the tabs still to be restored, so requests wait in the queue until
+    // `finish_session_restore` posts this message again.
+    if unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.session_restore.is_some())
+    {
+        return 0;
+    }
+    open_ipc_requests(hwnd)
+}
+
+/// Handles every queued forwarded launch now, restore or not.
+fn open_ipc_requests(hwnd: HWND) -> LRESULT {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return 0;
     };
@@ -3490,11 +3612,30 @@ fn remove_session_snapshots(hwnd: HWND, discarded: &[DocumentId]) {
 /// Where this window keeps its session, or `None` when it does not take part: session restore
 /// is off, or this is not the primary instance. Tests never resolve the real path.
 fn session_path(hwnd: HWND) -> Option<std::path::PathBuf> {
-    let mut app = unsafe { app_ptr(hwnd) }?;
-    let app = unsafe { app.as_mut() };
+    let app = unsafe { app_ptr(hwnd) }?;
+    let app = unsafe { app.as_ref() };
     if !app.settings.restore_session || app.instance_mutex.is_none() {
         return None;
     }
+    session_manifest_path(hwnd)
+}
+
+/// The primary window's manifest when session restore is off, so a stale one can be deleted.
+fn disabled_session_path(hwnd: HWND) -> Option<std::path::PathBuf> {
+    let app = unsafe { app_ptr(hwnd) }?;
+    let app = unsafe { app.as_ref() };
+    if app.settings.restore_session || app.instance_mutex.is_none() {
+        return None;
+    }
+    session_manifest_path(hwnd)
+}
+
+/// Where the manifest lives, whichever window asks. Only `session_path` and
+/// `disabled_session_path` decide whether this window may change it. Tests never resolve the
+/// real path, only a pre-seeded `App::session_path`.
+fn session_manifest_path(hwnd: HWND) -> Option<std::path::PathBuf> {
+    let mut app = unsafe { app_ptr(hwnd) }?;
+    let app = unsafe { app.as_mut() };
     #[cfg(not(test))]
     if app.session_path.is_none() {
         app.session_path = crate::session::session_file_path().ok();
@@ -3510,6 +3651,11 @@ fn save_session_for_close(hwnd: HWND) -> bool {
         return false;
     };
     let Some(path) = session_path(hwnd) else {
+        // Turned off during this session: a manifest from an earlier close must not outlive the
+        // prompts this close shows instead.
+        if let Some(stale) = disabled_session_path(hwnd) {
+            crate::session::remove(&stale);
+        }
         return false;
     };
     // Mid-restore, the manifest is gone and unrestored entries are in no tab. The review flow
@@ -3604,14 +3750,17 @@ fn build_session(hwnd: HWND, root: &std::path::Path) -> Option<crate::session::S
     Some(session)
 }
 
-/// Services the pipe and handles everything already queued, before a close review begins.
+/// Services the pipe and handles everything already queued, before a close review begins. This
+/// ignores the mid-restore hold: a close then uses the review, which must see a forwarded file
+/// as a tab rather than drop it with the window. If the review is cancelled, the restore goes on
+/// and the extra tab is simply one more open tab.
 fn drain_ipc_requests(hwnd: HWND) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
     service_ipc(hwnd, &identity);
     if identity.is_live_for(hwnd) {
-        handle_ipc_requests(hwnd);
+        open_ipc_requests(hwnd);
     }
 }
 
@@ -5926,9 +6075,16 @@ mod tests {
     #[test]
     fn session_close_still_prompts_when_restore_is_off() {
         // Break caught: the setting being ignored, so unsaved text is kept silently even though
-        // the user asked to be prompted.
+        // the user asked to be prompted, or a manifest from an earlier close outliving it.
         let _scintilla = load_native_scintilla();
         let scratch = RecoveryScratch::new("session-off");
+        write_session(
+            &scratch,
+            vec![SessionEntry::new(SessionSource::Snapshot(
+                RecoveryId::from_u128(0x5e58),
+            ))],
+            0,
+        );
         let window = ProductionWindow::new(make_app());
         let editor = install_test_editor(&window);
         enable_session(window.hwnd, &scratch);
@@ -5962,7 +6118,8 @@ mod tests {
     fn session_restore_reopens_files_and_unsaved_text_in_order() {
         // Break caught: restored tabs out of order, an unsaved file reopening untitled (so Ctrl+S
         // asks for a path), a stray empty startup tab, a lost caret, a manifest that restores
-        // twice, or crash recovery opening a restored snapshot again.
+        // twice, crash recovery opening a restored snapshot again, or a restored tab still
+        // pointing at the exited process's snapshot, which other windows would recover.
         let _scintilla = load_native_scintilla();
         let scratch = RecoveryScratch::new("session-restore");
         let recovery = scratch.path().join("Recovery");
@@ -6026,6 +6183,27 @@ mod tests {
             !scratch.path().join("session.ini").exists(),
             "the manifest is consumed"
         );
+        let own = |index: usize| {
+            let id = app_mut(window.hwnd)
+                .tabs
+                .documents()
+                .nth(index)
+                .unwrap()
+                .recovery_id;
+            crate::recovery::snapshot::snapshot_path(&recovery, id)
+        };
+        for (index, source, text) in [
+            (0, draft_id, "unsaved draft"),
+            (2, scratch_id, "scratch words"),
+        ] {
+            assert!(
+                !crate::recovery::snapshot::snapshot_path(&recovery, source).exists(),
+                "the dead process's snapshot would look like a crash leftover to other windows"
+            );
+            let adopted = Snapshot::decode(&std::fs::read(own(index)).unwrap()).unwrap();
+            assert_eq!(adopted.text, text);
+        }
+        let draft_snapshot = own(0);
 
         unsafe { SendMessageW(window.hwnd, crate::window::WM_FASTPAD_RECOVERY, 0, 0) };
         assert_eq!(
@@ -6037,7 +6215,7 @@ mod tests {
         execute_command(window.hwnd, CommandId::Save);
         assert_eq!(std::fs::read_to_string(&draft).unwrap(), "unsaved draft");
         assert!(
-            !crate::recovery::snapshot::snapshot_path(&recovery, draft_id).exists(),
+            !draft_snapshot.exists(),
             "saving a restored tab removes its snapshot"
         );
     }
@@ -6084,8 +6262,7 @@ mod tests {
 
     #[test]
     fn session_restore_ignores_a_window_outside_the_session() {
-        // Break caught: a --new-window instance or a disabled setting consuming the primary
-        // window's session.
+        // Break caught: a --new-window instance consuming the primary window's session.
         let _scintilla = load_native_scintilla();
         let scratch = RecoveryScratch::new("session-outside");
         let notes = scratch.path().join("notes.txt");
@@ -6099,15 +6276,147 @@ mod tests {
         let _editor = install_test_editor(&window);
         enable_session(window.hwnd, &scratch);
 
-        app_mut(window.hwnd).settings.restore_session = false;
-        run_session_restore(window.hwnd);
-        app_mut(window.hwnd).settings.restore_session = true;
         app_mut(window.hwnd).instance_mutex = None;
         run_session_restore(window.hwnd);
 
         assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
         assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().path, None);
         assert!(scratch.path().join("session.ini").exists());
+    }
+
+    #[test]
+    fn session_restore_with_the_setting_off_deletes_a_stale_manifest() {
+        // Break caught: a primary with the setting off leaving an old manifest behind, so turning
+        // the setting back on later reopens tabs crash recovery already brought back.
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-stale");
+        let notes = scratch.path().join("notes.txt");
+        std::fs::write(&notes, "saved text").unwrap();
+        write_session(
+            &scratch,
+            vec![SessionEntry::new(SessionSource::File(notes))],
+            0,
+        );
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        app_mut(window.hwnd).settings.restore_session = false;
+
+        run_session_restore(window.hwnd);
+
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+        assert_eq!(app_mut(window.hwnd).tabs.active().unwrap().path, None);
+        assert!(app_mut(window.hwnd).session_restore.is_none());
+        assert!(!scratch.path().join("session.ini").exists());
+    }
+
+    #[test]
+    fn recovery_leaves_snapshots_a_saved_session_names_while_restore_is_on() {
+        // Break caught: a --new-window instance recovering the primary's saved unsaved tabs as
+        // "Recovered: ..." (and deleting them on Discard) before the next launch restores them.
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-recover-skip");
+        let recovery = scratch.path().join("Recovery");
+        let saved_id = RecoveryId::from_u128(0x5e57);
+        write_snapshot(
+            &recovery,
+            &Snapshot::new(saved_id, None, Encoding::Utf8, "kept for the session"),
+        )
+        .unwrap();
+        write_session(
+            &scratch,
+            vec![SessionEntry::new(SessionSource::Snapshot(saved_id))],
+            0,
+        );
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        app_mut(window.hwnd).instance_mutex = None;
+
+        super::recover_snapshots(window.hwnd);
+
+        assert_eq!(
+            app_mut(window.hwnd).tabs.len(),
+            1,
+            "the saved snapshot waits"
+        );
+        assert!(crate::recovery::snapshot::snapshot_path(&recovery, saved_id).exists());
+
+        app_mut(window.hwnd).settings.restore_session = false;
+        super::recover_snapshots(window.hwnd);
+
+        assert_eq!(
+            app_mut(window.hwnd).tabs.len(),
+            2,
+            "with the setting off, crash recovery brings it back"
+        );
+    }
+
+    #[test]
+    fn session_restore_holds_forwarded_launches_until_it_finishes() {
+        // Break caught: a forwarded file opening mid-restore and being buried under the rest of
+        // the session, or never opening because the held request is not replayed.
+        use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-forwarded");
+        let first = scratch.path().join("first.txt");
+        std::fs::write(&first, "one").unwrap();
+        let second = scratch.path().join("second.txt");
+        std::fs::write(&second, "two").unwrap();
+        let forwarded = scratch.path().join("forwarded.txt");
+        std::fs::write(&forwarded, "asked for mid-restore").unwrap();
+        write_session(
+            &scratch,
+            vec![
+                SessionEntry::new(SessionSource::File(first)),
+                SessionEntry::new(SessionSource::File(second)),
+            ],
+            0,
+        );
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        let restore = crate::window::WM_FASTPAD_RESTORE_SESSION;
+        let request = crate::window::WM_FASTPAD_IPC_REQUEST;
+
+        unsafe { PostMessageW(window.hwnd, restore, 0, 0) };
+        let mut message = MSG::default();
+        assert_ne!(
+            unsafe { PeekMessageW(&mut message, window.hwnd, restore, restore, PM_REMOVE) },
+            0
+        );
+        unsafe { DispatchMessageW(&message) };
+        assert!(app_mut(window.hwnd).session_restore.is_some());
+        app_mut(window.hwnd)
+            .ipc_requests
+            .push(crate::ipc::IpcRequest::Open(forwarded.clone()));
+        unsafe { SendMessageW(window.hwnd, request, 0, 0) };
+
+        assert!(
+            app_mut(window.hwnd).tabs.find_path(&forwarded).is_none(),
+            "a forwarded file must wait for the restore"
+        );
+        assert_eq!(app_mut(window.hwnd).ipc_requests.len(), 1);
+
+        run_session_restore(window.hwnd);
+        assert!(app_mut(window.hwnd).session_restore.is_none());
+        assert_ne!(
+            unsafe { PeekMessageW(&mut message, window.hwnd, request, request, PM_REMOVE) },
+            0,
+            "finishing the restore replays the held requests"
+        );
+        unsafe { DispatchMessageW(&message) };
+        discard_posted(window.hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE);
+        discard_posted(window.hwnd, crate::window::WM_FASTPAD_RECOVERY);
+        discard_posted(window.hwnd, crate::window::WM_FASTPAD_OPEN_REQUEST);
+
+        let app = app_mut(window.hwnd);
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(
+            app.tabs.active().unwrap().path.as_deref(),
+            Some(forwarded.as_path())
+        );
+        assert_eq!(editor.text().unwrap(), "asked for mid-restore");
     }
 
     #[test]
@@ -6236,6 +6545,40 @@ mod tests {
             0,
             "Cancel keeps the window"
         );
+    }
+
+    #[test]
+    fn session_close_falls_back_to_the_prompt_when_a_snapshot_cannot_be_written() {
+        // Break caught: a dirty tab whose text reached no snapshot file closing silently, so the
+        // manifest names nothing for it and the user was never asked.
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-no-snapshot");
+        let blocker = scratch.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a folder").unwrap();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        app_mut(window.hwnd).recovery_root = Some(blocker);
+        editor.set_text("unsaved words").unwrap();
+        let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = std::rc::Rc::clone(&prompted);
+        answer_next_close_prompt(move |_| {
+            seen.set(true);
+            CloseDecision::Cancel
+        });
+
+        unsafe { SendMessageW(window.hwnd, WM_CLOSE, 0, 0) };
+
+        assert!(
+            prompted.get(),
+            "a failed snapshot write must fall back to the prompt"
+        );
+        assert_ne!(
+            unsafe { IsWindow(window.hwnd) },
+            0,
+            "Cancel keeps the window"
+        );
+        assert!(!scratch.path().join("session.ini").exists());
     }
 
     #[test]

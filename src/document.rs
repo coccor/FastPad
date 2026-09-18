@@ -113,6 +113,9 @@ impl Document {
             (None, Some(origin)) if !origin.from_session => {
                 format!("Recovered: {}", origin.display_name())
             }
+            // A session tab reopened unbound, because its file was already open elsewhere,
+            // still names that file.
+            (None, Some(origin)) => origin.display_name(),
             (path, _) => file_name_or_untitled(path.as_deref()),
         };
         if self.dirty {
@@ -193,6 +196,19 @@ mod tests {
         assert_eq!(document.title(), "Untitled *");
         document.recovery_origin.as_mut().unwrap().from_session = false;
         assert_eq!(document.title(), "Recovered: Untitled *");
+    }
+
+    #[test]
+    fn session_tabs_reopened_without_their_path_keep_the_file_name() {
+        // Break caught: an unsaved session tab whose file was already open in another tab coming
+        // back as a bare "Untitled", so nothing says which file its text belongs to.
+        let mut document = Document::test_fixture(DocumentId(1), true);
+        document.recovery_origin = Some(super::RecoveryOrigin {
+            snapshot_path: std::path::PathBuf::from(r"C:\Recovery\a.fps"),
+            original_path: Some(std::path::PathBuf::from(r"C:\docs\notes.md")),
+            from_session: true,
+        });
+        assert_eq!(document.title(), "notes.md *");
     }
 
     #[test]
