@@ -535,6 +535,11 @@ fn run_once(launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
         return Err(last_error().to_string());
     }
     let unique = format!("{}-{name_counter}", std::process::id());
+    // The child is launched without `--new-window`, so it becomes the primary instance and would
+    // otherwise resolve its settings/session paths from the real user profile via `LOCALAPPDATA`.
+    // Each run gets its own scratch profile so the benchmark never reads or writes real user data
+    // and never carries a session manifest from one run into the next.
+    let local_app_data = ScratchLocalAppData::create(&unique)?;
     let mapping_name = wide_null(&format!("Local\\FastPadBenchMapping-{unique}"));
     let event_name = wide_null(&format!("Local\\FastPadBenchEvent-{unique}"));
     let security = SECURITY_ATTRIBUTES {
@@ -588,6 +593,7 @@ fn run_once(launch_file: Option<&Path>) -> Result<BenchmarkRecord, String> {
         MAPPING_HANDLE_ENV,
         EVENT_HANDLE_ENV,
         QPC_ORIGIN_ENV,
+        local_app_data.path(),
     )?;
     let origin_marker = format!("{QPC_ORIGIN_ENV}={origin_placeholder}")
         .encode_utf16()
@@ -710,17 +716,24 @@ fn diagnostic_environment_block(
     mapping_name: &str,
     event_name: &str,
     origin_name: &str,
+    local_app_data: &Path,
 ) -> Result<Vec<u16>, String> {
+    const LOCAL_APP_DATA_NAME: &str = "LOCALAPPDATA";
     let mut values = std::env::vars_os().collect::<Vec<_>>();
     values.retain(|(name, _)| {
         let name = name.to_string_lossy();
         !name.eq_ignore_ascii_case(mapping_name)
             && !name.eq_ignore_ascii_case(event_name)
             && !name.eq_ignore_ascii_case(origin_name)
+            && !name.eq_ignore_ascii_case(LOCAL_APP_DATA_NAME)
     });
     values.push((mapping_name.into(), (mapping as usize).to_string().into()));
     values.push((event_name.into(), (event as usize).to_string().into()));
     values.push((origin_name.into(), origin.into()));
+    values.push((
+        LOCAL_APP_DATA_NAME.into(),
+        local_app_data.as_os_str().to_owned(),
+    ));
     values.sort_by(|(left, _), (right, _)| {
         left.to_string_lossy()
             .to_ascii_uppercase()
@@ -751,6 +764,34 @@ fn write_fixed_decimal(target: &mut [u16], value: i64) -> Result<(), String> {
         *slot = u16::from(byte);
     }
     Ok(())
+}
+
+/// A private `LOCALAPPDATA` for one benchmark run, so the primary-instance child under
+/// measurement never reads or writes the real user's `fastpad.ini`/`session.ini`/`Recovery`.
+/// Removed on drop, including on an early `?` return, so failed runs do not leak scratch
+/// directories.
+#[cfg(windows)]
+struct ScratchLocalAppData(PathBuf);
+
+#[cfg(windows)]
+impl ScratchLocalAppData {
+    fn create(unique: &str) -> Result<Self, String> {
+        let root = std::env::temp_dir().join(format!("fastpad-bench-{unique}"));
+        std::fs::create_dir_all(root.join("FastPad"))
+            .map_err(|error| format!("could not create {}: {error}", root.display()))?;
+        Ok(Self(root))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ScratchLocalAppData {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[cfg(windows)]

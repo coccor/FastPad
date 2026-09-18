@@ -11,10 +11,11 @@ pub const DEFAULT_WORD_WRAP: bool = false;
 pub const DEFAULT_LINE_NUMBERS: bool = true;
 pub const DEFAULT_THEME: ThemePreference = ThemePreference::System;
 pub const DEFAULT_RECOVERY_INTERVAL_SECONDS: u32 = 30;
+pub const DEFAULT_RESTORE_SESSION: bool = true;
 
 /// FastPad's compiled defaults: Consolas 11pt, 4-wide tabs, word wrap off, line numbers on, system
-/// theme, and a 30-second crash-recovery interval. Every value a settings file does not (validly) specify keeps
-/// whatever `default_settings()` produced.
+/// theme, a 30-second crash-recovery interval, and session restore on. Every value a settings file
+/// does not (validly) specify keeps whatever `default_settings()` produced.
 pub fn default_settings() -> Settings {
     Settings {
         font_face: DEFAULT_FONT_FACE.to_owned(),
@@ -24,6 +25,7 @@ pub fn default_settings() -> Settings {
         line_numbers: DEFAULT_LINE_NUMBERS,
         theme: DEFAULT_THEME,
         recovery_interval_seconds: DEFAULT_RECOVERY_INTERVAL_SECONDS,
+        restore_session: DEFAULT_RESTORE_SESSION,
     }
 }
 
@@ -43,5 +45,6 @@ mod tests {
         assert!(settings.line_numbers);
         assert_eq!(settings.theme, ThemePreference::System);
         assert_eq!(settings.recovery_interval_seconds, 30);
+        assert!(settings.restore_session);
     }
 }

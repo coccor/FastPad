@@ -116,6 +116,20 @@ pub fn snapshot_path(root: &Path, recovery_id: RecoveryId) -> PathBuf {
     root.join(format!("{:032x}.{EXTENSION}", recovery_id.0))
 }
 
+/// The recovery ID a snapshot file is named after, or `None` for any other file name.
+pub fn snapshot_file_id(path: &Path) -> Option<RecoveryId> {
+    if path.extension()? != EXTENSION {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    if stem.len() != 32 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u128::from_str_radix(stem, 16)
+        .ok()
+        .map(RecoveryId::from_u128)
+}
+
 pub fn write_snapshot(root: &Path, snapshot: &Snapshot) -> Result<PathBuf> {
     let bytes = snapshot.encode()?;
     std::fs::create_dir_all(root)?;
@@ -234,10 +248,22 @@ fn too_large() -> FastPadError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Snapshot, discover_snapshots, write_snapshot};
+    use super::{Snapshot, discover_snapshots, snapshot_file_id, snapshot_path, write_snapshot};
     use crate::document::RecoveryId;
     use crate::file::encoding::Encoding;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn snapshot_files_name_their_recovery_id() {
+        let root = Path::new(r"C:\Recovery");
+        let id = RecoveryId::from_u128(0x1234);
+        assert_eq!(snapshot_file_id(&snapshot_path(root, id)), Some(id));
+        assert_eq!(snapshot_file_id(Path::new(r"C:\Recovery\1234.fps")), None);
+        assert_eq!(
+            snapshot_file_id(&root.join(format!("{:032x}.txt", 0x1234))),
+            None
+        );
+    }
 
     #[test]
     fn snapshot_round_trip_preserves_metadata_and_text() {

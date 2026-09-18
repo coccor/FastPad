@@ -118,5 +118,9 @@ name = "single_instance"
 path = "tests/windows/single_instance.rs"
 
 [[test]]
+name = "session"
+path = "tests/windows/session.rs"
+
+[[test]]
 name = "markdown_preview"
 path = "tests/windows/markdown_preview.rs"

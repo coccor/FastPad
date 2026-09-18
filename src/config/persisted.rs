@@ -33,6 +33,8 @@ pub struct Settings {
     pub line_numbers: bool,
     pub theme: ThemePreference,
     pub recovery_interval_seconds: u32,
+    /// Whether the primary window reopens the last session's tabs and closes without prompting.
+    pub restore_session: bool,
 }
 
 impl Settings {
@@ -61,6 +63,9 @@ impl Settings {
         if let Some(recovery_interval_seconds) = delta.recovery_interval_seconds {
             self.recovery_interval_seconds = recovery_interval_seconds;
         }
+        if let Some(restore_session) = delta.restore_session {
+            self.restore_session = restore_session;
+        }
     }
 }
 
@@ -86,16 +91,17 @@ pub struct SettingsDelta {
     pub line_numbers: Option<bool>,
     pub theme: Option<ThemePreference>,
     pub recovery_interval_seconds: Option<u32>,
+    pub restore_session: Option<bool>,
     pub warnings: Vec<SettingWarning>,
 }
 
 /// Parses a hand-written, tolerant `.ini`-style settings source: one `key=value` pair per line: ASCII
 /// whitespace is trimmed from both the raw line and the split key/value, blank lines and `#` comment
 /// lines are skipped, and exactly `font_face`, `font_size`, `tab_width`, `word_wrap`,
-/// `line_numbers`, `theme`, and `recovery_interval_seconds` are recognized. Every line is handled
-/// independently: a line with an unknown key, a value that fails to parse, or no `=` at all records
-/// one `SettingWarning` and is otherwise skipped — it never discards, and is never affected by, any
-/// other line's outcome.
+/// `line_numbers`, `theme`, `recovery_interval_seconds`, and `restore_session` are recognized. Every
+/// line is handled independently: a line with an unknown key, a value that fails to parse, or no `=`
+/// at all records one `SettingWarning` and is otherwise skipped — it never discards, and is never
+/// affected by, any other line's outcome.
 pub fn parse(source: &str) -> SettingsDelta {
     let mut delta = SettingsDelta::default();
     // An editor that saves fastpad.ini with a UTF-8 BOM must not hide its first setting.
@@ -150,6 +156,10 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         "recovery_interval_seconds" => match value.parse::<u32>() {
             Ok(seconds) if seconds > 0 => delta.recovery_interval_seconds = Some(seconds),
             _ => warn(delta, line_number, key, value),
+        },
+        "restore_session" => match parse_bool(value) {
+            Some(restore_session) => delta.restore_session = Some(restore_session),
+            None => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
             line: line_number,
@@ -437,6 +447,22 @@ mod tests {
         let mut settings = default_settings();
         settings.apply_delta(&parse("line_numbers=0"));
         assert!(!settings.line_numbers);
+    }
+
+    #[test]
+    fn restore_session_defaults_on_and_accepts_the_boolean_spellings() {
+        // Break caught: session restore that is off for a brand-new profile, or that cannot be
+        // switched off from fastpad.ini.
+        assert!(default_settings().restore_session);
+        assert_eq!(parse("restore_session=off").restore_session, Some(false));
+        assert_eq!(parse("restore_session=Yes").restore_session, Some(true));
+        let delta = parse("restore_session=later");
+        assert_eq!(delta.restore_session, None);
+        assert_eq!(delta.warnings.len(), 1);
+
+        let mut settings = default_settings();
+        settings.apply_delta(&parse("restore_session=0"));
+        assert!(!settings.restore_session);
     }
 
     #[test]

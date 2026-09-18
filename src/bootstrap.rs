@@ -714,17 +714,17 @@ mod tests {
             )
         };
         assert_eq!(load_settings_status, 0);
-        let open_request_status = unsafe {
+        let restore_session_status = unsafe {
             PeekMessageW(
                 &mut queued,
                 std::ptr::null_mut(),
-                crate::window::WM_FASTPAD_OPEN_REQUEST,
-                crate::window::WM_FASTPAD_OPEN_REQUEST,
+                crate::window::WM_FASTPAD_RESTORE_SESSION,
+                crate::window::WM_FASTPAD_RESTORE_SESSION,
                 PM_REMOVE,
             )
         };
-        assert_ne!(open_request_status, 0);
-        assert_eq!(queued.message, crate::window::WM_FASTPAD_OPEN_REQUEST);
+        assert_ne!(restore_session_status, 0);
+        assert_eq!(queued.message, crate::window::WM_FASTPAD_RESTORE_SESSION);
 
         let input_messages = super::TEST_DISPATCHED_MESSAGES
             .with(|messages| messages.borrow().clone())

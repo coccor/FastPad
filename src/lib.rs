@@ -13,6 +13,7 @@ pub mod perf;
 pub mod platform;
 pub mod preview;
 pub mod recovery;
+pub mod session;
 pub mod window;
 
 pub use error::FastPadError;

@@ -132,6 +132,13 @@ FastPad quietly snapshots unsaved documents every 30 seconds while you edit. If 
 loses power or reboots for an update, the next launch brings your work back as unsaved tabs. Saving
 or discarding a recovered tab cleans up after itself.
 
+### Pick up where you left off
+
+Close FastPad and the next launch reopens every tab, including unsaved edits and untitled notes,
+with the tab you were on active. Closing never nags about unsaved changes while this is on. Turn
+it off with **File > Restore session on startup** or `restore_session=false`, and FastPad asks
+before closing again.
+
 ### And the details you'd expect
 
 - **Safe saves.** Files are written to a temporary copy and swapped into place, so a failed save never
@@ -170,6 +177,7 @@ line in a notification and applies the rest.
 | `line_numbers` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
+| `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |
 
 Hand edits keep your comments and other lines; the palette rewrites only the line it changes.
 
