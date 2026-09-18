@@ -13,7 +13,7 @@ The MVP design (`2026-08-31-fastpad-mvp-design.md`) left ordinary session restor
 
 ### Goals
 
-- Reopen the previous session's tabs in order, with the active tab and each tab's caret, selection and first visible line.
+- Reopen the previous session's tabs in order, with the active tab and its caret, selection and first visible line. FastPad keeps no per-tab view state (switching tabs already resets it), so only the active tab's view state is captured. The manifest still stores the fields on every entry, with zeros for the inactive ones.
 - Keep unsaved text across a normal close, for both file-backed and untitled tabs.
 - Leave startup performance unchanged: the first paint and first input happen before any session file is read.
 - Never lose data. This covers a crash after restore, a missing or corrupt manifest, and turning the setting off while snapshots still exist.
@@ -115,22 +115,33 @@ Snapshots for dirty tabs stay in the normal `Recovery` folder. If the manifest w
    - **`File(path)`** goes through `window::open_path`, so it reuses the loader, encoding detection and replacement of the clean initial untitled tab. A failure is counted and not reported yet, so it does not produce one notice per file.
    - **`Snapshot(id)`** reads `snapshot_path(recovery_root, id)` with the existing decoder. It opens through a variant of `open_recovered_snapshot` that binds the tab to `snapshot.original_path` when that path exists. The tab has `path = Some(original_path)`, is dirty, and has `recovery_origin` set to the session snapshot. That makes Ctrl+S save to the original file and then remove the snapshot, as the existing code already does after a save. Untitled snapshots open as untitled tabs, as they do today. A missing or invalid snapshot counts as a failure.
    - If a file-backed snapshot's path is already open in a tab, it opens as untitled with the recovery origin. `Tabs::push` rejects duplicate paths, so this keeps the unsaved text anyway.
-   - After loading an entry, apply its caret, anchor and first visible line.
+   - After loading an entry, apply its language right away (`apply_detected_language`). A posted language step could otherwise run after the next entry had become active.
 4. After the last entry:
-   - Activate the tab at the saved `active` index.
+   - Close the empty startup tab if it is still clean, untitled and empty, and at least one entry was restored.
+   - Activate the tab at the saved `active` index, or the last restored tab if that entry failed. Apply the saved caret, anchor and first visible line only when the saved entry itself was restored.
    - If anything failed, post one notice, for example "2 items from the last session could not be reopened."
    - Clear `pending_session` and post `OPEN_REQUEST`.
 5. `OPEN_REQUEST` then opens any command-line file as it does today, and that file becomes the active tab.
 
+### Titles
+
+`RecoveryOrigin` gets a `from_session: bool`. A session-restored untitled tab is titled "Untitled", not "Recovered: Untitled", because nothing crashed.
+
 ### Relation to crash recovery
 
-`recover_snapshots` runs after restore. It must skip any snapshot a restored tab already owns. Add that check where it tests `owns_recovery_id`: skip candidates whose snapshot path equals the `recovery_origin.snapshot_path` of an open document. That snapshot's owner process has exited, so without the check it would be treated as a crash snapshot and opened twice.
+`recover_snapshots` runs after restore. It must skip any snapshot a restored tab already owns. Add that check where it tests `owns_recovery_id`: skip candidates whose snapshot path equals the `recovery_origin.snapshot_path` of an open document. That snapshot's owner process has exited, so without the check it would be treated as a crash snapshot and opened twice. The check also stops a later Ctrl+O from reopening an already-recovered crash snapshot, because every open re-runs the recovery step.
+
+Every file open posts the language step, which carries on through the recovery step. `recover_snapshots` therefore returns early while a session restore is still in progress. It runs for real after `OPEN_REQUEST`, which always posts the language step again.
 
 ### Guards
 
 - Each pass re-checks `identity.is_live_for(hwnd)` after any call that can re-enter, following the existing pattern.
 - If the window starts closing while a restore is in progress, the close uses the normal flow. Entries not yet restored lose nothing: their snapshots stay on disk and crash recovery picks them up next launch.
 - File population is not re-entrant, so a pass that finds `file_population_active` reposts itself.
+
+### Test seam
+
+The session file path is resolved lazily into `App::session_path`. Under `cfg(test)` it is never resolved, only pre-seeded by a test. That way no in-process test can touch the real `%LOCALAPPDATA%`, even one that sets `instance_mutex`.
 
 ## 8. Error handling summary
 
