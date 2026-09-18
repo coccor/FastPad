@@ -704,6 +704,14 @@ fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
     // language after every successful Open/Save As/launch load that posts it.
     if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_RECOVERY) {
         apply_detected_language(hwnd);
+        // A tab reopened mid-restore must not start recovery, IPC and chrome ahead of the rest of
+        // the session. After the restore, `WM_FASTPAD_OPEN_REQUEST` always posts
+        // `WM_FASTPAD_APPLY_LANGUAGE` again, so the chain resumes in order from there.
+        if unsafe { app_ptr(hwnd) }
+            .is_some_and(|app| unsafe { app.as_ref() }.session_restore.is_some())
+        {
+            return 0;
+        }
     }
     // Only `WM_FASTPAD_RECOVERY` processed with no input pending produces this action.
     if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_START_IPC) {
@@ -2999,6 +3007,9 @@ enum RestoreStep {
 /// One `WM_FASTPAD_RESTORE_SESSION` pass. The first pass takes the manifest. Each pass reopens
 /// at most one entry, and the pass that finds none left finishes the restore.
 fn restore_session_step(hwnd: HWND) -> RestoreStep {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return RestoreStep::Done;
+    };
     if file_population_active(hwnd) {
         return RestoreStep::Continue;
     }
@@ -3019,6 +3030,9 @@ fn restore_session_step(hwnd: HWND) -> RestoreStep {
         return RestoreStep::Done;
     };
     let restored = restore_session_entry(hwnd, &entry);
+    if !identity.is_live_for(hwnd) {
+        return RestoreStep::Done;
+    }
     if let Some(mut app) = unsafe { app_ptr(hwnd) }
         && let Some(restore) = unsafe { app.as_mut() }.session_restore.as_mut()
     {
@@ -3083,6 +3097,9 @@ fn restore_session_entry(hwnd: HWND, entry: &crate::session::SessionEntry) -> Op
 /// Closes the empty startup tab once something replaced it, shows the saved active tab with its
 /// caret and scroll position, and reports every entry that failed in one notice.
 fn finish_session_restore(hwnd: HWND) {
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
     let Some(restore) =
         unsafe { app_ptr(hwnd) }.and_then(|mut app| unsafe { app.as_mut() }.session_restore.take())
     else {
@@ -3093,14 +3110,22 @@ fn finish_session_restore(hwnd: HWND) {
         && restored_any
         && still_empty_untitled(hwnd, placeholder)
         && activate_document_by_id(hwnd, placeholder)
+        && identity.is_live_for(hwnd)
     {
         close_active_document(hwnd);
     }
+    if !identity.is_live_for(hwnd) {
+        return;
+    }
     if let Some(active) = restore.active_tab()
         && activate_document_by_id(hwnd, active)
+        && identity.is_live_for(hwnd)
         && restore.saved_active_restored() == Some(active)
     {
         apply_view_state(hwnd, &restore.session.entries[restore.session.active]);
+    }
+    if !identity.is_live_for(hwnd) {
+        return;
     }
     if restore.failed > 0 {
         push_notice(hwnd, crate::session::restore_failure_notice(restore.failed));
@@ -6112,5 +6137,137 @@ mod tests {
         assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
         assert_eq!(app_mut(window.hwnd).tabs.active_index(), 1);
         assert_eq!(editor.text().unwrap(), "asked for now");
+    }
+
+    /// Removes every queued `message` for `hwnd` without dispatching it.
+    fn discard_posted(hwnd: HWND, message: u32) {
+        let mut queued = MSG::default();
+        while unsafe { PeekMessageW(&mut queued, hwnd, message, message, PM_REMOVE) } != 0 {}
+    }
+
+    #[test]
+    fn session_restore_holds_the_startup_chain_until_it_finishes() {
+        // Break caught: a tab reopened mid-restore posting the language unit, which then runs
+        // recovery, binds the IPC pipe and stamps FullyReady before the rest of the session is
+        // back, so a forwarded launch can open mid-restore and lose the active tab.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PM_NOREMOVE, PostMessageW};
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-chain");
+        let first = scratch.path().join("first.txt");
+        std::fs::write(&first, "one").unwrap();
+        let second = scratch.path().join("second.txt");
+        std::fs::write(&second, "two").unwrap();
+        write_session(
+            &scratch,
+            vec![
+                SessionEntry::new(SessionSource::File(first)),
+                SessionEntry::new(SessionSource::File(second)),
+            ],
+            0,
+        );
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        let restore = crate::window::WM_FASTPAD_RESTORE_SESSION;
+        let language = crate::window::WM_FASTPAD_APPLY_LANGUAGE;
+        let recovery = crate::window::WM_FASTPAD_RECOVERY;
+
+        unsafe { PostMessageW(window.hwnd, restore, 0, 0) };
+        let mut message = MSG::default();
+        assert_ne!(
+            unsafe { PeekMessageW(&mut message, window.hwnd, restore, restore, PM_REMOVE) },
+            0
+        );
+        unsafe { DispatchMessageW(&message) };
+        assert!(
+            app_mut(window.hwnd).session_restore.is_some(),
+            "one entry is still to come"
+        );
+        let mut languages = 0;
+        while unsafe { PeekMessageW(&mut message, window.hwnd, language, language, PM_REMOVE) } != 0
+        {
+            languages += 1;
+            unsafe { DispatchMessageW(&message) };
+        }
+
+        assert!(languages > 0, "the reopened tab posts the language unit");
+        let recovery_posted =
+            unsafe { PeekMessageW(&mut message, window.hwnd, recovery, recovery, PM_NOREMOVE) }
+                != 0;
+        run_session_restore(window.hwnd);
+        discard_posted(window.hwnd, language);
+        discard_posted(window.hwnd, recovery);
+        assert!(
+            !recovery_posted,
+            "the chain must wait for the restore to finish"
+        );
+        assert!(app_mut(window.hwnd).session_restore.is_none());
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+    }
+
+    #[test]
+    fn session_close_falls_back_to_the_prompt_when_the_manifest_cannot_be_written() {
+        // Break caught: a failed manifest write still closing silently, so the unsaved text is
+        // named by no session and the user was never asked about it.
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-unwritable");
+        let blocker = scratch.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a folder").unwrap();
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        app_mut(window.hwnd).session_path = Some(blocker.join("session.ini"));
+        editor.set_text("unsaved words").unwrap();
+        let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = std::rc::Rc::clone(&prompted);
+        answer_next_close_prompt(move |_| {
+            seen.set(true);
+            CloseDecision::Cancel
+        });
+
+        unsafe { SendMessageW(window.hwnd, WM_CLOSE, 0, 0) };
+
+        assert!(
+            prompted.get(),
+            "an unwritable manifest must fall back to the prompt"
+        );
+        assert_ne!(
+            unsafe { IsWindow(window.hwnd) },
+            0,
+            "Cancel keeps the window"
+        );
+    }
+
+    #[test]
+    fn session_close_during_a_restore_uses_the_prompt() {
+        // Break caught: a close mid-restore writing a manifest of only the tabs reopened so far,
+        // silently dropping the entries still to come.
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-mid-restore");
+        let window = ProductionWindow::new(make_app());
+        let editor = install_test_editor(&window);
+        enable_session(window.hwnd, &scratch);
+        app_mut(window.hwnd).session_restore = Some(crate::session::SessionRestore::new(
+            Session::default(),
+            None,
+        ));
+        editor.set_text("unsaved words").unwrap();
+        let prompted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = std::rc::Rc::clone(&prompted);
+        answer_next_close_prompt(move |_| {
+            seen.set(true);
+            CloseDecision::Cancel
+        });
+
+        unsafe { SendMessageW(window.hwnd, WM_CLOSE, 0, 0) };
+
+        assert!(prompted.get(), "a close mid-restore must use the review");
+        assert_ne!(
+            unsafe { IsWindow(window.hwnd) },
+            0,
+            "Cancel keeps the window"
+        );
+        assert!(!scratch.path().join("session.ini").exists());
+        app_mut(window.hwnd).session_restore = None;
     }
 }
