@@ -143,6 +143,11 @@ impl MenuBar {
                 MenuEntry::command("Save &As...\tCtrl+Shift+S", CommandId::SaveAs),
                 MenuEntry::command("&Close tab", CommandId::CloseTab),
                 MenuEntry::Separator,
+                MenuEntry::command(
+                    "&Restore session on startup",
+                    CommandId::ToggleRestoreSession,
+                ),
+                MenuEntry::Separator,
                 MenuEntry::command("E&xit", CommandId::Exit),
             ])?;
             append_popup(root, MENU_TITLES[0], file)?;

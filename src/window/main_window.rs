@@ -671,9 +671,9 @@ fn handle_deferred(hwnd: HWND, action: DeferredAction) -> LRESULT {
         return handle_open_request(hwnd);
     }
     // Each of these actions is produced only by its own deferred message with no input pending:
-    // `PostNext(WM_FASTPAD_OPEN_REQUEST)` by `WM_FASTPAD_LOAD_SETTINGS`, `RecordFullyReady` by
+    // `PostNext(WM_FASTPAD_RESTORE_SESSION)` by `WM_FASTPAD_LOAD_SETTINGS`, `RecordFullyReady` by
     // `WM_FASTPAD_BUILD_CHROME`. Running them before the milestone keeps the milestone honest.
-    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_OPEN_REQUEST) {
+    if action == DeferredAction::PostNext(crate::window::WM_FASTPAD_RESTORE_SESSION) {
         load_settings(hwnd);
     }
     if action == DeferredAction::RecordFullyReady {
@@ -1599,6 +1599,15 @@ fn execute_command(hwnd: HWND, command: CommandId) {
             settings.line_numbers = !settings.line_numbers;
             Some(("line_numbers", settings.line_numbers.to_string()))
         }),
+        CommandId::ToggleRestoreSession => {
+            change_setting(hwnd, |settings| {
+                settings.restore_session = !settings.restore_session;
+                Some(("restore_session", settings.restore_session.to_string()))
+            });
+            let enabled = unsafe { app_ptr(hwnd) }
+                .is_some_and(|app| unsafe { app.as_ref() }.settings.restore_session);
+            push_notice(hwnd, crate::session::toggle_notice(enabled).to_owned());
+        }
         CommandId::FontSizeIncrease => {
             set_font_size(hwnd, |size| {
                 size.saturating_add(1).min(MAX_FONT_SIZE.max(size))
@@ -2983,10 +2992,19 @@ fn recover_snapshots(hwnd: HWND) {
     };
     let mut recovered = 0;
     for candidate in candidates {
-        let owned = unsafe { app_ptr(hwnd) }.is_none_or(|app| {
-            unsafe { app.as_ref() }.owns_recovery_id(candidate.snapshot.recovery_id)
+        // This process's own snapshots, and ones an open tab was already recovered or restored
+        // from, are held by a live tab rather than left behind by a crash.
+        let claimed = unsafe { app_ptr(hwnd) }.is_none_or(|app| {
+            let app = unsafe { app.as_ref() };
+            app.owns_recovery_id(candidate.snapshot.recovery_id)
+                || app.tabs.documents().any(|document| {
+                    document
+                        .recovery_origin
+                        .as_ref()
+                        .is_some_and(|origin| origin.snapshot_path == candidate.path)
+                })
         });
-        if owned {
+        if claimed {
             continue;
         }
         if open_recovered_snapshot(hwnd, &identity, candidate).is_ok() {
@@ -3184,6 +3202,7 @@ fn open_recovered_snapshot(
     document.recovery_origin = Some(crate::document::RecoveryOrigin {
         snapshot_path: path,
         original_path: snapshot.original_path,
+        from_session: false,
     });
     if !identity.is_live_for(hwnd) {
         return Err(crate::FastPadError::Invariant(
@@ -3859,6 +3878,32 @@ mod tests {
     }
 
     #[test]
+    fn recovery_never_reopens_a_snapshot_an_open_tab_already_holds() {
+        // Break caught: a later Open (every open re-runs the recovery unit) or a session restore
+        // opening a second copy of text that is already in a tab.
+        let _scintilla = load_native_scintilla();
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        let root = RecoveryScratch::new("claimed");
+        write_snapshot(
+            root.path(),
+            &Snapshot::new(
+                RecoveryId::from_u128(0x7171),
+                None,
+                Encoding::Utf8,
+                "held once",
+            ),
+        )
+        .unwrap();
+        app_mut(window.hwnd).recovery_root = Some(root.path().to_path_buf());
+
+        unsafe { SendMessageW(window.hwnd, crate::window::WM_FASTPAD_RECOVERY, 0, 0) };
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+        unsafe { SendMessageW(window.hwnd, crate::window::WM_FASTPAD_RECOVERY, 0, 0) };
+        assert_eq!(app_mut(window.hwnd).tabs.len(), 2);
+    }
+
+    #[test]
     fn queued_ipc_requests_wait_for_the_overflow_menu_to_close() {
         // Break caught: the overflow menu's own modal loop dispatches a forwarded request, so a
         // new tab becomes active underneath it and the command the user picks acts on that tab
@@ -4354,6 +4399,36 @@ mod tests {
             },
             app_mut(window.hwnd).settings
         );
+    }
+
+    #[test]
+    fn session_toggle_saves_only_its_line_and_says_so() {
+        // Break caught: a toggle that flips the flag but is lost on restart, rewrites the user's
+        // fastpad.ini, or leaves no sign of which state it chose (menus show no checkmarks).
+        let _scintilla = load_native_scintilla();
+        let scratch = RecoveryScratch::new("session-toggle");
+        let ini = scratch.path().join("fastpad.ini");
+        std::fs::write(&ini, "# kept\r\n").unwrap();
+        super::save_settings_to(Some(ini.clone()));
+        let window = ProductionWindow::new(make_app());
+        let _editor = install_test_editor(&window);
+        assert!(app_mut(window.hwnd).settings.restore_session);
+
+        execute_command(window.hwnd, CommandId::ToggleRestoreSession);
+
+        assert!(!app_mut(window.hwnd).settings.restore_session);
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "# kept\r\nrestore_session=false\r\n"
+        );
+        assert!(
+            app_mut(window.hwnd)
+                .notifications
+                .pending()
+                .iter()
+                .any(|notice| notice.message == crate::session::toggle_notice(false))
+        );
+        super::save_settings_to(None);
     }
 
     #[test]

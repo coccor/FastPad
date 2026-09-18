@@ -57,6 +57,7 @@ pub enum CommandId {
     MarkdownPreviewSide,
     MarkdownPreviewFull,
     MarkdownPreviewClose,
+    ToggleRestoreSession,
 }
 
 impl CommandId {
@@ -85,6 +86,7 @@ impl CommandId {
                 | Self::ThemeCatppuccinFrappe
                 | Self::ThemeCatppuccinMacchiato
                 | Self::ThemeCatppuccinMocha
+                | Self::ToggleRestoreSession
         )
     }
 
@@ -114,7 +116,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 56] = [
+        const COMMANDS: [CommandId; 57] = [
             CommandId::New,
             CommandId::Open,
             CommandId::Save,
@@ -171,6 +173,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::MarkdownPreviewSide,
             CommandId::MarkdownPreviewFull,
             CommandId::MarkdownPreviewClose,
+            CommandId::ToggleRestoreSession,
         ];
         COMMANDS
             .into_iter()
@@ -214,6 +217,11 @@ mod tests {
             Ok(CommandId::ThemeCatppuccinMocha)
         );
         assert!(!CommandId::ToggleWordWrap.needs_document());
+        assert_eq!(
+            CommandId::try_from(156),
+            Ok(CommandId::ToggleRestoreSession)
+        );
+        assert!(!CommandId::ToggleRestoreSession.needs_document());
     }
 
     #[test]

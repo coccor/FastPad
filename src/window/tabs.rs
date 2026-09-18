@@ -536,6 +536,7 @@ mod tests {
         recovered.recovery_origin = Some(crate::document::RecoveryOrigin {
             snapshot_path: std::path::PathBuf::from("a.fps"),
             original_path: None,
+            from_session: false,
         });
         let mut tabs = Tabs::with_document(recovered);
 

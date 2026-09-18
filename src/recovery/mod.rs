@@ -86,6 +86,41 @@ pub fn snapshots_removed_on_close(
     }
 }
 
+/// The snapshot file holding `document`'s latest text: its own once written, otherwise the
+/// snapshot it was recovered or restored from. `None` while the latest edits are in no file.
+pub fn current_snapshot_file(root: &Path, document: &Document) -> Option<PathBuf> {
+    if document.recovery_generation != Some(document.generation) {
+        return None;
+    }
+    let own = snapshot::snapshot_path(root, document.recovery_id);
+    if own.is_file() {
+        return Some(own);
+    }
+    document
+        .recovery_origin
+        .as_ref()
+        .map(|origin| origin.snapshot_path.clone())
+        .filter(|source| source.is_file())
+}
+
+/// Files a session-saving close may delete. The manifest names only the current snapshot of
+/// each dirty document, so everything else that document owns would resurrect as a duplicate.
+/// Clean documents need none of theirs. A dirty document whose text is in no file keeps all.
+pub fn snapshots_removed_on_session_close(root: &Path, document: &Document) -> Vec<PathBuf> {
+    let keep = if document.dirty {
+        match current_snapshot_file(root, document) {
+            Some(current) => Some(current),
+            None => return Vec::new(),
+        }
+    } else {
+        None
+    };
+    owned_snapshot_files(root, document)
+        .into_iter()
+        .filter(|file| Some(file) != keep.as_ref())
+        .collect()
+}
+
 /// Every recovery ID a process composes shares this name, so a live owner is detectable.
 pub fn owner_mutex_name(id: RecoveryId) -> String {
     format!(
@@ -128,8 +163,9 @@ pub fn recovered_notice(count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_owner_mutex, input_idle, needs_snapshot, next_snapshot_document,
-        owned_snapshot_files, owner_is_alive, owner_mutex_name, snapshots_removed_on_close,
+        create_owner_mutex, current_snapshot_file, input_idle, needs_snapshot,
+        next_snapshot_document, owned_snapshot_files, owner_is_alive, owner_mutex_name,
+        snapshots_removed_on_close, snapshots_removed_on_session_close,
     };
     use crate::document::{Document, DocumentId, RecoveryId, RecoveryOrigin};
     use std::path::{Path, PathBuf};
@@ -198,6 +234,7 @@ mod tests {
         let origin = RecoveryOrigin {
             snapshot_path: PathBuf::from(r"C:\Recovery\old.fps"),
             original_path: None,
+            from_session: false,
         };
         let mut dirty_recovered = Document::test_fixture(DocumentId(1), true);
         dirty_recovered.recovery_origin = Some(origin.clone());
@@ -247,9 +284,57 @@ mod tests {
         document.recovery_origin = Some(RecoveryOrigin {
             snapshot_path: PathBuf::from(r"C:\Recovery\old.fps"),
             original_path: None,
+            from_session: false,
         });
         let files = owned_snapshot_files(root, &document);
         assert_eq!(files.len(), 2);
         assert_eq!(files[1], PathBuf::from(r"C:\Recovery\old.fps"));
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("fastpad-recovery-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn the_current_snapshot_is_the_own_one_once_written_else_the_source() {
+        // Break caught: a session naming a stale or missing snapshot, so the next launch restores
+        // old text or nothing at all.
+        let root = scratch("current");
+        let source = root.join("source.fps");
+        std::fs::write(&source, b"x").unwrap();
+        let mut document = Document::test_fixture(DocumentId(1), true);
+        document.recovery_origin = Some(RecoveryOrigin {
+            snapshot_path: source.clone(),
+            original_path: None,
+            from_session: false,
+        });
+        assert_eq!(
+            current_snapshot_file(&root, &document),
+            None,
+            "generation unrecorded"
+        );
+        document.recovery_generation = Some(document.generation);
+        assert_eq!(
+            current_snapshot_file(&root, &document),
+            Some(source.clone())
+        );
+        let own = crate::recovery::snapshot::snapshot_path(&root, document.recovery_id);
+        std::fs::write(&own, b"y").unwrap();
+        assert_eq!(current_snapshot_file(&root, &document), Some(own.clone()));
+
+        assert_eq!(
+            snapshots_removed_on_session_close(&root, &document),
+            vec![source]
+        );
+        let mut clean = Document::test_fixture(DocumentId(2), false);
+        clean.recovery_origin = document.recovery_origin.clone();
+        assert_eq!(snapshots_removed_on_session_close(&root, &clean).len(), 2);
+        document.recovery_generation = None;
+        assert!(snapshots_removed_on_session_close(&root, &document).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

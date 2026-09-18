@@ -10,6 +10,7 @@ pub const WM_FASTPAD_START_IPC: u32 = WM_APP + 5;
 pub const WM_FASTPAD_BUILD_CHROME: u32 = WM_APP + 6;
 // Not part of the deferred chain: it only drains requests already queued on App.
 pub const WM_FASTPAD_IPC_REQUEST: u32 = WM_APP + 7;
+pub const WM_FASTPAD_RESTORE_SESSION: u32 = WM_APP + 8;
 // Not part of the deferred chain: answers only under --diagnostic, for acceptance tests.
 pub const WM_FASTPAD_DIAGNOSTIC_JSON_COUNT: u32 = WM_APP + 0x40;
 // Not part of the deferred chain: answers only under --diagnostic; wparam selects a preview value.
@@ -37,7 +38,8 @@ pub fn deferred_start_message() -> u32 {
 
 pub fn classify_deferred_message(message: u32, input_pending: bool) -> Option<DeferredAction> {
     let action = match message {
-        WM_FASTPAD_LOAD_SETTINGS => next_action(message, WM_FASTPAD_OPEN_REQUEST, input_pending),
+        WM_FASTPAD_LOAD_SETTINGS => next_action(message, WM_FASTPAD_RESTORE_SESSION, input_pending),
+        WM_FASTPAD_RESTORE_SESSION => next_action(message, WM_FASTPAD_OPEN_REQUEST, input_pending),
         WM_FASTPAD_OPEN_REQUEST => next_action(message, WM_FASTPAD_APPLY_LANGUAGE, input_pending),
         WM_FASTPAD_APPLY_LANGUAGE => next_action(message, WM_FASTPAD_RECOVERY, input_pending),
         WM_FASTPAD_RECOVERY => next_action(message, WM_FASTPAD_START_IPC, input_pending),
@@ -56,7 +58,7 @@ pub fn classify_deferred_message(message: u32, input_pending: bool) -> Option<De
 
 pub(crate) fn completed_milestone(action: DeferredAction) -> Option<Milestone> {
     match action {
-        DeferredAction::PostNext(WM_FASTPAD_OPEN_REQUEST) => Some(Milestone::SettingsLoaded),
+        DeferredAction::PostNext(WM_FASTPAD_RESTORE_SESSION) => Some(Milestone::SettingsLoaded),
         DeferredAction::PostNext(WM_FASTPAD_APPLY_LANGUAGE) => Some(Milestone::FileLoaded),
         DeferredAction::RecordFullyReady => Some(Milestone::FullyReady),
         _ => None,
@@ -76,7 +78,8 @@ mod tests {
     use super::{
         DeferredAction, WM_FASTPAD_APPLY_LANGUAGE, WM_FASTPAD_BUILD_CHROME,
         WM_FASTPAD_LOAD_SETTINGS, WM_FASTPAD_OPEN_REQUEST, WM_FASTPAD_RECOVERY,
-        WM_FASTPAD_START_IPC, classify_deferred_message, completed_milestone,
+        WM_FASTPAD_RESTORE_SESSION, WM_FASTPAD_START_IPC, classify_deferred_message,
+        completed_milestone,
     };
     use crate::perf::Milestone;
 
@@ -86,6 +89,10 @@ mod tests {
         // first paint and invalidates the startup allowlist.
         assert_eq!(
             classify_deferred_message(WM_FASTPAD_LOAD_SETTINGS, false),
+            Some(DeferredAction::PostNext(WM_FASTPAD_RESTORE_SESSION))
+        );
+        assert_eq!(
+            classify_deferred_message(WM_FASTPAD_RESTORE_SESSION, false),
             Some(DeferredAction::PostNext(WM_FASTPAD_OPEN_REQUEST))
         );
         assert_eq!(
@@ -122,6 +129,10 @@ mod tests {
             classify_deferred_message(WM_FASTPAD_BUILD_CHROME, true),
             Some(DeferredAction::RepostSelf(WM_FASTPAD_BUILD_CHROME))
         );
+        assert_eq!(
+            classify_deferred_message(WM_FASTPAD_RESTORE_SESSION, true),
+            Some(DeferredAction::RepostSelf(WM_FASTPAD_RESTORE_SESSION))
+        );
     }
 
     #[test]
@@ -129,8 +140,12 @@ mod tests {
         // Break caught: leaving placeholder settings/file units unrecorded produces zero fields in
         // otherwise valid benchmark frames.
         assert_eq!(
-            completed_milestone(DeferredAction::PostNext(WM_FASTPAD_OPEN_REQUEST)),
+            completed_milestone(DeferredAction::PostNext(WM_FASTPAD_RESTORE_SESSION)),
             Some(Milestone::SettingsLoaded)
+        );
+        assert_eq!(
+            completed_milestone(DeferredAction::PostNext(WM_FASTPAD_OPEN_REQUEST)),
+            None
         );
         assert_eq!(
             completed_milestone(DeferredAction::PostNext(WM_FASTPAD_APPLY_LANGUAGE)),
